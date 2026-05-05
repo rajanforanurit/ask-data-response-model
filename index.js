@@ -179,6 +179,10 @@ function extractSubject(query) {
   }
   return q
 }
+function fixBrokenUrls(text) {
+  return text
+    .replace(/https:\/\/[^\s]+(\s+[^\s]+)/g, (match) => match.replace(/\s/g, ''))
+}
 
 function escapeRegex(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -919,7 +923,8 @@ app.post('/chat/message', requireClientKey, async (req, res) => {
       return res.json({ answer: "I couldn't find that in your documents. Try rephrasing your question or asking about it differently.", sources: [], client: { clientId, name } })
     }
 
-    const answer = await answerWithPhi4(query.trim(), hits, intent)
+    const rawAnswer = await answerWithPhi4(query.trim(), hits, intent)
+    const answer = fixBrokenUrls(rawAnswer)
 
     const sources = hits.map(h => ({
       source_file:  h.source_file  || 'unknown',
