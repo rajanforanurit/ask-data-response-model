@@ -700,8 +700,8 @@ function generateTitle(query) {
 // Health
 app.get('/health', (req, res) => res.json({
   ok: true,
-  service: 'rag-client-auth',
-  model:   PHI4_MODEL,
+  service: 'ask-data',
+  model:   'ask-data-response-model',
   embeddings: AZURE_EMBED_ENDPOINT ? 'azure-openai' : 'keyword-only',
 }))
 
