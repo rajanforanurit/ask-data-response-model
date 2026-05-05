@@ -396,6 +396,8 @@ UNIVERSAL RULES:
 8. Write clearly, concisely, and directly — like a knowledgeable colleague.
 9. Answer only what was asked. No padding or filler.
 10. NEVER say "the context does not define" or "not mentioned" if the term appears anywhere.
+11. If a URL is present, ALWAYS return the FULL URL exactly as-is. Never truncate or shorten URLs.
+12. URLs must be returned in one continuous line with no line breaks or spaces.
 ${intentInstructions}`
 
   const typeBlocks = []
