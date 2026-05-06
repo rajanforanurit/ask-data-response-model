@@ -12,7 +12,6 @@ const Papa = require('papaparse')
 const { simpleParser } = require('mailparser')
 const { parseOffice } = require('officeparser')
 const crypto = require('crypto')
-
 const app = express()
 
 const allowedOrigins = [
@@ -64,11 +63,12 @@ const PHI4_ENDPOINT = process.env.PHI4_ENDPOINT
 const PHI4_API_KEY  = process.env.PHI4_API_KEY
 const PHI4_MODEL = process.env.PHI4_MODEL || 'Phi-4-mini-instruct'
 const PHI4_TIMEOUT_MS = parseInt(process.env.PHI4_TIMEOUT_MS || '60000', 10)
-
 const AZURE_EMBED_ENDPOINT = process.env.AZURE_EMBED_ENDPOINT || ''
 const AZURE_EMBED_KEY = process.env.AZURE_EMBED_KEY || ''
 const AZURE_EMBED_MODEL = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
 const EMBED_TIMEOUT_MS  = parseInt(process.env.EMBED_TIMEOUT_MS || '15000', 10)
+const EMBED_POOL_LIMIT = parseInt(process.env.EMBED_POOL_LIMIT || '20', 10)
+const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '90000', 10)
 
 const RAW_PREFIX    = 'raw'
 const CHUNK_SIZE    = 500
@@ -104,9 +104,7 @@ const DOC_TYPE = {
   UNKNOWN:      'unknown',
 }
 
-// ─── FIX 3: fetchWithTimeout ──────────────────────────────────────────────────
-// Wraps every external HTTP call with an AbortController so requests can't
-// hang indefinitely when Phi-4 or Azure embedding services are under load.
+// ─── fetchWithTimeout ─────────────────────────────────────────────────────────
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
@@ -120,6 +118,29 @@ async function fetchWithTimeout(url, options, timeoutMs) {
     throw err
   } finally {
     clearTimeout(timer)
+  }
+}
+function withRequestTimeout(fn, timeoutMs = REQUEST_TIMEOUT_MS) {
+  return async (req, res, next) => {
+    let settled = false
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true
+        console.error(`[timeout] Request to ${req.path} exceeded ${timeoutMs}ms`)
+        if (!res.headersSent) {
+          res.status(503).json({ error: 'Request timed out. Please try again.' })
+        }
+      }
+    }, timeoutMs)
+
+    try {
+      await fn(req, res, next)
+    } catch (err) {
+      if (!settled) next(err)
+    } finally {
+      settled = true
+      clearTimeout(timer)
+    }
   }
 }
 
@@ -219,6 +240,7 @@ function cosineSim(a, b) {
   }
   return dot / (Math.sqrt(normA) * Math.sqrt(normB) + 1e-9)
 }
+
 async function callPhi4(systemPrompt, userMessage) {
   if (!PHI4_ENDPOINT || !PHI4_API_KEY) {
     throw new Error('PHI4_ENDPOINT and PHI4_API_KEY environment variables are required')
@@ -253,6 +275,7 @@ async function callPhi4(systemPrompt, userMessage) {
   const data = await response.json()
   return data.choices?.[0]?.message?.content || ''
 }
+
 async function embedQueryAzure(query) {
   if (!AZURE_EMBED_ENDPOINT || !AZURE_EMBED_KEY) return null
   try {
@@ -277,15 +300,36 @@ async function embedQueryAzure(query) {
     return null
   }
 }
-
-// ─── Keyword search ───────────────────────────────────────────────────────────
+async function embedBatch(texts) {
+  if (!AZURE_EMBED_ENDPOINT || !AZURE_EMBED_KEY || !texts.length) return []
+  try {
+    const response = await fetchWithTimeout(
+      AZURE_EMBED_ENDPOINT,
+      {
+        method:  'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'api-key':      AZURE_EMBED_KEY,
+        },
+        body: JSON.stringify({ input: texts, model: AZURE_EMBED_MODEL }),
+      },
+      EMBED_TIMEOUT_MS
+    )
+    if (!response.ok) return []
+    const data = await response.json()
+    // data.data is ordered by index
+    return (data.data || []).sort((a, b) => a.index - b.index).map(d => d.embedding)
+  } catch (err) {
+    console.warn('[embedBatch] failed:', err.message)
+    return []
+  }
+}
 function keywordSearch(query, chunks, topK, intent = 'general') {
   const subject      = intent === 'definition' ? extractSubject(query) : query.toLowerCase()
   const queryLower   = query.toLowerCase()
   const subjectLower = subject.toLowerCase()
   const subjectWords = subjectLower.split(/\s+/).filter(w => w.length > 1)
   const queryWords   = queryLower.replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1)
-
   return chunks
     .map(c => {
       const text    = (c.text || '').toLowerCase()
@@ -320,8 +364,6 @@ function keywordSearch(query, chunks, topK, intent = 'general') {
     .sort((a, b) => b._score - a._score)
     .slice(0, topK)
 }
-
-// ─── Retrieval ────────────────────────────────────────────────────────────────
 async function retrieveChunks(query, chunks, topK = 6) {
   const intent           = detectQueryIntent(query)
   const normalizedQuery  = query.toLowerCase().trim().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
@@ -337,26 +379,30 @@ async function retrieveChunks(query, chunks, topK = 6) {
     try {
       const queryVec = await embedQueryAzure(normalizedQuery)
       if (queryVec) {
-        const scored = []
-        for (const c of pool) {
-          try {
-            const chunkVec = await embedQueryAzure((c.text || '').toLowerCase().slice(0, 512))
-            if (chunkVec) {
-              const semanticScore = cosineSim(queryVec, chunkVec)
-              const maxKeyword    = pool[0]._score || 1
-              const keywordNorm   = typeof c._score === 'number' ? c._score / maxKeyword : 0
-              const weight        = intent === 'definition'
-                ? { semantic: 0.35, keyword: 0.65 }
-                : { semantic: 0.70, keyword: 0.30 }
-              scored.push({ ...c, _score: semanticScore * weight.semantic + keywordNorm * weight.keyword })
-            } else {
-              scored.push(c)
-            }
-          } catch {
-            scored.push(c)
-          }
-        }
-        return scored.sort((a, b) => b._score - a._score).slice(0, Math.min(topK, 12))
+        const poolSlice   = pool.slice(0, EMBED_POOL_LIMIT)
+        const chunkTexts  = poolSlice.map(c => (c.text || '').toLowerCase().slice(0, 512))
+        const embeddings  = await embedBatch(chunkTexts)
+
+        const maxKeyword  = pool[0]._score || 1
+        const weight      = intent === 'definition'
+          ? { semantic: 0.35, keyword: 0.65 }
+          : { semantic: 0.70, keyword: 0.30 }
+
+        const scored = poolSlice.map((c, i) => {
+          const chunkVec = embeddings[i]
+          if (!chunkVec) return c  
+          const semanticScore = cosineSim(queryVec, chunkVec)
+          const keywordNorm   = typeof c._score === 'number' ? c._score / maxKeyword : 0
+          return { ...c, _score: semanticScore * weight.semantic + keywordNorm * weight.keyword }
+        })
+        const remainder = pool.slice(EMBED_POOL_LIMIT).map(c => ({
+          ...c,
+          _score: (typeof c._score === 'number' ? c._score / maxKeyword : 0) * weight.keyword,
+        }))
+
+        return [...scored, ...remainder]
+          .sort((a, b) => b._score - a._score)
+          .slice(0, Math.min(topK, 12))
       }
     } catch (err) {
       console.warn('[retrieveChunks] Azure embed failed, keyword fallback:', err.message)
@@ -682,8 +728,9 @@ async function downloadBlobAsBuffer(containerClient, blobName) {
     parts.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
   return Buffer.concat(parts)
 }
-const CHUNK_CACHE     = new Map()
-const CHUNK_CACHE_TTL = parseInt(process.env.CHUNK_CACHE_TTL_MS || '300000', 10) 
+
+const CHUNK_CACHE = new Map()   
+const CHUNK_CACHE_TTL = parseInt(process.env.CHUNK_CACHE_TTL_MS || '300000', 10)
 
 async function _doLoadChunks(clientId) {
   if (!blobServiceClient) throw new Error('AZURE_CONNECTION_STRING not set')
@@ -708,13 +755,16 @@ async function _doLoadChunks(clientId) {
 }
 
 async function loadChunksForClient(clientId) {
+  const now    = Date.now()
   const cached = CHUNK_CACHE.get(clientId)
 
-  // Return cached chunks if still fresh
-  if (cached && !cached.loading && cached.chunks && Date.now() - cached.ts < CHUNK_CACHE_TTL) {
+  // Return already-resolved chunks if still fresh
+  if (cached && cached.chunks && !cached.loading && now - cached.ts < CHUNK_CACHE_TTL) {
     return cached.chunks
   }
-  if (cached?.loading) {
+
+  // FIX: If a load is already in-flight, return the same promise — no duplicate loads
+  if (cached && cached.loading) {
     return cached.loading
   }
   const loadPromise = _doLoadChunks(clientId)
@@ -723,17 +773,24 @@ async function loadChunksForClient(clientId) {
       return chunks
     })
     .catch(err => {
-      CHUNK_CACHE.delete(clientId)
+      const existing = CHUNK_CACHE.get(clientId)
+      CHUNK_CACHE.set(clientId, { chunks: existing?.chunks || null, ts: existing?.ts || 0, loading: null })
       throw err
     })
+  CHUNK_CACHE.set(clientId, {
+    chunks:  cached?.chunks  || null,
+    ts:      cached?.ts      || 0,
+    loading: loadPromise,
+  })
 
-  CHUNK_CACHE.set(clientId, { chunks: cached?.chunks || null, ts: cached?.ts || 0, loading: loadPromise })
   return loadPromise
 }
+
 function invalidateChunkCache(clientId) {
   CHUNK_CACHE.delete(clientId)
   console.log(`[chunkCache] Invalidated cache for client: ${clientId}`)
 }
+
 async function answerWithPhi4(originalQuery, hits, intent = 'general') {
   const systemPrompt = buildDynamicSystemPrompt(hits, intent)
   const context      = buildContext(hits)
@@ -755,6 +812,8 @@ function generateTitle(query) {
   const cleaned = query.trim().replace(/[?!.]+$/, '')
   return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned
 }
+
+// ─── Routes ───────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({
   ok: true,
   service: 'ask-data',
@@ -855,8 +914,6 @@ app.delete('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
     if (!client) return res.status(404).json({ error: 'Client not found' })
     if (client.apiKey) evictCache(client.apiKey)
     await database.collection('clients').deleteOne({ clientId })
-
-    // Also invalidate chunk cache for this client
     invalidateChunkCache(clientId)
 
     const blobsDeleted = [], blobsFailed = []
@@ -874,6 +931,7 @@ app.delete('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
     res.json({ ok: true, deleted: clientId, blobsDeleted: blobsDeleted.length, blobsFailed: blobsFailed.length > 0 ? blobsFailed : undefined })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
+
 app.post('/admin/clients/:clientId/invalidate-cache', requireAdminKey, (req, res) => {
   invalidateChunkCache(req.params.clientId)
   res.json({ ok: true, clientId: req.params.clientId, message: 'Chunk cache invalidated' })
@@ -961,7 +1019,7 @@ app.post('/chat/conversations/delete', requireClientKey, async (req, res) => {
     res.json({ ok: true, deleted: conversationId })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
-app.post('/chat/message', requireClientKey, async (req, res) => {
+app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) => {
   try {
     const { query, topK = 6, conversationId } = req.body
     if (!query?.trim()) return res.status(400).json({ error: 'query is required' })
@@ -1020,15 +1078,21 @@ app.post('/chat/message', requireClientKey, async (req, res) => {
     }
   } catch (err) {
     console.error('[chat/message] Error:', err.message)
-    res.status(500).json({ error: err.message })
+    if (!res.headersSent) res.status(500).json({ error: err.message })
   }
+}))
+app.use((err, req, res, next) => {
+  console.error('[global error handler]', err)
+  if (!res.headersSent) res.status(500).json({ error: 'An unexpected error occurred. Please try again.' })
 })
+
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => {
   console.log(`rag-client-auth running on port ${PORT}`)
   console.log(`Model: ${PHI4_MODEL} | Endpoint: ${PHI4_ENDPOINT ? 'configured' : 'MISSING'}`)
   console.log(`Phi-4 timeout: ${PHI4_TIMEOUT_MS}ms | Embed timeout: ${EMBED_TIMEOUT_MS}ms`)
-  console.log(`Chunk cache TTL: ${CHUNK_CACHE_TTL}ms`)
+  console.log(`Chunk cache TTL: ${CHUNK_CACHE_TTL}ms | Embed pool limit: ${EMBED_POOL_LIMIT}`)
+  console.log(`Request timeout: ${REQUEST_TIMEOUT_MS}ms`)
   console.log(`Azure blob client: ${blobServiceClient ? 'singleton ready' : 'MISSING connection string'}`)
   startApiKeyHealthChecker()
 })
