@@ -71,6 +71,11 @@ const EMBED_TIMEOUT_MS     = parseInt(process.env.EMBED_TIMEOUT_MS || '15000', 1
 const EMBED_POOL_LIMIT     = parseInt(process.env.EMBED_POOL_LIMIT || '20', 10)
 const REQUEST_TIMEOUT_MS   = parseInt(process.env.REQUEST_TIMEOUT_MS || '90000', 10)
 const KEYWORD_SHORTCIRCUIT_SCORE = parseInt(process.env.KEYWORD_SHORTCIRCUIT_SCORE || '12', 10)
+
+// ─── Warmup: clients to pre-load chunks for on startup ────────────────────────
+// Set WARMUP_CLIENT_IDS=clientA,clientB in env to pre-warm caches at boot
+const WARMUP_CLIENT_IDS = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
+
 const RAW_PREFIX    = 'raw'
 const CHUNK_SIZE    = 500
 const CHUNK_OVERLAP = 2
@@ -367,10 +372,6 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
     .slice(0, topK)
 }
 
-// ─── OPTIMIZATION 4: Smart embed short-circuit ────────────────────────────────
-// Skip the Azure embedding round-trip entirely when keyword search already found
-// a highly confident answer.  This is the single biggest latency win for common
-// definition/lookup queries (saves ~300–2000ms per request).
 async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
   const intent          = detectQueryIntent(query)
   const normalizedQuery = query.toLowerCase().trim().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
@@ -450,7 +451,6 @@ const SYSTEM_PROMPT_CACHE = new Map()
 const SYSTEM_PROMPT_CACHE_MAX = 100
 
 function buildDynamicSystemPrompt(hits, intent = 'general') {
-  // Cache key: sorted source file names + intent
   const sourceKey = [...new Set(hits.map(h => h.source_file || 'unknown'))].sort().join('|')
   const cacheKey  = `${sourceKey}::${intent}`
   const cached    = SYSTEM_PROMPT_CACHE.get(cacheKey)
@@ -516,7 +516,6 @@ ${intentInstructions}`
   const mixedNote   = uniqueTypes.length > 1 ? `\nMIXED DOCUMENT SET: Context contains ${uniqueTypes.length} document types (${uniqueTypes.join(', ')}). Apply the relevant rules above for each excerpt.` : ''
   const prompt      = [base, ...typeBlocks, mixedNote].filter(Boolean).join('\n') + '\n'
 
-  // Bounded LRU eviction: drop oldest entry when cache is full
   if (SYSTEM_PROMPT_CACHE.size >= SYSTEM_PROMPT_CACHE_MAX) {
     SYSTEM_PROMPT_CACHE.delete(SYSTEM_PROMPT_CACHE.keys().next().value)
   }
@@ -764,7 +763,6 @@ async function _doLoadChunks(clientId) {
   const containerClient = blobServiceClient.getContainerClient(AZURE_CONTAINER_NAME)
   const prefix          = `${RAW_PREFIX}/${clientId}/`
 
-  // Collect all blob names first
   const blobNames = []
   for await (const blob of containerClient.listBlobsFlat({ prefix })) {
     const fileName = blob.name.split('/').pop()
@@ -772,7 +770,6 @@ async function _doLoadChunks(clientId) {
     if (SUPPORTED_EXTENSIONS.has(ext)) blobNames.push(blob.name)
   }
 
-  // Process in parallel batches of BLOB_CONCURRENCY
   const allChunks = []
   for (let i = 0; i < blobNames.length; i += BLOB_CONCURRENCY) {
     const batch   = blobNames.slice(i, i + BLOB_CONCURRENCY)
@@ -836,6 +833,18 @@ async function loadChunksForClient(clientId) {
 function invalidateChunkCache(clientId) {
   CHUNK_CACHE.delete(clientId)
   console.log(`[chunkCache] Invalidated cache for client: ${clientId}`)
+}
+
+// ─── Warmup: pre-load chunks for known clients at startup ─────────────────────
+// Runs fire-and-forget so it never blocks the server from starting
+function warmupChunkCaches() {
+  if (!WARMUP_CLIENT_IDS.length || !blobServiceClient) return
+  console.log(`[warmup] Pre-loading chunks for ${WARMUP_CLIENT_IDS.length} client(s): ${WARMUP_CLIENT_IDS.join(', ')}`)
+  for (const clientId of WARMUP_CLIENT_IDS) {
+    loadChunksForClient(clientId)
+      .then(({ chunks }) => console.log(`[warmup] ✓ ${clientId} — ${chunks.length} chunks ready`))
+      .catch(err => console.warn(`[warmup] ✗ ${clientId} — ${err.message}`))
+  }
 }
 
 async function answerWithPhi4(originalQuery, hits, intent = 'general') {
@@ -977,7 +986,7 @@ app.delete('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
 
 app.post('/admin/clients/:clientId/invalidate-cache', requireAdminKey, (req, res) => {
   invalidateChunkCache(req.params.clientId)
-  SYSTEM_PROMPT_CACHE.clear()  // also flush prompt cache on manual invalidation
+  SYSTEM_PROMPT_CACHE.clear()
   res.json({ ok: true, clientId: req.params.clientId, message: 'Chunk + prompt cache invalidated' })
 })
 
@@ -987,6 +996,12 @@ app.post('/client/login', async (req, res) => {
     if (!apiKey) return res.status(400).json({ error: 'apiKey is required' })
     const client = await verifyApiKey(apiKey)
     if (!client) return res.status(401).json({ error: 'Invalid API key' })
+    if (blobServiceClient) {
+      loadChunksForClient(client.clientId).catch(err =>
+        console.warn(`[login warmup] ${client.clientId}: ${err.message}`)
+      )
+    }
+
     res.json({ ok: true, client })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -997,6 +1012,14 @@ app.post('/chat/login', async (req, res) => {
     if (!apiKey) return res.status(400).json({ error: 'apiKey is required' })
     const client = await verifyApiKey(apiKey)
     if (!client) return res.status(401).json({ error: 'Invalid API key' })
+
+    // ── Trigger chunk pre-load in the background on chat login too ────────────
+    if (blobServiceClient) {
+      loadChunksForClient(client.clientId).catch(err =>
+        console.warn(`[chat/login warmup] ${client.clientId}: ${err.message}`)
+      )
+    }
+
     res.json({ ok: true, client })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -1061,8 +1084,6 @@ app.post('/chat/conversations/delete', requireClientKey, async (req, res) => {
     res.json({ ok: true, deleted: conversationId })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
-
-// ─── CORE CHAT ENDPOINT ────────────────────────────────────────────────────────
 app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) => {
   try {
     const { query, topK = 6, conversationId } = req.body
@@ -1074,17 +1095,20 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       return res.json({
         answer: 'No documents found for your account. Please ensure your documents have been ingested first.',
         sources: [],
+        conversationId: conversationId || null,
         client: { clientId, name },
       })
     }
 
-    const intent = detectQueryIntent(query.trim())
-    const hits   = await retrieveChunks(query.trim(), chunks, Math.min(topK, 20), invertedIndex)
+    // ── 2. Retrieve relevant chunks & generate answer ─────────────────────────
+    const intent    = detectQueryIntent(query.trim())
+    const hits      = await retrieveChunks(query.trim(), chunks, Math.min(topK, 20), invertedIndex)
 
     if (hits.length === 0) {
       return res.json({
         answer: "I couldn't find that in your documents. Try rephrasing your question or asking about it differently.",
         sources: [],
+        conversationId: conversationId || null,
         client: { clientId, name },
       })
     }
@@ -1098,27 +1122,59 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       score:       typeof h._score === 'number' ? parseFloat(h._score.toFixed(4)) : null,
       preview:     (h.text || '').slice(0, 300),
     }))
-    const saveConversation = async () => {
+    let activeConversationId = conversationId || null
+    try {
       const chatDatabase = await getChatDb()
       const col          = chatDatabase.collection('conversations')
       const now          = new Date()
       const userMsg      = { role: 'user',      content: query.trim(), timestamp: now }
-      const assistantMsg = { role: 'assistant', content: answer, sources: sources.map(s => ({ source_file: s.source_file, score: s.score })), timestamp: now }
-
-      if (conversationId) {
-        await col.updateOne(
-          { _id: new ObjectId(conversationId), clientId },
-          { $push: { messages: { $each: [userMsg, assistantMsg] } }, $set: { updatedAt: now } }
-        )
-        return conversationId
-      } else {
-        const title  = generateTitle(query.trim())
-        const result = await col.insertOne({ clientId, title, messages: [userMsg, assistantMsg], createdAt: now, updatedAt: now })
-        return result.insertedId.toString()
+      const assistantMsg = {
+        role:    'assistant',
+        content: answer,
+        sources: sources.map(s => ({ source_file: s.source_file, score: s.score })),
+        timestamp: now,
       }
+
+      if (activeConversationId) {
+        // Append to existing conversation — verify ownership to prevent ID spoofing
+        const updated = await col.findOneAndUpdate(
+          { _id: new ObjectId(activeConversationId), clientId },
+          { $push: { messages: { $each: [userMsg, assistantMsg] } }, $set: { updatedAt: now } },
+          { returnDocument: 'after', projection: { _id: 1 } }
+        )
+        if (!updated) {
+          // Conversation not found or belongs to a different client — start fresh
+          console.warn(`[chat/message] conversationId ${activeConversationId} not found for ${clientId}, creating new`)
+          activeConversationId = null
+        }
+      }
+
+      if (!activeConversationId) {
+        // First message in a new session — use the question as the conversation title
+        const title  = generateTitle(query.trim())
+        const result = await col.insertOne({
+          clientId,
+          title,
+          messages:  [userMsg, assistantMsg],
+          createdAt: now,
+          updatedAt: now,
+        })
+        activeConversationId = result.insertedId.toString()
+      }
+    } catch (saveErr) {
+      // Saving history should never block the user from getting their answer.
+      // Log and continue — the response will still include whatever conversationId
+      // we managed to resolve (null if the insert itself failed).
+      console.warn('[chat/message] Failed to save conversation:', saveErr.message)
     }
-    res.json({ answer, sources, client: { clientId, name }, conversationId: conversationId || null })
-    saveConversation().catch(err => console.warn('[chat/message] Failed to save conversation:', err.message))
+
+    // ── 4. Return answer + the conversationId the client must reuse ───────────
+    res.json({
+      answer,
+      sources,
+      conversationId: activeConversationId,
+      client: { clientId, name },
+    })
 
   } catch (err) {
     console.error('[chat/message] Error:', err.message)
@@ -1141,6 +1197,7 @@ app.listen(PORT, () => {
   console.log(`Blob concurrency: ${BLOB_CONCURRENCY}`)
   console.log(`Azure blob client: ${blobServiceClient ? 'singleton ready' : 'MISSING connection string'}`)
   startApiKeyHealthChecker()
+  warmupChunkCaches()  // pre-load chunks for any WARMUP_CLIENT_IDS at boot
 })
 
 module.exports = app
