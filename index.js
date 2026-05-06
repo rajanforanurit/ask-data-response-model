@@ -62,17 +62,16 @@ const KEY_CHECK_INTERVAL_MS   = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '3
 const PHI4_ENDPOINT    = process.env.PHI4_ENDPOINT
 const PHI4_API_KEY     = process.env.PHI4_API_KEY
 const PHI4_MODEL       = process.env.PHI4_MODEL || 'Phi-4-mini-instruct'
-const PHI4_TIMEOUT_MS  = parseInt(process.env.PHI4_TIMEOUT_MS || '30000', 10)  // reduced from 60s
+const PHI4_TIMEOUT_MS  = parseInt(process.env.PHI4_TIMEOUT_MS || '30000', 10)
 
 const AZURE_EMBED_ENDPOINT = process.env.AZURE_EMBED_ENDPOINT || ''
 const AZURE_EMBED_KEY      = process.env.AZURE_EMBED_KEY || ''
 const AZURE_EMBED_MODEL    = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
-const EMBED_TIMEOUT_MS     = parseInt(process.env.EMBED_TIMEOUT_MS || '10000', 10)  // reduced from 15s
+const EMBED_TIMEOUT_MS     = parseInt(process.env.EMBED_TIMEOUT_MS || '10000', 10)
 const EMBED_POOL_LIMIT     = parseInt(process.env.EMBED_POOL_LIMIT || '20', 10)
-const REQUEST_TIMEOUT_MS   = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10)  // reduced from 90s
-const KEYWORD_SHORTCIRCUIT_SCORE = parseInt(process.env.KEYWORD_SHORTCIRCUIT_SCORE || '6', 10)  // lowered from 12
+const REQUEST_TIMEOUT_MS   = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10)
+const KEYWORD_SHORTCIRCUIT_SCORE = parseInt(process.env.KEYWORD_SHORTCIRCUIT_SCORE || '6', 10)
 
-// Warmup: clients to pre-load chunks for on startup
 const WARMUP_CLIENT_IDS = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
 
 const RAW_PREFIX    = 'raw'
@@ -107,8 +106,9 @@ const DOC_TYPE = {
   WEB:          'web',
   UNKNOWN:      'unknown',
 }
+
 const RESPONSE_CACHE     = new Map()
-const RESPONSE_CACHE_TTL = 10 * 60 * 1000 
+const RESPONSE_CACHE_TTL = 10 * 60 * 1000
 const RESPONSE_CACHE_MAX = 1000
 
 function responseCacheGet(key) {
@@ -119,7 +119,6 @@ function responseCacheGet(key) {
 }
 
 function responseCacheSet(key, value) {
-  // Evict oldest entry if over limit
   if (RESPONSE_CACHE.size >= RESPONSE_CACHE_MAX) {
     const firstKey = RESPONSE_CACHE.keys().next().value
     RESPONSE_CACHE.delete(firstKey)
@@ -130,6 +129,7 @@ function responseCacheSet(key, value) {
 function getCacheKey(clientId, query) {
   return `${clientId}:${query.toLowerCase().trim()}`
 }
+
 const IN_FLIGHT = new Map()
 let phiActiveCount = 0
 const PHI_MAX_CONCURRENT = 3
@@ -158,13 +158,13 @@ function drainPhiQueue() {
     next()
   }
 }
+
 let phiFailures      = 0
 let phiBlockedUntil  = 0
 
 function phiCircuitOpen() {
   if (Date.now() < phiBlockedUntil) return true
   if (phiBlockedUntil > 0) {
-    // Circuit was blocked but timeout passed — half-open, reset
     phiBlockedUntil = 0
     phiFailures     = 0
     console.log('[phi4] Circuit breaker reset (timeout elapsed)')
@@ -182,7 +182,6 @@ function phiRecordFailure() {
   }
 }
 
-// ─── fetchWithTimeout ─────────────────────────────────────────────────────────
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
@@ -270,6 +269,8 @@ function detectQueryIntent(query) {
   const DEFINITION_PATTERNS = [/^what\s+(is|are|does)\s+/,/^define\s+/,/^explain\s+/,/^meaning\s+of\s+/,/^tell\s+me\s+about\s+/,/^describe\s+/,/^how\s+is\s+.+\s+(calculated|defined|measured|computed)/,/\bmeaning\b/,/\bdefinition\b/,/\bwhat\s+does\b/]
   const LOOKUP_PATTERNS     = [/^(show|list|find|get|fetch|give)\s+(me\s+)?/,/^how\s+many\s+/,/^what\s+(is\s+the\s+)?(value|number|count|total|sum|amount)/]
   const COMPARISON_PATTERNS = [/\bvs\b|\bversus\b|\bdifference\b|\bcompare\b|\bbetween\b/]
+  const URL_PATTERNS        = [/\burl\b/,/\blink\b/,/\breport\b.*\burl\b/,/\burl\b.*\breport\b/,/\bpower\s*bi\b/,/\bdashboard\b/]
+  if (URL_PATTERNS.some(p => p.test(q)))        return 'url_lookup'
   if (DEFINITION_PATTERNS.some(p => p.test(q))) return 'definition'
   if (COMPARISON_PATTERNS.some(p => p.test(q))) return 'comparison'
   if (LOOKUP_PATTERNS.some(p => p.test(q)))     return 'lookup'
@@ -294,6 +295,15 @@ function extractSubject(query) {
     if (m) return m[1].trim()
   }
   return q
+}
+
+// ─── FIX: Extract URL-specific keywords from query ───────────────────────────
+function extractUrlKeywords(query) {
+  const q = query.toLowerCase()
+  // Remove generic words, keep meaningful ones
+  const stopWords = new Set(['power', 'bi', 'report', 'url', 'link', 'for', 'the', 'a', 'an', 'of', 'in', 'get', 'me', 'show', 'give', 'find', 'fetch'])
+  const words = q.replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1 && !stopWords.has(w))
+  return words
 }
 
 function fixBrokenUrls(text) {
@@ -329,11 +339,9 @@ function buildInvertedIndex(chunks) {
   return index
 }
 
-// ─── Phi-4 call: circuit breaker + concurrency limit + timeout ────────────────
+// ─── Phi-4 call ───────────────────────────────────────────────────────────────
 async function callPhi4(systemPrompt, userMessage) {
   if (!PHI4_ENDPOINT || !PHI4_API_KEY) throw new Error('PHI4_ENDPOINT and PHI4_API_KEY environment variables are required')
-
-  // Check circuit breaker first (fast fail, no queue slot used)
   if (phiCircuitOpen()) throw new Error('Model temporarily unavailable (circuit breaker open)')
 
   return runWithPhiLimit(async () => {
@@ -346,8 +354,8 @@ async function callPhi4(systemPrompt, userMessage) {
           body: JSON.stringify({
             model:       PHI4_MODEL,
             messages:    [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
-            temperature: 0.2,
-            max_tokens:  1024,
+            temperature: 0.1,
+            max_tokens:  512,
           }),
         },
         PHI4_TIMEOUT_MS
@@ -410,15 +418,28 @@ async function embedBatch(texts) {
   }
 }
 
+// ─── FIX: Precision keyword search with URL-aware scoring ────────────────────
 function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = null) {
   const subject      = intent === 'definition' ? extractSubject(query) : query.toLowerCase()
   const queryLower   = query.toLowerCase()
   const subjectLower = subject.toLowerCase()
   const subjectWords = subjectLower.split(/\s+/).filter(w => w.length > 1)
   const queryWords   = queryLower.replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1)
+
+  // For URL lookups, extract specific topic keywords (e.g., "occupancy" from "power BI report URL for occupancy")
+  const urlKeywords = intent === 'url_lookup' ? extractUrlKeywords(query) : []
+
   let candidateIndices
   if (invertedIndex && subjectWords.length > 0) {
-    const sets = subjectWords.map(w => invertedIndex.get(w) || new Set())
+    const wordsToIndex = intent === 'url_lookup' ? urlKeywords : subjectWords
+    const sets = wordsToIndex.map(w => invertedIndex.get(w) || new Set())
+    // Also always index for URL/Link chunks on url_lookup
+    if (intent === 'url_lookup') {
+      const urlSet = invertedIndex.get('url') || new Set()
+      const linkSet = invertedIndex.get('link') || new Set()
+      const httpSet = invertedIndex.get('http') || new Set()
+      sets.push(urlSet, linkSet, httpSet)
+    }
     const union = new Set()
     for (const s of sets) for (const idx of s) union.add(idx)
     candidateIndices = union
@@ -426,7 +447,7 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
 
   const source = candidateIndices
     ? [...candidateIndices].map(i => chunks[i]).filter(Boolean)
-    : chunks  // full scan fallback
+    : chunks.slice(0, 100)
 
   return source
     .map(c => {
@@ -434,27 +455,41 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
       const docType = classifyExtension(c.source_file || '')
       let score = 0
 
-      if (text.includes(subjectLower)) {
-        score += subjectWords.length * 4
-        const defPattern = new RegExp(`${escapeRegex(subjectLower)}\\s*(is|are)\\s*(defined|described|calculated|measured|computed)`, 'i')
-        if (defPattern.test(c.text || '')) score += subjectWords.length * 6
-      }
-
-      score += subjectWords.filter(w => text.includes(w)).length * 2
-
-      if ((docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) && intent === 'definition') {
-        const descPattern = new RegExp(`${escapeRegex(subjectLower)}\\s*(is described as|is defined as):`, 'i')
-        if (descPattern.test(c.text || '')) score += subjectWords.length * 8
-      }
-
-      if (docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) {
-        for (const w of subjectWords) {
-          const kvPattern = new RegExp(`:\\s*${escapeRegex(w)}\\b|\\|\\s*${escapeRegex(w)}\\b`, 'i')
-          if (kvPattern.test(c.text || '')) score += 2
+      if (intent === 'url_lookup') {
+        // Must contain a URL
+        if (!text.includes('http')) return { ...c, _score: 0 }
+        // Score by how many topic keywords match
+        const topicMatches = urlKeywords.filter(w => text.includes(w)).length
+        score += topicMatches * 10
+        // Penalise chunks that match none of the topic keywords
+        if (topicMatches === 0) return { ...c, _score: 0 }
+        // Boost exact multi-word topic phrase
+        const topicPhrase = urlKeywords.join(' ')
+        if (text.includes(topicPhrase)) score += 15
+      } else {
+        if (text.includes(subjectLower)) {
+          score += subjectWords.length * 4
+          const defPattern = new RegExp(`${escapeRegex(subjectLower)}\\s*(is|are)\\s*(defined|described|calculated|measured|computed)`, 'i')
+          if (defPattern.test(c.text || '')) score += subjectWords.length * 6
         }
+
+        score += subjectWords.filter(w => text.includes(w)).length * 2
+
+        if ((docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) && intent === 'definition') {
+          const descPattern = new RegExp(`${escapeRegex(subjectLower)}\\s*(is described as|is defined as):`, 'i')
+          if (descPattern.test(c.text || '')) score += subjectWords.length * 8
+        }
+
+        if (docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) {
+          for (const w of subjectWords) {
+            const kvPattern = new RegExp(`:\\s*${escapeRegex(w)}\\b|\\|\\s*${escapeRegex(w)}\\b`, 'i')
+            if (kvPattern.test(c.text || '')) score += 2
+          }
+        }
+
+        if (text.includes(queryLower)) score += queryWords.length * 2
       }
 
-      if (text.includes(queryLower)) score += queryWords.length * 2
       return { ...c, _score: score }
     })
     .filter(c => c._score > 0)
@@ -469,15 +504,17 @@ async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
   const candidates      = keywordSearch(normalizedQuery, chunks, keywordTopK, intent, invertedIndex)
   const pool            = candidates.length > 0 ? candidates : chunks.slice(0, 100)
 
-  // Hard short-circuit: strong keyword hit → skip embed entirely (lowered threshold to 6)
   if (pool.length > 0 && pool[0]._score >= KEYWORD_SHORTCIRCUIT_SCORE) {
     console.log(`[retrieveChunks] keyword short-circuit (score=${pool[0]._score}) — skipping embed`)
     return pool.slice(0, Math.min(topK, 10))
   }
 
-  // Soft short-circuit: definition queries with decent hits
   if (intent === 'definition' && pool.length > 0 && pool[0]._score >= 4) {
     return pool.slice(0, Math.min(topK, 10))
+  }
+
+  if (intent === 'url_lookup' && pool.length > 0) {
+    return pool.slice(0, Math.min(topK, 6))
   }
 
   if (AZURE_EMBED_ENDPOINT && AZURE_EMBED_KEY) {
@@ -517,27 +554,14 @@ async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
   return pool.slice(0, Math.min(topK, 12))
 }
 
-// ─── Context & prompt builders ────────────────────────────────────────────────
+// ─── Context builder ──────────────────────────────────────────────────────────
 function buildContext(hits) {
   return hits.map((h, i) => {
-    const src      = h.source_file || 'document'
-    const docType  = classifyExtension(src)
-    const typeLabel = {
-      [DOC_TYPE.SPREADSHEET]:  'spreadsheet — pipe-separated key:value pairs, each line is one record',
-      [DOC_TYPE.DATA]:         'structured data (JSON/YAML/CSV)',
-      [DOC_TYPE.PDF]:          'PDF document',
-      [DOC_TYPE.WORD]:         'Word document',
-      [DOC_TYPE.PRESENTATION]: 'presentation slide',
-      [DOC_TYPE.CODE]:         'source code',
-      [DOC_TYPE.TEXT]:         'text/markdown document',
-      [DOC_TYPE.EMAIL]:        'email',
-      [DOC_TYPE.WEB]:          'web/HTML page',
-      [DOC_TYPE.UNKNOWN]:      'document',
-    }[docType] || 'document'
-    return `[Excerpt ${i + 1} | type: ${typeLabel} | relevance: ${typeof h._score === 'number' ? h._score.toFixed(3) : 'n/a'}]\n${(h.text || '').trim()}`
+    return `[${i + 1}]\n${(h.text || '').trim()}`
   }).join('\n\n---\n\n')
 }
 
+// ─── FIX: Lean, optimised system prompt (~600-650 tokens) ─────────────────────
 const SYSTEM_PROMPT_CACHE     = new Map()
 const SYSTEM_PROMPT_CACHE_MAX = 100
 
@@ -547,65 +571,37 @@ function buildDynamicSystemPrompt(hits, intent = 'general') {
   const cached    = SYSTEM_PROMPT_CACHE.get(cacheKey)
   if (cached) return cached
 
-  const fileMap = new Map()
-  for (const h of hits) {
-    const src = h.source_file || 'unknown'
-    if (!fileMap.has(src)) fileMap.set(src, [])
-    fileMap.get(src).push((h.text || '').trim())
-  }
+  const hasSpreadsheet = hits.some(h => classifyExtension(h.source_file || '') === DOC_TYPE.SPREADSHEET)
 
-  const schemas       = []
-  for (const [fileName, samples] of fileMap) schemas.push(inferSchema(fileName, samples))
-  const spreadsheets  = schemas.filter(s => s.type === DOC_TYPE.SPREADSHEET)
-  const dataFiles     = schemas.filter(s => s.type === DOC_TYPE.DATA)
-  const pdfDocs       = schemas.filter(s => s.type === DOC_TYPE.PDF)
-  const wordDocs      = schemas.filter(s => s.type === DOC_TYPE.WORD)
-  const presentations = schemas.filter(s => s.type === DOC_TYPE.PRESENTATION)
-  const codeFiles     = schemas.filter(s => s.type === DOC_TYPE.CODE)
-  const textFiles     = schemas.filter(s => s.type === DOC_TYPE.TEXT)
-  const emailFiles    = schemas.filter(s => s.type === DOC_TYPE.EMAIL)
-  const webFiles      = schemas.filter(s => s.type === DOC_TYPE.WEB)
+  // ── Intent-specific instruction (short) ──────────────────────────────────
+  const intentLine = {
+    definition: `The user wants a definition. Find the EXACT term in context and explain what it is, how it's calculated, and any conditions. Focus only on that term.`,
+    lookup:     `The user wants a specific value or count. Find and return the exact data — no approximations.`,
+    comparison: `The user wants a comparison. Cover each item clearly with similarities and differences in parallel structure.`,
+    url_lookup: `The user wants a URL or report link. Return ONLY the matching URL(s) — full and unbroken. Match on the specific topic they asked about, not just any URL in the context.`,
+    general:    `Scan all context. Synthesise a clear, complete answer from what's there.`,
+  }[intent] || `Scan all context. Synthesise a clear, complete answer from what's there.`
 
-  const intentInstructions = {
-    definition: `ANSWER STRATEGY — DEFINITION QUERY: The user is asking for the definition or meaning of a specific term or metric. 1. Scan ALL excerpts for: the EXACT term, "is defined as", "is described as", "is calculated as", or any sentence that explains what the term IS. 2. If found, state the definition clearly and completely. Include calculation logic, filters, or conditions if mentioned. 3. If the term appears as a column name or value in structured data, explain its role in that context. 4. Do NOT describe tangentially related metrics — focus on the EXACT term asked about. 5. If multiple excerpts define the same term differently, reconcile them or present both definitions.`,
-    lookup:     `ANSWER STRATEGY — LOOKUP QUERY: The user wants a specific value, count, or list from the data. 1. Find the exact records, rows, or values that match the query. 2. Report the precise values — do not approximate. 3. For spreadsheet data, scan all rows; the answer may span multiple records. 4. State clearly where the data comes from (metric name, column name, etc.).`,
-    comparison: `ANSWER STRATEGY — COMPARISON QUERY: The user wants to compare two or more items. 1. Find all relevant information for EACH item being compared. 2. Structure the answer as a clear comparison — similarities and differences. 3. Use parallel structure so the comparison is easy to follow. 4. If one side has more data than the other, note the gap explicitly.`,
-    general:    `ANSWER STRATEGY — GENERAL QUERY: Scan all excerpts carefully. Find information that directly answers the question. Synthesise a clear, complete answer. If the information spans multiple excerpts, combine it coherently.`,
-  }[intent] || ''
+  const spreadsheetNote = hasSpreadsheet
+    ? `\nFor spreadsheet data: rows are pipe-separated key:value pairs. Lines with "is described as:" are definitions — prioritise them. Field labels like Field1/Field2 are internal column headers — never include them in your answer; use the actual values instead.`
+    : ''
 
-  const base = `You are a knowledgeable document assistant. Answer questions ONLY using the document context provided.
-UNIVERSAL RULES:
-1. Answer ONLY from the context. Never invent or assume information.
-2. Search the ENTIRE context — every excerpt — before concluding something is absent.
-3. Case-insensitive matching: "applicant count", "Applicant Count", "APPLICANT COUNT" are identical.
-4. If a term appears ANYWHERE in the context — as a label, value, heading, or inline text — treat it as present.
-5. If information is truly absent after thorough search, say: "I couldn't find specific information about that in your documents."
-6. Do NOT add citation markers like [1], [2], [3].
-7. Do NOT mention file names or source document names in your answer.
-8. Write clearly, concisely, and directly — like a knowledgeable colleague.
-9. Answer only what was asked. No padding or filler.
-10. NEVER say "the context does not define" or "not mentioned" if the term appears anywhere.
-11. If a URL is present, ALWAYS return the FULL URL exactly as-is. Never truncate or shorten URLs.
-12. URLs must be returned in one continuous line with no line breaks or spaces.
-${intentInstructions}`
+  const prompt = `You are a precise document assistant. Answer using ONLY the provided context.
 
-  const typeBlocks = []
-  if (spreadsheets.length > 0) {
-    const colSummary = spreadsheets.filter(s => s.columns.length > 0).map(s => ` • ${s.fileName}: [${s.columns.join(', ')}]`).join('\n')
-    typeBlocks.push(`SPREADSHEET RULES: - Data is serialised as pipe-delimited key:value rows. Each line = one record. - Lines like "X is described as: ..." are definition summaries — prioritise them for definition queries. - For definition queries: a field name matching the subject IS a definition. Explain it from surrounding values. - Scan ALL rows — the answer may not be in the first matching row. ${colSummary ? `- Detected columns:\n${colSummary}` : ''}`)
-  }
-  if (dataFiles.length > 0)     typeBlocks.push(`STRUCTURED DATA RULES (JSON/YAML/CSV): - Fields and values may be nested. Treat "parent.child: value" as a nested attribute. - Every key and every value is meaningful data — no prose definition required.`)
-  if (pdfDocs.length > 0)       typeBlocks.push(`PDF RULES: - Content is extracted from PDF pages. Minor formatting artefacts may exist. - Read numbers, dates, and figures exactly as they appear.`)
-  if (wordDocs.length > 0)      typeBlocks.push(`WORD DOCUMENT RULES: - Context contains prose, lists, and tables. Headings indicate section structure. - Quote definitions or policy statements accurately.`)
-  if (presentations.length > 0) typeBlocks.push(`PRESENTATION RULES: - Slide titles are section headers; bullets are supporting detail. - Do not infer beyond what the slide explicitly states.`)
-  if (codeFiles.length > 0)     typeBlocks.push(`CODE RULES: - Read code literally. Function/variable names and comments are all meaningful. - Describe what code does in plain English unless code output is requested.`)
-  if (textFiles.length > 0)     typeBlocks.push(`TEXT/MARKDOWN RULES: - Markdown formatting (##, **, -) indicates structure. Interpret accordingly. - Lists represent discrete facts or steps.`)
-  if (emailFiles.length > 0)    typeBlocks.push(`EMAIL RULES: - Attribute statements to their sender. Do not mix up correspondents. - Dates and times are as stated in the email header.`)
-  if (webFiles.length > 0)      typeBlocks.push(`WEB/HTML RULES: - Focus on main body content. Ignore repetitive navigation text. - Include URLs exactly if mentioned.`)
+Rules:
+1. Answer only from context — never invent information.
+2. Search every excerpt before saying something is missing.
+3. Matching is case-insensitive.
+4. If information is truly absent, say: "I couldn't find that in your documents."
+5. Never include citation markers like [1], [2].
+6. Never mention file names or source names.
+7. Never expose internal field labels (Field1, Field2, Field3, etc.) in your answer.
+8. Be concise and direct — answer only what was asked.
+9. URLs: return the full URL on a single unbroken line, exactly as it appears.
+10. For URL queries: only return URLs that match the specific topic asked — ignore unrelated links.
+${spreadsheetNote}
 
-  const uniqueTypes = [...new Set(schemas.map(s => s.type))]
-  const mixedNote   = uniqueTypes.length > 1 ? `\nMIXED DOCUMENT SET: Context contains ${uniqueTypes.length} document types (${uniqueTypes.join(', ')}). Apply the relevant rules above for each excerpt.` : ''
-  const prompt      = [base, ...typeBlocks, mixedNote].filter(Boolean).join('\n') + '\n'
+Task: ${intentLine}`
 
   if (SYSTEM_PROMPT_CACHE.size >= SYSTEM_PROMPT_CACHE_MAX) {
     SYSTEM_PROMPT_CACHE.delete(SYSTEM_PROMPT_CACHE.keys().next().value)
@@ -847,6 +843,7 @@ async function downloadBlobAsBuffer(containerClient, blobName) {
     parts.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
   return Buffer.concat(parts)
 }
+
 const BLOB_CONCURRENCY = parseInt(process.env.BLOB_CONCURRENCY || '8', 10)
 
 async function _doLoadChunks(clientId) {
@@ -888,15 +885,12 @@ async function loadChunksForClient(clientId) {
   const now    = Date.now()
   const cached = CHUNK_CACHE.get(clientId)
 
-  // Stale-while-revalidate: serve stale immediately, refresh in background
   if (cached && cached.chunks) {
     const isStale = now - cached.ts > CHUNK_CACHE_TTL
     if (!isStale) {
-      // Fresh — return immediately
       return { chunks: cached.chunks, invertedIndex: cached.invertedIndex }
     }
     if (!cached.loading) {
-      // Stale but usable — serve stale, kick off background refresh
       console.log(`[chunkCache] Serving stale cache for ${clientId}, refreshing in background`)
       const refreshPromise = _doLoadChunks(clientId)
         .then(chunks => {
@@ -913,18 +907,15 @@ async function loadChunksForClient(clientId) {
       CHUNK_CACHE.set(clientId, { ...cached, loading: refreshPromise })
       return { chunks: cached.chunks, invertedIndex: cached.invertedIndex }
     }
-    // Already refreshing — return stale
     return { chunks: cached.chunks, invertedIndex: cached.invertedIndex }
   }
 
-  // No cache at all — must wait for load
   if (cached && cached.loading) {
     const chunks = await cached.loading
     const entry  = CHUNK_CACHE.get(clientId)
     return { chunks: chunks || entry?.chunks || [], invertedIndex: entry?.invertedIndex || null }
   }
 
-  // First load ever
   const loadPromise = _doLoadChunks(clientId)
     .then(chunks => {
       const invertedIndex = buildInvertedIndex(chunks)
@@ -962,27 +953,60 @@ async function answerWithPhi4(originalQuery, hits, intent = 'general') {
   const systemPrompt = buildDynamicSystemPrompt(hits, intent)
   const context      = buildContext(hits)
   const subjectHint  = intent === 'definition'
-    ? `\nThe user is specifically asking for the DEFINITION of: "${extractSubject(originalQuery)}". Focus entirely on that term.`
+    ? `\nFocus: define "${extractSubject(originalQuery)}" only.`
+    : intent === 'url_lookup'
+    ? `\nFocus: return only the URL(s) matching the topic "${extractUrlKeywords(originalQuery).join(' ')}". Do not return unrelated links.`
     : ''
 
-  const userMessage = `---DOCUMENT CONTEXT START---
+  const userMessage = `CONTEXT:
 ${context}
----DOCUMENT CONTEXT END---
 ${subjectHint}
-User question: "${originalQuery}"
-Instructions: Scan the entire context above. Apply the document-type rules. Give a direct, complete answer. Do not say a term is missing if it appears anywhere in the context.`
+Question: ${originalQuery}`
 
   return callPhi4(systemPrompt, userMessage)
 }
 
-// ─── Build a fallback answer from raw chunks when model is unavailable ────────
+// ─── FIX: Clean fallback — no technical note, no field names ─────────────────
 function buildFallbackAnswer(query, hits) {
-  if (!hits || hits.length === 0) return "I couldn't find relevant information in your documents for this query."
-  // Try to find a chunk that directly mentions the query subject
+  if (!hits || hits.length === 0) {
+    return "I couldn't find relevant information in your documents for this query."
+  }
+  const intent = detectQueryIntent(query)
+
+  // For URL lookups, try to extract just the URL line
+  if (intent === 'url_lookup') {
+    const urlKeywords = extractUrlKeywords(query)
+    for (const h of hits) {
+      const lines = (h.text || '').split('\n')
+      for (const line of lines) {
+        if (!line.toLowerCase().includes('http')) continue
+        // Check if this line is relevant to the topic
+        const lineLower = line.toLowerCase()
+        const matches = urlKeywords.filter(w => lineLower.includes(w)).length
+        if (matches > 0) {
+          // Extract just the URL
+          const urlMatch = line.match(/https?:\/\/\S+/)
+          if (urlMatch) return urlMatch[0].replace(/\s/g, '')
+        }
+      }
+    }
+  }
+
+  // For definitions, find the most relevant snippet
   const subject = extractSubject(query).toLowerCase()
-  const best    = hits.find(h => (h.text || '').toLowerCase().includes(subject)) || hits[0]
-  const snippet = (best.text || '').slice(0, 400).trim()
-  return `Here's the most relevant excerpt from your documents:\n\n${snippet}\n\n*(Note: Full AI analysis is temporarily unavailable. Please try again in a moment.)*`
+  const best = hits.find(h => {
+    const t = (h.text || '').toLowerCase()
+    return t.includes('is described as') && t.includes(subject)
+  }) || hits.find(h => (h.text || '').toLowerCase().includes(subject)) || hits[0]
+
+  // Clean up internal field labels from the snippet
+  const snippet = (best.text || '')
+    .replace(/Field\d+:\s*/gi, '')
+    .replace(/\|\s*Field\d+\b/gi, '')
+    .slice(0, 350)
+    .trim()
+
+  return snippet || "I couldn't find that specific information in your documents."
 }
 
 function generateTitle(query) {
@@ -1214,7 +1238,6 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
     if (!query?.trim()) return res.status(400).json({ error: 'query is required' })
     const { clientId, name } = req.client
 
-    // ── 1. Response cache — instant reply for repeated queries ─────────────────
     const cacheKey = getCacheKey(clientId, query)
     const cached   = responseCacheGet(cacheKey)
     if (cached) {
@@ -1226,11 +1249,9 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       try {
         const result = await IN_FLIGHT.get(cacheKey)
         return res.json({ ...result, conversationId: conversationId || result.conversationId })
-      } catch {
-      }
+      } catch {}
     }
 
-    // ── 3. Build the main processing promise ───────────────────────────────────
     const requestPromise = (async () => {
       const { chunks, invertedIndex } = await loadChunksForClient(clientId)
 
@@ -1248,14 +1269,14 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
 
       if (hits.length === 0) {
         return {
-          answer: "I couldn't find that in your documents. Try rephrasing your question or asking about it differently.",
+          answer: "I couldn't find that in your documents. Try rephrasing your question.",
           sources: [],
           conversationId: conversationId || null,
           client: { clientId, name },
         }
       }
 
-      // ── 4. Call model with 8s fast-fallback ─────────────────────────────────
+      // ── Call model with 8s fast-fallback — no error note in fallback ────────
       let rawAnswer
       try {
         rawAnswer = await Promise.race([
@@ -1269,13 +1290,20 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         rawAnswer = buildFallbackAnswer(query.trim(), hits)
       }
 
-      const answer  = fixBrokenUrls(rawAnswer)
+      // ── FIX: Strip any residual field label patterns from model output ───────
+      const cleanAnswer = fixBrokenUrls(rawAnswer)
+        .replace(/\bField\d+\s*:\s*/gi, '')
+        .replace(/\|\s*Field\d+\b/gi, '')
+        .trim()
+
+      const answer  = cleanAnswer
       const sources = hits.map(h => ({
         source_file: h.source_file  || 'unknown',
         chunk_index: h.chunk_index  ?? 0,
         score:       typeof h._score === 'number' ? parseFloat(h._score.toFixed(4)) : null,
         preview:     (h.text || '').slice(0, 300),
       }))
+
       let activeConversationId = conversationId || null
       try {
         const chatDatabase = await getChatDb()
@@ -1313,7 +1341,6 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       return { answer, sources, conversationId: activeConversationId, client: { clientId, name } }
     })()
 
-    // Register in-flight so duplicate requests can share this promise
     IN_FLIGHT.set(cacheKey, requestPromise)
 
     let result
@@ -1322,7 +1349,9 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
     } finally {
       IN_FLIGHT.delete(cacheKey)
     }
-    if (result.answer && !result.answer.includes('temporarily unavailable')) {
+
+    // Only cache clean, complete answers
+    if (result.answer && result.answer.length > 10) {
       responseCacheSet(cacheKey, result)
     }
 
