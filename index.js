@@ -50,30 +50,30 @@ app.options('*', cors({
 app.use(express.json())
 
 // ─── ENV ──────────────────────────────────────────────────────────────────────
-const MONGODB_URI  = process.env.MONGODB_URI
-const MONGODB_DB  = process.env.MONGODB_DB || 'clientcreds'
-const CHAT_HISTORY_URI = process.env.CHAT_HISTORY_URI
-const CHAT_HISTORY_DB  = process.env.CHAT_HISTORY_DB || 'chathistory'
+const MONGODB_URI             = process.env.MONGODB_URI
+const MONGODB_DB              = process.env.MONGODB_DB || 'clientcreds'
+const CHAT_HISTORY_URI        = process.env.CHAT_HISTORY_URI
+const CHAT_HISTORY_DB         = process.env.CHAT_HISTORY_DB || 'chathistory'
 const AZURE_CONNECTION_STRING = process.env.AZURE_CONNECTION_STRING || ''
-const AZURE_CONTAINER_NAME  = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
-const ADMIN_API_KEY   = process.env.ADMIN_API_KEY
-const KEY_CHECK_INTERVAL_MS = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10)
+const AZURE_CONTAINER_NAME    = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
+const ADMIN_API_KEY           = process.env.ADMIN_API_KEY
+const KEY_CHECK_INTERVAL_MS   = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10)
 
-const PHI4_ENDPOINT = process.env.PHI4_ENDPOINT
-const PHI4_API_KEY  = process.env.PHI4_API_KEY
-const PHI4_MODEL = process.env.PHI4_MODEL || 'Phi-4-mini-instruct'
-const PHI4_TIMEOUT_MS = parseInt(process.env.PHI4_TIMEOUT_MS || '60000', 10)
+const PHI4_ENDPOINT    = process.env.PHI4_ENDPOINT
+const PHI4_API_KEY     = process.env.PHI4_API_KEY
+const PHI4_MODEL       = process.env.PHI4_MODEL || 'Phi-4-mini-instruct'
+const PHI4_TIMEOUT_MS  = parseInt(process.env.PHI4_TIMEOUT_MS || '60000', 10)
+
 const AZURE_EMBED_ENDPOINT = process.env.AZURE_EMBED_ENDPOINT || ''
-const AZURE_EMBED_KEY = process.env.AZURE_EMBED_KEY || ''
-const AZURE_EMBED_MODEL = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
-const EMBED_TIMEOUT_MS  = parseInt(process.env.EMBED_TIMEOUT_MS || '15000', 10)
-const EMBED_POOL_LIMIT = parseInt(process.env.EMBED_POOL_LIMIT || '20', 10)
-const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '90000', 10)
-
+const AZURE_EMBED_KEY      = process.env.AZURE_EMBED_KEY || ''
+const AZURE_EMBED_MODEL    = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
+const EMBED_TIMEOUT_MS     = parseInt(process.env.EMBED_TIMEOUT_MS || '15000', 10)
+const EMBED_POOL_LIMIT     = parseInt(process.env.EMBED_POOL_LIMIT || '20', 10)
+const REQUEST_TIMEOUT_MS   = parseInt(process.env.REQUEST_TIMEOUT_MS || '90000', 10)
+const KEYWORD_SHORTCIRCUIT_SCORE = parseInt(process.env.KEYWORD_SHORTCIRCUIT_SCORE || '12', 10)
 const RAW_PREFIX    = 'raw'
 const CHUNK_SIZE    = 500
 const CHUNK_OVERLAP = 2
-
 const blobServiceClient = AZURE_CONNECTION_STRING
   ? BlobServiceClient.fromConnectionString(AZURE_CONNECTION_STRING)
   : null
@@ -112,14 +112,13 @@ async function fetchWithTimeout(url, options, timeoutMs) {
     const response = await fetch(url, { ...options, signal: controller.signal })
     return response
   } catch (err) {
-    if (err.name === 'AbortError') {
-      throw new Error(`Request timed out after ${timeoutMs}ms: ${url}`)
-    }
+    if (err.name === 'AbortError') throw new Error(`Request timed out after ${timeoutMs}ms: ${url}`)
     throw err
   } finally {
     clearTimeout(timer)
   }
 }
+
 function withRequestTimeout(fn, timeoutMs = REQUEST_TIMEOUT_MS) {
   return async (req, res, next) => {
     let settled = false
@@ -127,12 +126,9 @@ function withRequestTimeout(fn, timeoutMs = REQUEST_TIMEOUT_MS) {
       if (!settled) {
         settled = true
         console.error(`[timeout] Request to ${req.path} exceeded ${timeoutMs}ms`)
-        if (!res.headersSent) {
-          res.status(503).json({ error: 'Request timed out. Please try again.' })
-        }
+        if (!res.headersSent) res.status(503).json({ error: 'Request timed out. Please try again.' })
       }
     }, timeoutMs)
-
     try {
       await fn(req, res, next)
     } catch (err) {
@@ -147,28 +143,27 @@ function withRequestTimeout(fn, timeoutMs = REQUEST_TIMEOUT_MS) {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function classifyExtension(fileName) {
   const ext = ('.' + fileName.split('.').pop()).toLowerCase()
-  if (['.xlsx', '.xls', '.ods'].includes(ext))                              return DOC_TYPE.SPREADSHEET
-  if (ext === '.pdf')                                                        return DOC_TYPE.PDF
-  if (['.docx', '.doc', '.odt', '.rtf'].includes(ext))                      return DOC_TYPE.WORD
-  if (['.pptx', '.ppt'].includes(ext))                                      return DOC_TYPE.PRESENTATION
+  if (['.xlsx', '.xls', '.ods'].includes(ext))                               return DOC_TYPE.SPREADSHEET
+  if (ext === '.pdf')                                                         return DOC_TYPE.PDF
+  if (['.docx', '.doc', '.odt', '.rtf'].includes(ext))                       return DOC_TYPE.WORD
+  if (['.pptx', '.ppt'].includes(ext))                                       return DOC_TYPE.PRESENTATION
   if (['.py','.js','.ts','.jsx','.tsx','.java','.cpp','.c','.h','.cs',
        '.go','.rb','.php','.swift','.kt','.r','.sql','.sh','.bash','.ps1']
-      .includes(ext))                                                        return DOC_TYPE.CODE
+      .includes(ext))                                                         return DOC_TYPE.CODE
   if (['.json','.jsonl','.yaml','.yml','.toml','.csv','.tsv'].includes(ext)) return DOC_TYPE.DATA
-  if (['.txt','.md','.markdown','.rst'].includes(ext))                      return DOC_TYPE.TEXT
-  if (ext === '.eml')                                                        return DOC_TYPE.EMAIL
-  if (['.html','.htm','.xml'].includes(ext))                                return DOC_TYPE.WEB
+  if (['.txt','.md','.markdown','.rst'].includes(ext))                       return DOC_TYPE.TEXT
+  if (ext === '.eml')                                                         return DOC_TYPE.EMAIL
+  if (['.html','.htm','.xml'].includes(ext))                                 return DOC_TYPE.WEB
   return DOC_TYPE.UNKNOWN
 }
 
 function inferSchema(fileName, textSamples) {
-  const type = classifyExtension(fileName)
+  const type   = classifyExtension(fileName)
   const schema = { type, fileName, columns: [], sampleValues: [], topics: [] }
   if (type === DOC_TYPE.SPREADSHEET || type === DOC_TYPE.DATA) {
     const columnSet = new Set(), valueSet = new Set()
     for (const sample of textSamples.slice(0, 60)) {
-      const pairs = sample.split('|').map(s => s.trim())
-      for (const pair of pairs) {
+      for (const pair of sample.split('|').map(s => s.trim())) {
         const colonIdx = pair.indexOf(':')
         if (colonIdx > 0) {
           const key = pair.slice(0, colonIdx).trim()
@@ -240,38 +235,41 @@ function cosineSim(a, b) {
   }
   return dot / (Math.sqrt(normA) * Math.sqrt(normB) + 1e-9)
 }
+function buildInvertedIndex(chunks) {
+  const index = new Map()
+  for (let i = 0; i < chunks.length; i++) {
+    const words = (chunks[i].text || '').toLowerCase()
+      .replace(/[^\w\s]/g, ' ')
+      .split(/\s+/)
+    for (const w of words) {
+      if (w.length < 3) continue
+      if (!index.has(w)) index.set(w, new Set())
+      index.get(w).add(i)
+    }
+  }
+  return index
+}
 
 async function callPhi4(systemPrompt, userMessage) {
-  if (!PHI4_ENDPOINT || !PHI4_API_KEY) {
-    throw new Error('PHI4_ENDPOINT and PHI4_API_KEY environment variables are required')
-  }
-  const body = {
-    model: PHI4_MODEL,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user',   content: userMessage  },
-    ],
-    temperature: 0.2,
-    max_tokens:  1024,
-  }
+  if (!PHI4_ENDPOINT || !PHI4_API_KEY) throw new Error('PHI4_ENDPOINT and PHI4_API_KEY environment variables are required')
   const response = await fetchWithTimeout(
     PHI4_ENDPOINT,
     {
       method:  'POST',
-      headers: {
-        'Content-Type':  'application/json',
-        'Authorization': `Bearer ${PHI4_API_KEY}`,
-      },
-      body: JSON.stringify(body),
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${PHI4_API_KEY}` },
+      body: JSON.stringify({
+        model:       PHI4_MODEL,
+        messages:    [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
+        temperature: 0.2,
+        max_tokens:  1024,
+      }),
     },
     PHI4_TIMEOUT_MS
   )
-
   if (!response.ok) {
     const errText = await response.text()
     throw new Error(`Phi-4 API error ${response.status}: ${errText}`)
   }
-
   const data = await response.json()
   return data.choices?.[0]?.message?.content || ''
 }
@@ -283,15 +281,11 @@ async function embedQueryAzure(query) {
       AZURE_EMBED_ENDPOINT,
       {
         method:  'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'api-key':      AZURE_EMBED_KEY,
-        },
-        body: JSON.stringify({ input: query, model: AZURE_EMBED_MODEL }),
+        headers: { 'Content-Type': 'application/json', 'api-key': AZURE_EMBED_KEY },
+        body:    JSON.stringify({ input: query, model: AZURE_EMBED_MODEL }),
       },
       EMBED_TIMEOUT_MS
     )
-
     if (!response.ok) return null
     const data = await response.json()
     return data.data?.[0]?.embedding || null
@@ -300,6 +294,7 @@ async function embedQueryAzure(query) {
     return null
   }
 }
+
 async function embedBatch(texts) {
   if (!AZURE_EMBED_ENDPOINT || !AZURE_EMBED_KEY || !texts.length) return []
   try {
@@ -307,30 +302,38 @@ async function embedBatch(texts) {
       AZURE_EMBED_ENDPOINT,
       {
         method:  'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'api-key':      AZURE_EMBED_KEY,
-        },
-        body: JSON.stringify({ input: texts, model: AZURE_EMBED_MODEL }),
+        headers: { 'Content-Type': 'application/json', 'api-key': AZURE_EMBED_KEY },
+        body:    JSON.stringify({ input: texts, model: AZURE_EMBED_MODEL }),
       },
       EMBED_TIMEOUT_MS
     )
     if (!response.ok) return []
     const data = await response.json()
-    // data.data is ordered by index
     return (data.data || []).sort((a, b) => a.index - b.index).map(d => d.embedding)
   } catch (err) {
     console.warn('[embedBatch] failed:', err.message)
     return []
   }
 }
-function keywordSearch(query, chunks, topK, intent = 'general') {
+function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = null) {
   const subject      = intent === 'definition' ? extractSubject(query) : query.toLowerCase()
   const queryLower   = query.toLowerCase()
   const subjectLower = subject.toLowerCase()
   const subjectWords = subjectLower.split(/\s+/).filter(w => w.length > 1)
   const queryWords   = queryLower.replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1)
-  return chunks
+  let candidateIndices
+  if (invertedIndex && subjectWords.length > 0) {
+    const sets = subjectWords.map(w => invertedIndex.get(w) || new Set())
+    const union = new Set()
+    for (const s of sets) for (const idx of s) union.add(idx)
+    candidateIndices = union
+  }
+
+  const source = candidateIndices
+    ? [...candidateIndices].map(i => chunks[i]).filter(Boolean)
+    : chunks  // full scan fallback
+
+  return source
     .map(c => {
       const text    = (c.text || '').toLowerCase()
       const docType = classifyExtension(c.source_file || '')
@@ -342,8 +345,7 @@ function keywordSearch(query, chunks, topK, intent = 'general') {
         if (defPattern.test(c.text || '')) score += subjectWords.length * 6
       }
 
-      const wordHits = subjectWords.filter(w => text.includes(w)).length
-      score += wordHits * 2
+      score += subjectWords.filter(w => text.includes(w)).length * 2
 
       if ((docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) && intent === 'definition') {
         const descPattern = new RegExp(`${escapeRegex(subjectLower)}\\s*(is described as|is defined as):`, 'i')
@@ -364,13 +366,25 @@ function keywordSearch(query, chunks, topK, intent = 'general') {
     .sort((a, b) => b._score - a._score)
     .slice(0, topK)
 }
-async function retrieveChunks(query, chunks, topK = 6) {
-  const intent           = detectQueryIntent(query)
-  const normalizedQuery  = query.toLowerCase().trim().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
-  const keywordTopK      = intent === 'definition' ? Math.min(150, chunks.length) : Math.min(100, chunks.length)
-  const candidates       = keywordSearch(normalizedQuery, chunks, keywordTopK, intent)
-  const pool             = candidates.length > 0 ? candidates : chunks.slice(0, 100)
 
+// ─── OPTIMIZATION 4: Smart embed short-circuit ────────────────────────────────
+// Skip the Azure embedding round-trip entirely when keyword search already found
+// a highly confident answer.  This is the single biggest latency win for common
+// definition/lookup queries (saves ~300–2000ms per request).
+async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
+  const intent          = detectQueryIntent(query)
+  const normalizedQuery = query.toLowerCase().trim().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
+  const keywordTopK     = intent === 'definition' ? Math.min(150, chunks.length) : Math.min(100, chunks.length)
+  const candidates      = keywordSearch(normalizedQuery, chunks, keywordTopK, intent, invertedIndex)
+  const pool            = candidates.length > 0 ? candidates : chunks.slice(0, 100)
+
+  // Hard short-circuit: strong keyword hit → skip embed entirely
+  if (pool.length > 0 && pool[0]._score >= KEYWORD_SHORTCIRCUIT_SCORE) {
+    console.log(`[retrieveChunks] keyword short-circuit (score=${pool[0]._score}) — skipping embed`)
+    return pool.slice(0, Math.min(topK, 10))
+  }
+
+  // Soft short-circuit: definition queries with decent hits
   if (intent === 'definition' && pool.length > 0 && pool[0]._score >= 8) {
     return pool.slice(0, Math.min(topK, 10))
   }
@@ -379,18 +393,18 @@ async function retrieveChunks(query, chunks, topK = 6) {
     try {
       const queryVec = await embedQueryAzure(normalizedQuery)
       if (queryVec) {
-        const poolSlice   = pool.slice(0, EMBED_POOL_LIMIT)
-        const chunkTexts  = poolSlice.map(c => (c.text || '').toLowerCase().slice(0, 512))
-        const embeddings  = await embedBatch(chunkTexts)
+        const poolSlice  = pool.slice(0, EMBED_POOL_LIMIT)
+        const chunkTexts = poolSlice.map(c => (c.text || '').toLowerCase().slice(0, 512))
+        const embeddings = await embedBatch(chunkTexts)
 
-        const maxKeyword  = pool[0]._score || 1
-        const weight      = intent === 'definition'
+        const maxKeyword = pool[0]._score || 1
+        const weight     = intent === 'definition'
           ? { semantic: 0.35, keyword: 0.65 }
           : { semantic: 0.70, keyword: 0.30 }
 
         const scored = poolSlice.map((c, i) => {
           const chunkVec = embeddings[i]
-          if (!chunkVec) return c  
+          if (!chunkVec) return c
           const semanticScore = cosineSim(queryVec, chunkVec)
           const keywordNorm   = typeof c._score === 'number' ? c._score / maxKeyword : 0
           return { ...c, _score: semanticScore * weight.semantic + keywordNorm * weight.keyword }
@@ -432,8 +446,16 @@ function buildContext(hits) {
     return `[Excerpt ${i + 1} | type: ${typeLabel} | relevance: ${typeof h._score === 'number' ? h._score.toFixed(3) : 'n/a'}]\n${(h.text || '').trim()}`
   }).join('\n\n---\n\n')
 }
+const SYSTEM_PROMPT_CACHE = new Map()
+const SYSTEM_PROMPT_CACHE_MAX = 100
 
 function buildDynamicSystemPrompt(hits, intent = 'general') {
+  // Cache key: sorted source file names + intent
+  const sourceKey = [...new Set(hits.map(h => h.source_file || 'unknown'))].sort().join('|')
+  const cacheKey  = `${sourceKey}::${intent}`
+  const cached    = SYSTEM_PROMPT_CACHE.get(cacheKey)
+  if (cached) return cached
+
   const fileMap = new Map()
   for (const h of hits) {
     const src = h.source_file || 'unknown'
@@ -492,7 +514,14 @@ ${intentInstructions}`
 
   const uniqueTypes = [...new Set(schemas.map(s => s.type))]
   const mixedNote   = uniqueTypes.length > 1 ? `\nMIXED DOCUMENT SET: Context contains ${uniqueTypes.length} document types (${uniqueTypes.join(', ')}). Apply the relevant rules above for each excerpt.` : ''
-  return [base, ...typeBlocks, mixedNote].filter(Boolean).join('\n') + '\n'
+  const prompt      = [base, ...typeBlocks, mixedNote].filter(Boolean).join('\n') + '\n'
+
+  // Bounded LRU eviction: drop oldest entry when cache is full
+  if (SYSTEM_PROMPT_CACHE.size >= SYSTEM_PROMPT_CACHE_MAX) {
+    SYSTEM_PROMPT_CACHE.delete(SYSTEM_PROMPT_CACHE.keys().next().value)
+  }
+  SYSTEM_PROMPT_CACHE.set(cacheKey, prompt)
+  return prompt
 }
 
 // ─── Mongo helpers ────────────────────────────────────────────────────────────
@@ -516,8 +545,8 @@ async function getChatDb() {
   return chatDb
 }
 
-const CLIENT_CACHE   = new Map()
-const CACHE_TTL_MS   = 5 * 60 * 1000
+const CLIENT_CACHE = new Map()
+const CACHE_TTL_MS = 5 * 60 * 1000
 
 function getCached(apiKey) {
   const entry = CLIENT_CACHE.get(apiKey)
@@ -679,24 +708,24 @@ async function extractEpub(buffer) {
 
 async function extractTextFromBuffer(buffer, fileName) {
   const ext = ('.' + fileName.split('.').pop()).toLowerCase()
-  if (ext === '.pdf')                          return extractPdf(buffer)
-  if (ext === '.docx' || ext === '.doc')       return extractWord(buffer)
-  if (ext === '.odt'  || ext === '.rtf')       return extractOffice(buffer)
-  if (['.xlsx','.xls','.ods'].includes(ext))   return extractSpreadsheet(buffer)
-  if (ext === '.csv')                          return extractCsv(buffer, ',')
-  if (ext === '.tsv')                          return extractCsv(buffer, '\t')
-  if (ext === '.pptx' || ext === '.ppt')       return extractOffice(buffer)
-  if (ext === '.html' || ext === '.htm')       return extractHtml(buffer)
-  if (ext === '.xml')                          return extractXml(buffer)
+  if (ext === '.pdf')                           return extractPdf(buffer)
+  if (ext === '.docx' || ext === '.doc')        return extractWord(buffer)
+  if (ext === '.odt'  || ext === '.rtf')        return extractOffice(buffer)
+  if (['.xlsx','.xls','.ods'].includes(ext))    return extractSpreadsheet(buffer)
+  if (ext === '.csv')                           return extractCsv(buffer, ',')
+  if (ext === '.tsv')                           return extractCsv(buffer, '\t')
+  if (ext === '.pptx' || ext === '.ppt')        return extractOffice(buffer)
+  if (ext === '.html' || ext === '.htm')        return extractHtml(buffer)
+  if (ext === '.xml')                           return extractXml(buffer)
   if (['.md','.markdown','.rst'].includes(ext)) return buffer.toString('utf-8')
-  if (ext === '.json')                         return extractJson(buffer)
-  if (ext === '.jsonl')                        return extractJsonl(buffer)
-  if (ext === '.yaml' || ext === '.yml')       return extractYaml(buffer)
-  if (ext === '.toml')                         return buffer.toString('utf-8')
+  if (ext === '.json')                          return extractJson(buffer)
+  if (ext === '.jsonl')                         return extractJsonl(buffer)
+  if (ext === '.yaml' || ext === '.yml')        return extractYaml(buffer)
+  if (ext === '.toml')                          return buffer.toString('utf-8')
   const plainText = new Set(['.txt','.py','.js','.ts','.jsx','.tsx','.java','.cpp','.c','.h','.cs','.go','.rb','.php','.swift','.kt','.r','.sql','.sh','.bash','.ps1'])
-  if (plainText.has(ext))                      return buffer.toString('utf-8')
-  if (ext === '.epub')                         return extractEpub(buffer)
-  if (ext === '.eml')                          return extractEml(buffer)
+  if (plainText.has(ext))                       return buffer.toString('utf-8')
+  if (ext === '.epub')                          return extractEpub(buffer)
+  if (ext === '.eml')                           return extractEml(buffer)
   return ''
 }
 
@@ -728,62 +757,80 @@ async function downloadBlobAsBuffer(containerClient, blobName) {
     parts.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
   return Buffer.concat(parts)
 }
-
-const CHUNK_CACHE = new Map()   
-const CHUNK_CACHE_TTL = parseInt(process.env.CHUNK_CACHE_TTL_MS || '300000', 10)
+const BLOB_CONCURRENCY = parseInt(process.env.BLOB_CONCURRENCY || '8', 10)
 
 async function _doLoadChunks(clientId) {
   if (!blobServiceClient) throw new Error('AZURE_CONNECTION_STRING not set')
   const containerClient = blobServiceClient.getContainerClient(AZURE_CONTAINER_NAME)
   const prefix          = `${RAW_PREFIX}/${clientId}/`
-  const allChunks       = []
 
+  // Collect all blob names first
+  const blobNames = []
   for await (const blob of containerClient.listBlobsFlat({ prefix })) {
     const fileName = blob.name.split('/').pop()
     const ext      = ('.' + fileName.split('.').pop()).toLowerCase()
-    if (!SUPPORTED_EXTENSIONS.has(ext)) continue
-    try {
-      const buffer = await downloadBlobAsBuffer(containerClient, blob.name)
-      const text   = await extractTextFromBuffer(buffer, fileName)
-      if (!text?.trim()) continue
-      allChunks.push(...chunkText(text, fileName))
-    } catch (err) {
-      console.warn(`[loadChunks] Failed to process ${blob.name}:`, err.message)
+    if (SUPPORTED_EXTENSIONS.has(ext)) blobNames.push(blob.name)
+  }
+
+  // Process in parallel batches of BLOB_CONCURRENCY
+  const allChunks = []
+  for (let i = 0; i < blobNames.length; i += BLOB_CONCURRENCY) {
+    const batch   = blobNames.slice(i, i + BLOB_CONCURRENCY)
+    const results = await Promise.allSettled(
+      batch.map(async (blobName) => {
+        const fileName = blobName.split('/').pop()
+        const buffer   = await downloadBlobAsBuffer(containerClient, blobName)
+        const text     = await extractTextFromBuffer(buffer, fileName)
+        if (!text?.trim()) return []
+        return chunkText(text, fileName)
+      })
+    )
+    for (const result of results) {
+      if (result.status === 'fulfilled') allChunks.push(...result.value)
+      else console.warn(`[loadChunks] blob failed:`, result.reason?.message)
     }
   }
   return allChunks
 }
+const CHUNK_CACHE     = new Map()
+const CHUNK_CACHE_TTL = parseInt(process.env.CHUNK_CACHE_TTL_MS || '300000', 10)
 
 async function loadChunksForClient(clientId) {
   const now    = Date.now()
   const cached = CHUNK_CACHE.get(clientId)
 
-  // Return already-resolved chunks if still fresh
   if (cached && cached.chunks && !cached.loading && now - cached.ts < CHUNK_CACHE_TTL) {
-    return cached.chunks
+    return { chunks: cached.chunks, invertedIndex: cached.invertedIndex }
   }
 
-  // FIX: If a load is already in-flight, return the same promise — no duplicate loads
   if (cached && cached.loading) {
-    return cached.loading
+    const chunks = await cached.loading
+    return { chunks, invertedIndex: cached.invertedIndex }
   }
+
   const loadPromise = _doLoadChunks(clientId)
     .then(chunks => {
-      CHUNK_CACHE.set(clientId, { chunks, ts: Date.now(), loading: null })
+      const invertedIndex = buildInvertedIndex(chunks)
+      CHUNK_CACHE.set(clientId, { chunks, invertedIndex, ts: Date.now(), loading: null })
+      console.log(`[chunkCache] Loaded ${chunks.length} chunks + built inverted index for ${clientId}`)
       return chunks
     })
     .catch(err => {
       const existing = CHUNK_CACHE.get(clientId)
-      CHUNK_CACHE.set(clientId, { chunks: existing?.chunks || null, ts: existing?.ts || 0, loading: null })
+      CHUNK_CACHE.set(clientId, { chunks: existing?.chunks || null, invertedIndex: existing?.invertedIndex || null, ts: existing?.ts || 0, loading: null })
       throw err
     })
+
   CHUNK_CACHE.set(clientId, {
-    chunks:  cached?.chunks  || null,
-    ts:      cached?.ts      || 0,
-    loading: loadPromise,
+    chunks:        cached?.chunks        || null,
+    invertedIndex: cached?.invertedIndex || null,
+    ts:            cached?.ts            || 0,
+    loading:       loadPromise,
   })
 
-  return loadPromise
+  const chunks = await loadPromise
+  const entry  = CHUNK_CACHE.get(clientId)
+  return { chunks, invertedIndex: entry?.invertedIndex || null }
 }
 
 function invalidateChunkCache(clientId) {
@@ -813,16 +860,15 @@ function generateTitle(query) {
   return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned
 }
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({
-  ok: true,
-  service: 'ask-data',
-  model:   'ask-data-response-model',
-  embeddings: AZURE_EMBED_ENDPOINT ? 'azure-openai' : 'keyword-only',
+  ok:             true,
+  service:        'ask-data',
+  model:          'ask-data-response-model',
+  embeddings:     AZURE_EMBED_ENDPOINT ? 'azure-anurit' : 'keyword-only',
   chunkCacheSize: CHUNK_CACHE.size,
+  promptCacheSize: SYSTEM_PROMPT_CACHE.size,
 }))
 
-// Client verify
 app.post('/client/verify', async (req, res) => {
   try {
     const apiKey = extractApiKey(req) || req.body?.apiKey
@@ -830,12 +876,9 @@ app.post('/client/verify', async (req, res) => {
     const client = await verifyApiKey(apiKey)
     if (!client) return res.status(401).json({ valid: false, error: 'Invalid or expired API key' })
     res.json({ valid: true, client })
-  } catch (err) {
-    res.status(500).json({ valid: false, error: err.message })
-  }
+  } catch (err) { res.status(500).json({ valid: false, error: err.message }) }
 })
 
-// Admin Routes
 app.post('/admin/clients', requireAdminKey, async (req, res) => {
   try {
     let { name, clientId, apiKey } = req.body
@@ -934,10 +977,10 @@ app.delete('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
 
 app.post('/admin/clients/:clientId/invalidate-cache', requireAdminKey, (req, res) => {
   invalidateChunkCache(req.params.clientId)
-  res.json({ ok: true, clientId: req.params.clientId, message: 'Chunk cache invalidated' })
+  SYSTEM_PROMPT_CACHE.clear()  // also flush prompt cache on manual invalidation
+  res.json({ ok: true, clientId: req.params.clientId, message: 'Chunk + prompt cache invalidated' })
 })
 
-// Auth
 app.post('/client/login', async (req, res) => {
   try {
     const apiKey = extractApiKey(req) || req.body?.apiKey
@@ -967,7 +1010,6 @@ app.get('/client/me', requireClientKey, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
-// Conversations
 app.post('/chat/conversations', requireClientKey, async (req, res) => {
   try {
     const { title }    = req.body
@@ -1019,12 +1061,14 @@ app.post('/chat/conversations/delete', requireClientKey, async (req, res) => {
     res.json({ ok: true, deleted: conversationId })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
+
+// ─── CORE CHAT ENDPOINT ────────────────────────────────────────────────────────
 app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) => {
   try {
     const { query, topK = 6, conversationId } = req.body
     if (!query?.trim()) return res.status(400).json({ error: 'query is required' })
     const { clientId, name } = req.client
-    const chunks = await loadChunksForClient(clientId)
+    const { chunks, invertedIndex } = await loadChunksForClient(clientId)
 
     if (chunks.length === 0) {
       return res.json({
@@ -1035,7 +1079,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
     }
 
     const intent = detectQueryIntent(query.trim())
-    const hits   = await retrieveChunks(query.trim(), chunks, Math.min(topK, 20))
+    const hits   = await retrieveChunks(query.trim(), chunks, Math.min(topK, 20), invertedIndex)
 
     if (hits.length === 0) {
       return res.json({
@@ -1044,6 +1088,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         client: { clientId, name },
       })
     }
+
     const rawAnswer = await answerWithPhi4(query.trim(), hits, intent)
     const answer    = fixBrokenUrls(rawAnswer)
 
@@ -1053,8 +1098,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       score:       typeof h._score === 'number' ? parseFloat(h._score.toFixed(4)) : null,
       preview:     (h.text || '').slice(0, 300),
     }))
-
-    try {
+    const saveConversation = async () => {
       const chatDatabase = await getChatDb()
       const col          = chatDatabase.collection('conversations')
       const now          = new Date()
@@ -1066,21 +1110,22 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
           { _id: new ObjectId(conversationId), clientId },
           { $push: { messages: { $each: [userMsg, assistantMsg] } }, $set: { updatedAt: now } }
         )
-        res.json({ answer, sources, client: { clientId, name }, conversationId })
+        return conversationId
       } else {
         const title  = generateTitle(query.trim())
         const result = await col.insertOne({ clientId, title, messages: [userMsg, assistantMsg], createdAt: now, updatedAt: now })
-        res.json({ answer, sources, client: { clientId, name }, conversationId: result.insertedId.toString() })
+        return result.insertedId.toString()
       }
-    } catch (histErr) {
-      console.warn('[chat/message] Failed to save conversation history:', histErr.message)
-      res.json({ answer, sources, client: { clientId, name }, conversationId: conversationId || null })
     }
+    res.json({ answer, sources, client: { clientId, name }, conversationId: conversationId || null })
+    saveConversation().catch(err => console.warn('[chat/message] Failed to save conversation:', err.message))
+
   } catch (err) {
     console.error('[chat/message] Error:', err.message)
     if (!res.headersSent) res.status(500).json({ error: err.message })
   }
 }))
+
 app.use((err, req, res, next) => {
   console.error('[global error handler]', err)
   if (!res.headersSent) res.status(500).json({ error: 'An unexpected error occurred. Please try again.' })
@@ -1092,7 +1137,8 @@ app.listen(PORT, () => {
   console.log(`Model: ${PHI4_MODEL} | Endpoint: ${PHI4_ENDPOINT ? 'configured' : 'MISSING'}`)
   console.log(`Phi-4 timeout: ${PHI4_TIMEOUT_MS}ms | Embed timeout: ${EMBED_TIMEOUT_MS}ms`)
   console.log(`Chunk cache TTL: ${CHUNK_CACHE_TTL}ms | Embed pool limit: ${EMBED_POOL_LIMIT}`)
-  console.log(`Request timeout: ${REQUEST_TIMEOUT_MS}ms`)
+  console.log(`Request timeout: ${REQUEST_TIMEOUT_MS}ms | Keyword short-circuit score: ${KEYWORD_SHORTCIRCUIT_SCORE}`)
+  console.log(`Blob concurrency: ${BLOB_CONCURRENCY}`)
   console.log(`Azure blob client: ${blobServiceClient ? 'singleton ready' : 'MISSING connection string'}`)
   startApiKeyHealthChecker()
 })
