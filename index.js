@@ -62,18 +62,17 @@ const KEY_CHECK_INTERVAL_MS   = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '3
 const PHI4_ENDPOINT    = process.env.PHI4_ENDPOINT
 const PHI4_API_KEY     = process.env.PHI4_API_KEY
 const PHI4_MODEL       = process.env.PHI4_MODEL || 'Phi-4-mini-instruct'
-const PHI4_TIMEOUT_MS  = parseInt(process.env.PHI4_TIMEOUT_MS || '60000', 10)
+const PHI4_TIMEOUT_MS  = parseInt(process.env.PHI4_TIMEOUT_MS || '30000', 10)  // reduced from 60s
 
 const AZURE_EMBED_ENDPOINT = process.env.AZURE_EMBED_ENDPOINT || ''
 const AZURE_EMBED_KEY      = process.env.AZURE_EMBED_KEY || ''
 const AZURE_EMBED_MODEL    = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
-const EMBED_TIMEOUT_MS     = parseInt(process.env.EMBED_TIMEOUT_MS || '15000', 10)
+const EMBED_TIMEOUT_MS     = parseInt(process.env.EMBED_TIMEOUT_MS || '10000', 10)  // reduced from 15s
 const EMBED_POOL_LIMIT     = parseInt(process.env.EMBED_POOL_LIMIT || '20', 10)
-const REQUEST_TIMEOUT_MS   = parseInt(process.env.REQUEST_TIMEOUT_MS || '90000', 10)
-const KEYWORD_SHORTCIRCUIT_SCORE = parseInt(process.env.KEYWORD_SHORTCIRCUIT_SCORE || '12', 10)
+const REQUEST_TIMEOUT_MS   = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10)  // reduced from 90s
+const KEYWORD_SHORTCIRCUIT_SCORE = parseInt(process.env.KEYWORD_SHORTCIRCUIT_SCORE || '6', 10)  // lowered from 12
 
-// ─── Warmup: clients to pre-load chunks for on startup ────────────────────────
-// Set WARMUP_CLIENT_IDS=clientA,clientB in env to pre-warm caches at boot
+// Warmup: clients to pre-load chunks for on startup
 const WARMUP_CLIENT_IDS = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
 
 const RAW_PREFIX    = 'raw'
@@ -107,6 +106,80 @@ const DOC_TYPE = {
   EMAIL:        'email',
   WEB:          'web',
   UNKNOWN:      'unknown',
+}
+const RESPONSE_CACHE     = new Map()
+const RESPONSE_CACHE_TTL = 10 * 60 * 1000 
+const RESPONSE_CACHE_MAX = 1000
+
+function responseCacheGet(key) {
+  const entry = RESPONSE_CACHE.get(key)
+  if (!entry) return null
+  if (Date.now() - entry.ts > RESPONSE_CACHE_TTL) { RESPONSE_CACHE.delete(key); return null }
+  return entry.value
+}
+
+function responseCacheSet(key, value) {
+  // Evict oldest entry if over limit
+  if (RESPONSE_CACHE.size >= RESPONSE_CACHE_MAX) {
+    const firstKey = RESPONSE_CACHE.keys().next().value
+    RESPONSE_CACHE.delete(firstKey)
+  }
+  RESPONSE_CACHE.set(key, { value, ts: Date.now() })
+}
+
+function getCacheKey(clientId, query) {
+  return `${clientId}:${query.toLowerCase().trim()}`
+}
+const IN_FLIGHT = new Map()
+let phiActiveCount = 0
+const PHI_MAX_CONCURRENT = 3
+const phiQueue = []
+
+function runWithPhiLimit(fn) {
+  return new Promise((resolve, reject) => {
+    function tryRun() {
+      if (phiActiveCount < PHI_MAX_CONCURRENT) {
+        phiActiveCount++
+        Promise.resolve().then(fn).then(
+          result => { phiActiveCount--; drainPhiQueue(); resolve(result) },
+          err    => { phiActiveCount--; drainPhiQueue(); reject(err) }
+        )
+      } else {
+        phiQueue.push(tryRun)
+      }
+    }
+    tryRun()
+  })
+}
+
+function drainPhiQueue() {
+  if (phiQueue.length > 0 && phiActiveCount < PHI_MAX_CONCURRENT) {
+    const next = phiQueue.shift()
+    next()
+  }
+}
+let phiFailures      = 0
+let phiBlockedUntil  = 0
+
+function phiCircuitOpen() {
+  if (Date.now() < phiBlockedUntil) return true
+  if (phiBlockedUntil > 0) {
+    // Circuit was blocked but timeout passed — half-open, reset
+    phiBlockedUntil = 0
+    phiFailures     = 0
+    console.log('[phi4] Circuit breaker reset (timeout elapsed)')
+  }
+  return false
+}
+
+function phiRecordSuccess() { phiFailures = 0; phiBlockedUntil = 0 }
+
+function phiRecordFailure() {
+  phiFailures++
+  if (phiFailures >= 3) {
+    phiBlockedUntil = Date.now() + 30000
+    console.error(`🚨 [phi4] Circuit breaker OPEN for 30s after ${phiFailures} failures`)
+  }
 }
 
 // ─── fetchWithTimeout ─────────────────────────────────────────────────────────
@@ -240,6 +313,7 @@ function cosineSim(a, b) {
   }
   return dot / (Math.sqrt(normA) * Math.sqrt(normB) + 1e-9)
 }
+
 function buildInvertedIndex(chunks) {
   const index = new Map()
   for (let i = 0; i < chunks.length; i++) {
@@ -255,28 +329,43 @@ function buildInvertedIndex(chunks) {
   return index
 }
 
+// ─── Phi-4 call: circuit breaker + concurrency limit + timeout ────────────────
 async function callPhi4(systemPrompt, userMessage) {
   if (!PHI4_ENDPOINT || !PHI4_API_KEY) throw new Error('PHI4_ENDPOINT and PHI4_API_KEY environment variables are required')
-  const response = await fetchWithTimeout(
-    PHI4_ENDPOINT,
-    {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${PHI4_API_KEY}` },
-      body: JSON.stringify({
-        model:       PHI4_MODEL,
-        messages:    [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
-        temperature: 0.2,
-        max_tokens:  1024,
-      }),
-    },
-    PHI4_TIMEOUT_MS
-  )
-  if (!response.ok) {
-    const errText = await response.text()
-    throw new Error(`Phi-4 API error ${response.status}: ${errText}`)
-  }
-  const data = await response.json()
-  return data.choices?.[0]?.message?.content || ''
+
+  // Check circuit breaker first (fast fail, no queue slot used)
+  if (phiCircuitOpen()) throw new Error('Model temporarily unavailable (circuit breaker open)')
+
+  return runWithPhiLimit(async () => {
+    try {
+      const response = await fetchWithTimeout(
+        PHI4_ENDPOINT,
+        {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${PHI4_API_KEY}` },
+          body: JSON.stringify({
+            model:       PHI4_MODEL,
+            messages:    [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
+            temperature: 0.2,
+            max_tokens:  1024,
+          }),
+        },
+        PHI4_TIMEOUT_MS
+      )
+
+      if (!response.ok) {
+        const errText = await response.text()
+        throw new Error(`Phi-4 API error ${response.status}: ${errText}`)
+      }
+
+      const data = await response.json()
+      phiRecordSuccess()
+      return data.choices?.[0]?.message?.content || ''
+    } catch (err) {
+      phiRecordFailure()
+      throw err
+    }
+  })
 }
 
 async function embedQueryAzure(query) {
@@ -320,6 +409,7 @@ async function embedBatch(texts) {
     return []
   }
 }
+
 function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = null) {
   const subject      = intent === 'definition' ? extractSubject(query) : query.toLowerCase()
   const queryLower   = query.toLowerCase()
@@ -379,14 +469,14 @@ async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
   const candidates      = keywordSearch(normalizedQuery, chunks, keywordTopK, intent, invertedIndex)
   const pool            = candidates.length > 0 ? candidates : chunks.slice(0, 100)
 
-  // Hard short-circuit: strong keyword hit → skip embed entirely
+  // Hard short-circuit: strong keyword hit → skip embed entirely (lowered threshold to 6)
   if (pool.length > 0 && pool[0]._score >= KEYWORD_SHORTCIRCUIT_SCORE) {
     console.log(`[retrieveChunks] keyword short-circuit (score=${pool[0]._score}) — skipping embed`)
     return pool.slice(0, Math.min(topK, 10))
   }
 
   // Soft short-circuit: definition queries with decent hits
-  if (intent === 'definition' && pool.length > 0 && pool[0]._score >= 8) {
+  if (intent === 'definition' && pool.length > 0 && pool[0]._score >= 4) {
     return pool.slice(0, Math.min(topK, 10))
   }
 
@@ -447,7 +537,8 @@ function buildContext(hits) {
     return `[Excerpt ${i + 1} | type: ${typeLabel} | relevance: ${typeof h._score === 'number' ? h._score.toFixed(3) : 'n/a'}]\n${(h.text || '').trim()}`
   }).join('\n\n---\n\n')
 }
-const SYSTEM_PROMPT_CACHE = new Map()
+
+const SYSTEM_PROMPT_CACHE     = new Map()
 const SYSTEM_PROMPT_CACHE_MAX = 100
 
 function buildDynamicSystemPrompt(hits, intent = 'general') {
@@ -789,6 +880,7 @@ async function _doLoadChunks(clientId) {
   }
   return allChunks
 }
+
 const CHUNK_CACHE     = new Map()
 const CHUNK_CACHE_TTL = parseInt(process.env.CHUNK_CACHE_TTL_MS || '300000', 10)
 
@@ -796,15 +888,43 @@ async function loadChunksForClient(clientId) {
   const now    = Date.now()
   const cached = CHUNK_CACHE.get(clientId)
 
-  if (cached && cached.chunks && !cached.loading && now - cached.ts < CHUNK_CACHE_TTL) {
+  // Stale-while-revalidate: serve stale immediately, refresh in background
+  if (cached && cached.chunks) {
+    const isStale = now - cached.ts > CHUNK_CACHE_TTL
+    if (!isStale) {
+      // Fresh — return immediately
+      return { chunks: cached.chunks, invertedIndex: cached.invertedIndex }
+    }
+    if (!cached.loading) {
+      // Stale but usable — serve stale, kick off background refresh
+      console.log(`[chunkCache] Serving stale cache for ${clientId}, refreshing in background`)
+      const refreshPromise = _doLoadChunks(clientId)
+        .then(chunks => {
+          const invertedIndex = buildInvertedIndex(chunks)
+          CHUNK_CACHE.set(clientId, { chunks, invertedIndex, ts: Date.now(), loading: null })
+          console.log(`[chunkCache] Background refresh done for ${clientId}: ${chunks.length} chunks`)
+          return chunks
+        })
+        .catch(err => {
+          const existing = CHUNK_CACHE.get(clientId)
+          CHUNK_CACHE.set(clientId, { ...existing, loading: null })
+          console.warn(`[chunkCache] Background refresh failed for ${clientId}: ${err.message}`)
+        })
+      CHUNK_CACHE.set(clientId, { ...cached, loading: refreshPromise })
+      return { chunks: cached.chunks, invertedIndex: cached.invertedIndex }
+    }
+    // Already refreshing — return stale
     return { chunks: cached.chunks, invertedIndex: cached.invertedIndex }
   }
 
+  // No cache at all — must wait for load
   if (cached && cached.loading) {
     const chunks = await cached.loading
-    return { chunks, invertedIndex: cached.invertedIndex }
+    const entry  = CHUNK_CACHE.get(clientId)
+    return { chunks: chunks || entry?.chunks || [], invertedIndex: entry?.invertedIndex || null }
   }
 
+  // First load ever
   const loadPromise = _doLoadChunks(clientId)
     .then(chunks => {
       const invertedIndex = buildInvertedIndex(chunks)
@@ -813,18 +933,11 @@ async function loadChunksForClient(clientId) {
       return chunks
     })
     .catch(err => {
-      const existing = CHUNK_CACHE.get(clientId)
-      CHUNK_CACHE.set(clientId, { chunks: existing?.chunks || null, invertedIndex: existing?.invertedIndex || null, ts: existing?.ts || 0, loading: null })
+      CHUNK_CACHE.set(clientId, { chunks: null, invertedIndex: null, ts: 0, loading: null })
       throw err
     })
 
-  CHUNK_CACHE.set(clientId, {
-    chunks:        cached?.chunks        || null,
-    invertedIndex: cached?.invertedIndex || null,
-    ts:            cached?.ts            || 0,
-    loading:       loadPromise,
-  })
-
+  CHUNK_CACHE.set(clientId, { chunks: null, invertedIndex: null, ts: 0, loading: loadPromise })
   const chunks = await loadPromise
   const entry  = CHUNK_CACHE.get(clientId)
   return { chunks, invertedIndex: entry?.invertedIndex || null }
@@ -835,8 +948,6 @@ function invalidateChunkCache(clientId) {
   console.log(`[chunkCache] Invalidated cache for client: ${clientId}`)
 }
 
-// ─── Warmup: pre-load chunks for known clients at startup ─────────────────────
-// Runs fire-and-forget so it never blocks the server from starting
 function warmupChunkCaches() {
   if (!WARMUP_CLIENT_IDS.length || !blobServiceClient) return
   console.log(`[warmup] Pre-loading chunks for ${WARMUP_CLIENT_IDS.length} client(s): ${WARMUP_CLIENT_IDS.join(', ')}`)
@@ -864,18 +975,32 @@ Instructions: Scan the entire context above. Apply the document-type rules. Give
   return callPhi4(systemPrompt, userMessage)
 }
 
+// ─── Build a fallback answer from raw chunks when model is unavailable ────────
+function buildFallbackAnswer(query, hits) {
+  if (!hits || hits.length === 0) return "I couldn't find relevant information in your documents for this query."
+  // Try to find a chunk that directly mentions the query subject
+  const subject = extractSubject(query).toLowerCase()
+  const best    = hits.find(h => (h.text || '').toLowerCase().includes(subject)) || hits[0]
+  const snippet = (best.text || '').slice(0, 400).trim()
+  return `Here's the most relevant excerpt from your documents:\n\n${snippet}\n\n*(Note: Full AI analysis is temporarily unavailable. Please try again in a moment.)*`
+}
+
 function generateTitle(query) {
   const cleaned = query.trim().replace(/[?!.]+$/, '')
   return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned
 }
 
+// ─── Routes ───────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({
-  ok:             true,
-  service:        'ask-data',
-  model:          'ask-data-response-model',
-  embeddings:     AZURE_EMBED_ENDPOINT ? 'azure-anurit' : 'keyword-only',
-  chunkCacheSize: CHUNK_CACHE.size,
-  promptCacheSize: SYSTEM_PROMPT_CACHE.size,
+  ok:               true,
+  service:          'ask-data',
+  model:            'ask-data-response-model',
+  embeddings:       AZURE_EMBED_ENDPOINT ? 'azure-anurit' : 'keyword-only',
+  chunkCacheSize:   CHUNK_CACHE.size,
+  promptCacheSize:  SYSTEM_PROMPT_CACHE.size,
+  responseCacheSize: RESPONSE_CACHE.size,
+  phiCircuitOpen:   phiCircuitOpen(),
+  phiFailures,
 }))
 
 app.post('/client/verify', async (req, res) => {
@@ -987,7 +1112,8 @@ app.delete('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
 app.post('/admin/clients/:clientId/invalidate-cache', requireAdminKey, (req, res) => {
   invalidateChunkCache(req.params.clientId)
   SYSTEM_PROMPT_CACHE.clear()
-  res.json({ ok: true, clientId: req.params.clientId, message: 'Chunk + prompt cache invalidated' })
+  RESPONSE_CACHE.clear()
+  res.json({ ok: true, clientId: req.params.clientId, message: 'Chunk + prompt + response cache invalidated' })
 })
 
 app.post('/client/login', async (req, res) => {
@@ -1001,7 +1127,6 @@ app.post('/client/login', async (req, res) => {
         console.warn(`[login warmup] ${client.clientId}: ${err.message}`)
       )
     }
-
     res.json({ ok: true, client })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -1012,14 +1137,11 @@ app.post('/chat/login', async (req, res) => {
     if (!apiKey) return res.status(400).json({ error: 'apiKey is required' })
     const client = await verifyApiKey(apiKey)
     if (!client) return res.status(401).json({ error: 'Invalid API key' })
-
-    // ── Trigger chunk pre-load in the background on chat login too ────────────
     if (blobServiceClient) {
       loadChunksForClient(client.clientId).catch(err =>
         console.warn(`[chat/login warmup] ${client.clientId}: ${err.message}`)
       )
     }
-
     res.json({ ok: true, client })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -1084,97 +1206,127 @@ app.post('/chat/conversations/delete', requireClientKey, async (req, res) => {
     res.json({ ok: true, deleted: conversationId })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
+
+// ─── MAIN CHAT ENDPOINT ───────────────────────────────────────────────────────
 app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) => {
   try {
     const { query, topK = 6, conversationId } = req.body
     if (!query?.trim()) return res.status(400).json({ error: 'query is required' })
     const { clientId, name } = req.client
-    const { chunks, invertedIndex } = await loadChunksForClient(clientId)
 
-    if (chunks.length === 0) {
-      return res.json({
-        answer: 'No documents found for your account. Please ensure your documents have been ingested first.',
-        sources: [],
-        conversationId: conversationId || null,
-        client: { clientId, name },
-      })
+    // ── 1. Response cache — instant reply for repeated queries ─────────────────
+    const cacheKey = getCacheKey(clientId, query)
+    const cached   = responseCacheGet(cacheKey)
+    if (cached) {
+      console.log(`[cache] HIT for "${query.slice(0, 50)}"`)
+      return res.json({ ...cached, cached: true, conversationId: conversationId || cached.conversationId })
     }
-
-    // ── 2. Retrieve relevant chunks & generate answer ─────────────────────────
-    const intent    = detectQueryIntent(query.trim())
-    const hits      = await retrieveChunks(query.trim(), chunks, Math.min(topK, 20), invertedIndex)
-
-    if (hits.length === 0) {
-      return res.json({
-        answer: "I couldn't find that in your documents. Try rephrasing your question or asking about it differently.",
-        sources: [],
-        conversationId: conversationId || null,
-        client: { clientId, name },
-      })
-    }
-
-    const rawAnswer = await answerWithPhi4(query.trim(), hits, intent)
-    const answer    = fixBrokenUrls(rawAnswer)
-
-    const sources = hits.map(h => ({
-      source_file: h.source_file  || 'unknown',
-      chunk_index: h.chunk_index  ?? 0,
-      score:       typeof h._score === 'number' ? parseFloat(h._score.toFixed(4)) : null,
-      preview:     (h.text || '').slice(0, 300),
-    }))
-    let activeConversationId = conversationId || null
-    try {
-      const chatDatabase = await getChatDb()
-      const col          = chatDatabase.collection('conversations')
-      const now          = new Date()
-      const userMsg      = { role: 'user',      content: query.trim(), timestamp: now }
-      const assistantMsg = {
-        role:    'assistant',
-        content: answer,
-        sources: sources.map(s => ({ source_file: s.source_file, score: s.score })),
-        timestamp: now,
+    if (IN_FLIGHT.has(cacheKey)) {
+      console.log(`[dedup] Waiting for in-flight request: "${query.slice(0, 50)}"`)
+      try {
+        const result = await IN_FLIGHT.get(cacheKey)
+        return res.json({ ...result, conversationId: conversationId || result.conversationId })
+      } catch {
       }
+    }
 
-      if (activeConversationId) {
-        // Append to existing conversation — verify ownership to prevent ID spoofing
-        const updated = await col.findOneAndUpdate(
-          { _id: new ObjectId(activeConversationId), clientId },
-          { $push: { messages: { $each: [userMsg, assistantMsg] } }, $set: { updatedAt: now } },
-          { returnDocument: 'after', projection: { _id: 1 } }
-        )
-        if (!updated) {
-          // Conversation not found or belongs to a different client — start fresh
-          console.warn(`[chat/message] conversationId ${activeConversationId} not found for ${clientId}, creating new`)
-          activeConversationId = null
+    // ── 3. Build the main processing promise ───────────────────────────────────
+    const requestPromise = (async () => {
+      const { chunks, invertedIndex } = await loadChunksForClient(clientId)
+
+      if (chunks.length === 0) {
+        return {
+          answer: 'No documents found for your account. Please ensure your documents have been ingested first.',
+          sources: [],
+          conversationId: conversationId || null,
+          client: { clientId, name },
         }
       }
 
-      if (!activeConversationId) {
-        // First message in a new session — use the question as the conversation title
-        const title  = generateTitle(query.trim())
-        const result = await col.insertOne({
-          clientId,
-          title,
-          messages:  [userMsg, assistantMsg],
-          createdAt: now,
-          updatedAt: now,
-        })
-        activeConversationId = result.insertedId.toString()
+      const intent = detectQueryIntent(query.trim())
+      const hits   = await retrieveChunks(query.trim(), chunks, Math.min(topK, 20), invertedIndex)
+
+      if (hits.length === 0) {
+        return {
+          answer: "I couldn't find that in your documents. Try rephrasing your question or asking about it differently.",
+          sources: [],
+          conversationId: conversationId || null,
+          client: { clientId, name },
+        }
       }
-    } catch (saveErr) {
-      // Saving history should never block the user from getting their answer.
-      // Log and continue — the response will still include whatever conversationId
-      // we managed to resolve (null if the insert itself failed).
-      console.warn('[chat/message] Failed to save conversation:', saveErr.message)
+
+      // ── 4. Call model with 8s fast-fallback ─────────────────────────────────
+      let rawAnswer
+      try {
+        rawAnswer = await Promise.race([
+          answerWithPhi4(query.trim(), hits, intent),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Model response timeout (8s)')), 8000)
+          ),
+        ])
+      } catch (err) {
+        console.warn(`⚠️ [phi4] Using fallback answer: ${err.message}`)
+        rawAnswer = buildFallbackAnswer(query.trim(), hits)
+      }
+
+      const answer  = fixBrokenUrls(rawAnswer)
+      const sources = hits.map(h => ({
+        source_file: h.source_file  || 'unknown',
+        chunk_index: h.chunk_index  ?? 0,
+        score:       typeof h._score === 'number' ? parseFloat(h._score.toFixed(4)) : null,
+        preview:     (h.text || '').slice(0, 300),
+      }))
+      let activeConversationId = conversationId || null
+      try {
+        const chatDatabase = await getChatDb()
+        const col          = chatDatabase.collection('conversations')
+        const now          = new Date()
+        const userMsg      = { role: 'user',      content: query.trim(), timestamp: now }
+        const assistantMsg = {
+          role:      'assistant',
+          content:   answer,
+          sources:   sources.map(s => ({ source_file: s.source_file, score: s.score })),
+          timestamp: now,
+        }
+
+        if (activeConversationId) {
+          const updated = await col.findOneAndUpdate(
+            { _id: new ObjectId(activeConversationId), clientId },
+            { $push: { messages: { $each: [userMsg, assistantMsg] } }, $set: { updatedAt: now } },
+            { returnDocument: 'after', projection: { _id: 1 } }
+          )
+          if (!updated) {
+            console.warn(`[chat/message] conversationId ${activeConversationId} not found for ${clientId}, creating new`)
+            activeConversationId = null
+          }
+        }
+
+        if (!activeConversationId) {
+          const title  = generateTitle(query.trim())
+          const result = await col.insertOne({ clientId, title, messages: [userMsg, assistantMsg], createdAt: now, updatedAt: now })
+          activeConversationId = result.insertedId.toString()
+        }
+      } catch (saveErr) {
+        console.warn('[chat/message] Failed to save conversation:', saveErr.message)
+      }
+
+      return { answer, sources, conversationId: activeConversationId, client: { clientId, name } }
+    })()
+
+    // Register in-flight so duplicate requests can share this promise
+    IN_FLIGHT.set(cacheKey, requestPromise)
+
+    let result
+    try {
+      result = await requestPromise
+    } finally {
+      IN_FLIGHT.delete(cacheKey)
+    }
+    if (result.answer && !result.answer.includes('temporarily unavailable')) {
+      responseCacheSet(cacheKey, result)
     }
 
-    // ── 4. Return answer + the conversationId the client must reuse ───────────
-    res.json({
-      answer,
-      sources,
-      conversationId: activeConversationId,
-      client: { clientId, name },
-    })
+    res.json(result)
 
   } catch (err) {
     console.error('[chat/message] Error:', err.message)
@@ -1197,7 +1349,7 @@ app.listen(PORT, () => {
   console.log(`Blob concurrency: ${BLOB_CONCURRENCY}`)
   console.log(`Azure blob client: ${blobServiceClient ? 'singleton ready' : 'MISSING connection string'}`)
   startApiKeyHealthChecker()
-  warmupChunkCaches()  // pre-load chunks for any WARMUP_CLIENT_IDS at boot
+  warmupChunkCaches()
 })
 
 module.exports = app
