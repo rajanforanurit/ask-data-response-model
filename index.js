@@ -51,29 +51,32 @@ app.options('*', cors({
 app.use(express.json())
 
 // ─── ENV ──────────────────────────────────────────────────────────────────────
-const MONGODB_URI            = process.env.MONGODB_URI
-const MONGODB_DB             = process.env.MONGODB_DB || 'clientcreds'
-const CHAT_HISTORY_URI       = process.env.CHAT_HISTORY_URI
-const CHAT_HISTORY_DB        = process.env.CHAT_HISTORY_DB || 'chathistory'
+const MONGODB_URI  = process.env.MONGODB_URI
+const MONGODB_DB  = process.env.MONGODB_DB || 'clientcreds'
+const CHAT_HISTORY_URI = process.env.CHAT_HISTORY_URI
+const CHAT_HISTORY_DB  = process.env.CHAT_HISTORY_DB || 'chathistory'
 const AZURE_CONNECTION_STRING = process.env.AZURE_CONNECTION_STRING || ''
-const AZURE_CONTAINER_NAME   = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
-const ADMIN_API_KEY          = process.env.ADMIN_API_KEY
-const KEY_CHECK_INTERVAL_MS  = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10)
+const AZURE_CONTAINER_NAME  = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
+const ADMIN_API_KEY   = process.env.ADMIN_API_KEY
+const KEY_CHECK_INTERVAL_MS = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10)
 
-// Azure AI Foundry / Phi-4 config
-const PHI4_ENDPOINT  = process.env.PHI4_ENDPOINT  // e.g. https://xxx.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview
-const PHI4_API_KEY   = process.env.PHI4_API_KEY   // the key from Azure AI Foundry
-const PHI4_MODEL     = process.env.PHI4_MODEL || 'Phi-4-mini-instruct'
+const PHI4_ENDPOINT = process.env.PHI4_ENDPOINT
+const PHI4_API_KEY  = process.env.PHI4_API_KEY
+const PHI4_MODEL = process.env.PHI4_MODEL || 'Phi-4-mini-instruct'
+const PHI4_TIMEOUT_MS = parseInt(process.env.PHI4_TIMEOUT_MS || '60000', 10)
 
-// Optional: Azure OpenAI embeddings (text-embedding-ada-002 or similar)
-// If not set, falls back to keyword-only search
 const AZURE_EMBED_ENDPOINT = process.env.AZURE_EMBED_ENDPOINT || ''
-const AZURE_EMBED_KEY      = process.env.AZURE_EMBED_KEY || ''
-const AZURE_EMBED_MODEL    = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
+const AZURE_EMBED_KEY = process.env.AZURE_EMBED_KEY || ''
+const AZURE_EMBED_MODEL = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
+const EMBED_TIMEOUT_MS  = parseInt(process.env.EMBED_TIMEOUT_MS || '15000', 10)
 
-const RAW_PREFIX   = 'raw'
-const CHUNK_SIZE   = 500
+const RAW_PREFIX    = 'raw'
+const CHUNK_SIZE    = 500
 const CHUNK_OVERLAP = 2
+
+const blobServiceClient = AZURE_CONNECTION_STRING
+  ? BlobServiceClient.fromConnectionString(AZURE_CONNECTION_STRING)
+  : null
 
 const SUPPORTED_EXTENSIONS = new Set([
   '.pdf', '.docx', '.doc', '.txt', '.rtf', '.odt',
@@ -99,6 +102,25 @@ const DOC_TYPE = {
   EMAIL:        'email',
   WEB:          'web',
   UNKNOWN:      'unknown',
+}
+
+// ─── FIX 3: fetchWithTimeout ──────────────────────────────────────────────────
+// Wraps every external HTTP call with an AbortController so requests can't
+// hang indefinitely when Phi-4 or Azure embedding services are under load.
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal })
+    return response
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error(`Request timed out after ${timeoutMs}ms: ${url}`)
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -179,9 +201,9 @@ function extractSubject(query) {
   }
   return q
 }
+
 function fixBrokenUrls(text) {
-  return text
-    .replace(/https:\/\/[^\s]+(\s+[^\s]+)/g, (match) => match.replace(/\s/g, ''))
+  return text.replace(/https:\/\/[^\s]+(\s+[^\s]+)/g, (match) => match.replace(/\s/g, ''))
 }
 
 function escapeRegex(str) {
@@ -197,13 +219,10 @@ function cosineSim(a, b) {
   }
   return dot / (Math.sqrt(normA) * Math.sqrt(normB) + 1e-9)
 }
-
-// ─── Azure AI Foundry: Phi-4 chat completion ──────────────────────────────────
 async function callPhi4(systemPrompt, userMessage) {
   if (!PHI4_ENDPOINT || !PHI4_API_KEY) {
     throw new Error('PHI4_ENDPOINT and PHI4_API_KEY environment variables are required')
   }
-
   const body = {
     model: PHI4_MODEL,
     messages: [
@@ -213,15 +232,18 @@ async function callPhi4(systemPrompt, userMessage) {
     temperature: 0.2,
     max_tokens:  1024,
   }
-
-  const response = await fetch(PHI4_ENDPOINT, {
-    method:  'POST',
-    headers: {
-      'Content-Type':  'application/json',
-      'Authorization': `Bearer ${PHI4_API_KEY}`,
+  const response = await fetchWithTimeout(
+    PHI4_ENDPOINT,
+    {
+      method:  'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${PHI4_API_KEY}`,
+      },
+      body: JSON.stringify(body),
     },
-    body: JSON.stringify(body),
-  })
+    PHI4_TIMEOUT_MS
+  )
 
   if (!response.ok) {
     const errText = await response.text()
@@ -231,23 +253,29 @@ async function callPhi4(systemPrompt, userMessage) {
   const data = await response.json()
   return data.choices?.[0]?.message?.content || ''
 }
-
-// ─── Azure OpenAI Embeddings (optional) ──────────────────────────────────────
 async function embedQueryAzure(query) {
   if (!AZURE_EMBED_ENDPOINT || !AZURE_EMBED_KEY) return null
+  try {
+    const response = await fetchWithTimeout(
+      AZURE_EMBED_ENDPOINT,
+      {
+        method:  'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'api-key':      AZURE_EMBED_KEY,
+        },
+        body: JSON.stringify({ input: query, model: AZURE_EMBED_MODEL }),
+      },
+      EMBED_TIMEOUT_MS
+    )
 
-  const response = await fetch(AZURE_EMBED_ENDPOINT, {
-    method:  'POST',
-    headers: {
-      'Content-Type':  'application/json',
-      'api-key':       AZURE_EMBED_KEY,
-    },
-    body: JSON.stringify({ input: query, model: AZURE_EMBED_MODEL }),
-  })
-
-  if (!response.ok) return null
-  const data = await response.json()
-  return data.data?.[0]?.embedding || null
+    if (!response.ok) return null
+    const data = await response.json()
+    return data.data?.[0]?.embedding || null
+  } catch (err) {
+    console.warn('[embedQueryAzure] failed:', err.message)
+    return null
+  }
 }
 
 // ─── Keyword search ───────────────────────────────────────────────────────────
@@ -301,12 +329,10 @@ async function retrieveChunks(query, chunks, topK = 6) {
   const candidates       = keywordSearch(normalizedQuery, chunks, keywordTopK, intent)
   const pool             = candidates.length > 0 ? candidates : chunks.slice(0, 100)
 
-  // Fast path: strong keyword match on definition queries
   if (intent === 'definition' && pool.length > 0 && pool[0]._score >= 8) {
     return pool.slice(0, Math.min(topK, 10))
   }
 
-  // Try semantic re-ranking via Azure embeddings
   if (AZURE_EMBED_ENDPOINT && AZURE_EMBED_KEY) {
     try {
       const queryVec = await embedQueryAzure(normalizedQuery)
@@ -454,7 +480,7 @@ function getCached(apiKey) {
   return entry
 }
 function setCache(apiKey, data) { CLIENT_CACHE.set(apiKey, { ...data, cachedAt: Date.now() }) }
-function evictCache(apiKey)    { if (apiKey) CLIENT_CACHE.delete(apiKey) }
+function evictCache(apiKey)     { if (apiKey) CLIENT_CACHE.delete(apiKey) }
 
 async function verifyApiKey(apiKey) {
   if (!apiKey || !apiKey.startsWith('rak_')) return null
@@ -656,12 +682,15 @@ async function downloadBlobAsBuffer(containerClient, blobName) {
     parts.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
   return Buffer.concat(parts)
 }
+const CHUNK_CACHE     = new Map()
+const CHUNK_CACHE_TTL = parseInt(process.env.CHUNK_CACHE_TTL_MS || '300000', 10) 
 
-async function loadChunksForClient(clientId) {
-  if (!AZURE_CONNECTION_STRING) throw new Error('AZURE_CONNECTION_STRING not set')
-  const containerClient = BlobServiceClient.fromConnectionString(AZURE_CONNECTION_STRING).getContainerClient(AZURE_CONTAINER_NAME)
+async function _doLoadChunks(clientId) {
+  if (!blobServiceClient) throw new Error('AZURE_CONNECTION_STRING not set')
+  const containerClient = blobServiceClient.getContainerClient(AZURE_CONTAINER_NAME)
   const prefix          = `${RAW_PREFIX}/${clientId}/`
   const allChunks       = []
+
   for await (const blob of containerClient.listBlobsFlat({ prefix })) {
     const fileName = blob.name.split('/').pop()
     const ext      = ('.' + fileName.split('.').pop()).toLowerCase()
@@ -678,7 +707,33 @@ async function loadChunksForClient(clientId) {
   return allChunks
 }
 
-// ─── Answer generation using Phi-4 ───────────────────────────────────────────
+async function loadChunksForClient(clientId) {
+  const cached = CHUNK_CACHE.get(clientId)
+
+  // Return cached chunks if still fresh
+  if (cached && !cached.loading && cached.chunks && Date.now() - cached.ts < CHUNK_CACHE_TTL) {
+    return cached.chunks
+  }
+  if (cached?.loading) {
+    return cached.loading
+  }
+  const loadPromise = _doLoadChunks(clientId)
+    .then(chunks => {
+      CHUNK_CACHE.set(clientId, { chunks, ts: Date.now(), loading: null })
+      return chunks
+    })
+    .catch(err => {
+      CHUNK_CACHE.delete(clientId)
+      throw err
+    })
+
+  CHUNK_CACHE.set(clientId, { chunks: cached?.chunks || null, ts: cached?.ts || 0, loading: loadPromise })
+  return loadPromise
+}
+function invalidateChunkCache(clientId) {
+  CHUNK_CACHE.delete(clientId)
+  console.log(`[chunkCache] Invalidated cache for client: ${clientId}`)
+}
 async function answerWithPhi4(originalQuery, hits, intent = 'general') {
   const systemPrompt = buildDynamicSystemPrompt(hits, intent)
   const context      = buildContext(hits)
@@ -700,15 +755,12 @@ function generateTitle(query) {
   const cleaned = query.trim().replace(/[?!.]+$/, '')
   return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned
 }
-
-// ─── Routes ───────────────────────────────────────────────────────────────────
-
-// Health
 app.get('/health', (req, res) => res.json({
   ok: true,
   service: 'ask-data',
   model:   'ask-data-response-model',
   embeddings: AZURE_EMBED_ENDPOINT ? 'azure-openai' : 'keyword-only',
+  chunkCacheSize: CHUNK_CACHE.size,
 }))
 
 // Client verify
@@ -803,11 +855,14 @@ app.delete('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
     if (!client) return res.status(404).json({ error: 'Client not found' })
     if (client.apiKey) evictCache(client.apiKey)
     await database.collection('clients').deleteOne({ clientId })
+
+    // Also invalidate chunk cache for this client
+    invalidateChunkCache(clientId)
+
     const blobsDeleted = [], blobsFailed = []
-    if (AZURE_CONNECTION_STRING) {
+    if (blobServiceClient) {
       try {
-        const blobServiceClient = BlobServiceClient.fromConnectionString(AZURE_CONNECTION_STRING)
-        const containerClient   = blobServiceClient.getContainerClient(AZURE_CONTAINER_NAME)
+        const containerClient = blobServiceClient.getContainerClient(AZURE_CONTAINER_NAME)
         for (const prefix of [`raw/${clientId}/`, `meta/${clientId}/`]) {
           for await (const blob of containerClient.listBlobsFlat({ prefix })) {
             try { await containerClient.deleteBlob(blob.name); blobsDeleted.push(blob.name) }
@@ -818,6 +873,10 @@ app.delete('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
     }
     res.json({ ok: true, deleted: clientId, blobsDeleted: blobsDeleted.length, blobsFailed: blobsFailed.length > 0 ? blobsFailed : undefined })
   } catch (err) { res.status(500).json({ error: err.message }) }
+})
+app.post('/admin/clients/:clientId/invalidate-cache', requireAdminKey, (req, res) => {
+  invalidateChunkCache(req.params.clientId)
+  res.json({ ok: true, clientId: req.params.clientId, message: 'Chunk cache invalidated' })
 })
 
 // Auth
@@ -853,19 +912,19 @@ app.get('/client/me', requireClientKey, async (req, res) => {
 // Conversations
 app.post('/chat/conversations', requireClientKey, async (req, res) => {
   try {
-    const { title }  = req.body
-    const database   = await getChatDb()
-    const now        = new Date()
+    const { title }    = req.body
+    const database     = await getChatDb()
+    const now          = new Date()
     const conversation = { clientId: req.client.clientId, title: title || 'New Conversation', messages: [], createdAt: now, updatedAt: now }
-    const result     = await database.collection('conversations').insertOne(conversation)
+    const result       = await database.collection('conversations').insertOne(conversation)
     res.status(201).json({ ...conversation, _id: result.insertedId })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
 app.post('/chat/conversations/list', requireClientKey, async (req, res) => {
   try {
-    const database       = await getChatDb()
-    const conversations  = await database.collection('conversations').find({ clientId: req.client.clientId }, { projection: { messages: 0 } }).sort({ updatedAt: -1 }).toArray()
+    const database      = await getChatDb()
+    const conversations = await database.collection('conversations').find({ clientId: req.client.clientId }, { projection: { messages: 0 } }).sort({ updatedAt: -1 }).toArray()
     res.json({ conversations })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -902,35 +961,39 @@ app.post('/chat/conversations/delete', requireClientKey, async (req, res) => {
     res.json({ ok: true, deleted: conversationId })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
-
-// ─── Chat message ─────────────────────────────────────────────────────────────
 app.post('/chat/message', requireClientKey, async (req, res) => {
   try {
     const { query, topK = 6, conversationId } = req.body
     if (!query?.trim()) return res.status(400).json({ error: 'query is required' })
-
     const { clientId, name } = req.client
     const chunks = await loadChunksForClient(clientId)
 
     if (chunks.length === 0) {
-      return res.json({ answer: 'No documents found for your account. Please ensure your documents have been ingested first.', sources: [], client: { clientId, name } })
+      return res.json({
+        answer: 'No documents found for your account. Please ensure your documents have been ingested first.',
+        sources: [],
+        client: { clientId, name },
+      })
     }
 
     const intent = detectQueryIntent(query.trim())
     const hits   = await retrieveChunks(query.trim(), chunks, Math.min(topK, 20))
 
     if (hits.length === 0) {
-      return res.json({ answer: "I couldn't find that in your documents. Try rephrasing your question or asking about it differently.", sources: [], client: { clientId, name } })
+      return res.json({
+        answer: "I couldn't find that in your documents. Try rephrasing your question or asking about it differently.",
+        sources: [],
+        client: { clientId, name },
+      })
     }
-
     const rawAnswer = await answerWithPhi4(query.trim(), hits, intent)
-    const answer = fixBrokenUrls(rawAnswer)
+    const answer    = fixBrokenUrls(rawAnswer)
 
     const sources = hits.map(h => ({
-      source_file:  h.source_file  || 'unknown',
-      chunk_index:  h.chunk_index  ?? 0,
-      score:        typeof h._score === 'number' ? parseFloat(h._score.toFixed(4)) : null,
-      preview:      (h.text || '').slice(0, 300),
+      source_file: h.source_file  || 'unknown',
+      chunk_index: h.chunk_index  ?? 0,
+      score:       typeof h._score === 'number' ? parseFloat(h._score.toFixed(4)) : null,
+      preview:     (h.text || '').slice(0, 300),
     }))
 
     try {
@@ -941,7 +1004,10 @@ app.post('/chat/message', requireClientKey, async (req, res) => {
       const assistantMsg = { role: 'assistant', content: answer, sources: sources.map(s => ({ source_file: s.source_file, score: s.score })), timestamp: now }
 
       if (conversationId) {
-        await col.updateOne({ _id: new ObjectId(conversationId), clientId }, { $push: { messages: { $each: [userMsg, assistantMsg] } }, $set: { updatedAt: now } })
+        await col.updateOne(
+          { _id: new ObjectId(conversationId), clientId },
+          { $push: { messages: { $each: [userMsg, assistantMsg] } }, $set: { updatedAt: now } }
+        )
         res.json({ answer, sources, client: { clientId, name }, conversationId })
       } else {
         const title  = generateTitle(query.trim())
@@ -949,18 +1015,21 @@ app.post('/chat/message', requireClientKey, async (req, res) => {
         res.json({ answer, sources, client: { clientId, name }, conversationId: result.insertedId.toString() })
       }
     } catch (histErr) {
+      console.warn('[chat/message] Failed to save conversation history:', histErr.message)
       res.json({ answer, sources, client: { clientId, name }, conversationId: conversationId || null })
     }
   } catch (err) {
+    console.error('[chat/message] Error:', err.message)
     res.status(500).json({ error: err.message })
   }
 })
-
-// ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => {
   console.log(`rag-client-auth running on port ${PORT}`)
   console.log(`Model: ${PHI4_MODEL} | Endpoint: ${PHI4_ENDPOINT ? 'configured' : 'MISSING'}`)
+  console.log(`Phi-4 timeout: ${PHI4_TIMEOUT_MS}ms | Embed timeout: ${EMBED_TIMEOUT_MS}ms`)
+  console.log(`Chunk cache TTL: ${CHUNK_CACHE_TTL}ms`)
+  console.log(`Azure blob client: ${blobServiceClient ? 'singleton ready' : 'MISSING connection string'}`)
   startApiKeyHealthChecker()
 })
 
