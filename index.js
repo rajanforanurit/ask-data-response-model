@@ -528,40 +528,51 @@ function buildContext(hits) {
 const SYSTEM_PROMPT_CACHE     = new Map()
 const SYSTEM_PROMPT_CACHE_MAX = 100
 
-const HARDCODED_SYSTEM_PROMPT = `You are a document assistant. Answer ONLY using the CONTEXT provided below the question.
-
-ABSOLUTE RULES — follow every rule without exception:
-1. NEVER use general knowledge. Every claim must come directly from CONTEXT.
-2. If the exact term or value is not in CONTEXT, respond: "I couldn't find specific information about that in your documents."
-3. Search ALL context excerpts before concluding something is absent.
-4. No citation markers ([1],[2]). No file names. No internal labels (Field1, Field2).
-5. Return URLs exactly as they appear — full, unbroken, no spaces.
-6. Ignore copyright lines, page headers, and legal boilerplate.
-7. Be concise: one clear paragraph maximum.
-
-DEFINITION QUERIES (what is / define / explain):
-- Find lines containing the EXACT term asked — as a column name, key, or in "is described as" / "is defined as" sentences.
-- State the definition exactly as described in CONTEXT. Do NOT define a different term.
-- If CONTEXT shows "X is described as: ..." use that. If CONTEXT shows pipe-delimited rows with X as a key, describe it from those values.
-- If no definition is found for that EXACT term, say so explicitly.
-
-LOOKUP QUERIES (how many / what is the value of):
-- Return the exact value or count from CONTEXT. No approximations.
-
-URL QUERIES (Power BI / report URL / link):
-- Find and return the full matching URL on its own line.
-- If multiple URLs match, list each on its own line.
-
-SPREADSHEET DATA:
-- Rows appear as pipe-separated key:value pairs.
-- Lines ending in "is described as: ..." are definition summaries — prioritise these.
-- Write natural sentences from this data — never output raw pipe-delimited rows.
-
-PDF DATA:
-- Ignore repeated headers, footers, and page numbers. Focus on content.`
-
 function buildDynamicSystemPrompt(hits, intent = 'general') {
-  return HARDCODED_SYSTEM_PROMPT
+  const hasSpreadsheet = hits.some(h => classifyExtension(h.source_file || '') === DOC_TYPE.SPREADSHEET)
+  const hasPdf         = hits.some(h => classifyExtension(h.source_file || '') === DOC_TYPE.PDF)
+  const cacheKey       = `${intent}::${hasSpreadsheet}::${hasPdf}`
+  const cached         = SYSTEM_PROMPT_CACHE.get(cacheKey)
+  if (cached) return cached
+  const base = `You are a precise document assistant. Answer ONLY from the CONTEXT below.
+
+STRICT RULES:
+1. NEVER invent, assume, or add information not in CONTEXT.
+2. If the answer is absent, say: "I couldn't find that in your documents."
+3. Ignore lines that are purely copyright notices, legal boilerplate, or page headers — do not return them as answers.
+4. No citation markers ([1],[2]). No file names. No internal labels (Field1, Field2, etc).
+5. Be concise and direct. One short paragraph is ideal.`
+
+  const intentGuide = {
+    definition: `
+DEFINITION TASK: Find lines containing "is described as", "is defined as", or a clear explanation of the exact term asked. Synthesise those lines into a clean 1-2 sentence definition. If no matching definition line exists, say "I couldn't find a definition for that term in your documents." Do NOT define a different term.`,
+
+    lookup: `
+LOOKUP TASK: Return the exact value, count, or list from CONTEXT. Report precise numbers — no approximations. If not found, say so.`,
+
+    comparison: `
+COMPARISON TASK: Find information for EACH item and compare them clearly. Note any gaps if one side has less data.`,
+
+    url_lookup: `
+URL TASK: Find and return the full URL that matches the topic. Return the URL on its own line, unbroken, with no spaces. If multiple URLs match, list each on its own line. If none match, say not found.`,
+
+    general: `
+GENERAL TASK: Synthesise a clear, accurate answer from CONTEXT. Stay focused on what was asked.`,
+  }[intent] || `
+GENERAL TASK: Synthesise a clear, accurate answer from CONTEXT.`
+  const spreadsheetGuide = hasSpreadsheet ? `
+SPREADSHEET DATA: Rows appear as pipe-separated key:value pairs. Lines ending in "is described as: ..." are definition summaries — prioritise these for definition questions. When answering, write a natural sentence from this data — never output raw pipe-delimited rows verbatim.` : ''
+
+  const pdfGuide = hasPdf ? `
+PDF DATA: Ignore repeated headers, footers, copyright lines, and page numbers. Focus on substantive content.` : ''
+
+  const prompt = `${base}${intentGuide}${spreadsheetGuide}${pdfGuide}`
+
+  if (SYSTEM_PROMPT_CACHE.size >= SYSTEM_PROMPT_CACHE_MAX) {
+    SYSTEM_PROMPT_CACHE.delete(SYSTEM_PROMPT_CACHE.keys().next().value)
+  }
+  SYSTEM_PROMPT_CACHE.set(cacheKey, prompt)
+  return prompt
 }
 
 // ─── Mongo helpers ────────────────────────────────────────────────────────────
@@ -908,24 +919,13 @@ async function answerWithPhi4(originalQuery, hits, intent = 'general') {
   const systemPrompt = buildDynamicSystemPrompt(hits, intent)
   const context      = buildContext(hits)
 
-  // Build a tightly scoped instruction appended to the user message.
-  // This prevents the model from drifting to general knowledge.
-  let taskInstruction = ''
-  if (intent === 'definition') {
-    const subject = extractSubject(originalQuery)
-    taskInstruction = `\n\nTASK: Define ONLY the exact term "${subject}" using CONTEXT above. Do NOT define any other term. Do NOT use general knowledge. If "${subject}" does not appear in CONTEXT, say: "I couldn't find specific information about that in your documents."`
-  } else if (intent === 'url_lookup') {
-    const keywords = extractUrlKeywords(originalQuery).join(' ')
-    taskInstruction = `\n\nTASK: Find and return the full Power BI / report URL matching "${keywords}" from CONTEXT. Return the URL unbroken on its own line. If not found, say so.`
-  } else if (intent === 'lookup') {
-    taskInstruction = `\n\nTASK: Return the exact value or count from CONTEXT. No approximations. If not found, say so.`
-  } else if (intent === 'comparison') {
-    taskInstruction = `\n\nTASK: Compare the items using CONTEXT only. Use parallel structure. Note gaps if one side has less data.`
-  } else {
-    taskInstruction = `\n\nTASK: Answer the question using CONTEXT only. Be concise and direct.`
-  }
+  const subjectHint  = intent === 'definition'
+    ? `\nDefine ONLY this exact term: "${extractSubject(originalQuery)}". Do not define any other term.`
+    : intent === 'url_lookup'
+    ? `\nReturn URL(s) for: "${extractUrlKeywords(originalQuery).join(' ')}".`
+    : ''
 
-  const userMessage = `CONTEXT:\n${context}${taskInstruction}\n\nQuestion: ${originalQuery}`
+  const userMessage = `CONTEXT:\n${context}${subjectHint}\n\nQuestion: ${originalQuery}`
   return callPhi4(systemPrompt, userMessage)
 }
 
