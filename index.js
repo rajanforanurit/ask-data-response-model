@@ -33,13 +33,13 @@ function originAllowed(origin) {
 app.use(cors({
   origin: (origin, callback) => callback(null, originAllowed(origin)),
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-session-id'],
   credentials: true,
 }))
 app.options('*', cors({
   origin: (origin, callback) => callback(null, true),
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-session-id'],
   credentials: true,
 }))
 app.use(express.json())
@@ -122,76 +122,98 @@ function getCacheKey(clientId, query) {
   return `${clientId}:${query.toLowerCase().trim()}`
 }
 
-// ─── Per-Client Rate Limiter ──────────────────────────────────────────────────
-const RATE_LIMIT_MAX       = parseInt(process.env.RATE_LIMIT_MAX       || '10',     10)
-const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '120000', 10) // 2 minutes
-const RATE_LIMIT_MAP       = new Map() // clientId → { count, blockedUntil }
+const SESSION_RATE_LIMIT_MAX = parseInt(process.env.SESSION_RATE_LIMIT_MAX || '15', 10)
+const GLOBAL_RATE_LIMIT_MAX = parseInt(process.env.GLOBAL_RATE_LIMIT_MAX || '120', 10)
+const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '120000', 10) 
 
-/**
- * Check and update rate limit for a given clientId.
- * Returns { blocked: boolean, retryAfter: number (seconds), remaining: number }
- */
-function rateLimitCheck(clientId) {
+const SESSION_RL_MAP = new Map() 
+const GLOBAL_RL_MAP  = new Map() 
+function extractSessionId(req) {
+  return (req.headers['x-session-id'] || '').trim()
+    || (req.body?.sessionId || '').trim()
+    || req.ip
+    || 'unknown'
+}
+function checkRateLimit(map, key, maxRequests) {
   const now   = Date.now()
-  const entry = RATE_LIMIT_MAP.get(clientId) || { count: 0, blockedUntil: 0 }
+  const entry = map.get(key) || { count: 0, blockedUntil: 0 }
 
-  // 1. Client is currently blocked — reject immediately
+  // Currently blocked
   if (entry.blockedUntil > now) {
     const retryAfter = Math.ceil((entry.blockedUntil - now) / 1000)
     return { blocked: true, retryAfter, remaining: 0 }
   }
 
-  // 2. Block period has fully elapsed — reset counter before incrementing
+  // Block period just elapsed — reset
   if (entry.blockedUntil > 0 && entry.blockedUntil <= now) {
     entry.count        = 0
     entry.blockedUntil = 0
-    console.log(`[rateLimit] Block expired for ${clientId} — counter reset`)
   }
 
-  // 3. Increment request count for this window
-  entry.count += 1
+  entry.count    += 1
+  entry.lastSeen  = now
 
-  // 4. Limit exceeded — impose block
-  if (entry.count > RATE_LIMIT_MAX) {
+  // Limit exceeded — impose block
+  if (entry.count > maxRequests) {
     entry.blockedUntil = now + RATE_LIMIT_WINDOW_MS
-    RATE_LIMIT_MAP.set(clientId, entry)
+    map.set(key, entry)
     const retryAfter = Math.ceil(RATE_LIMIT_WINDOW_MS / 1000)
-    console.warn(
-      `[rateLimit] 🚫 ${clientId} BLOCKED for ${retryAfter}s ` +
-      `(hit request ${entry.count}/${RATE_LIMIT_MAX})`
-    )
+    console.warn(`[rateLimit] 🚫 BLOCKED key=${key} for ${retryAfter}s (hit ${entry.count}/${maxRequests})`)
     return { blocked: true, retryAfter, remaining: 0 }
   }
 
-  // 5. Within limit — persist updated entry and allow request
-  const remaining = RATE_LIMIT_MAX - entry.count
-  RATE_LIMIT_MAP.set(clientId, entry)
-  console.log(
-    `[rateLimit] ${clientId} — request ${entry.count}/${RATE_LIMIT_MAX} ` +
-    `(${remaining} remaining)`
-  )
+  map.set(key, entry)
+  const remaining = maxRequests - entry.count
   return { blocked: false, retryAfter: 0, remaining }
 }
+function applyRateLimits(req, clientId) {
+  const sessionId  = extractSessionId(req)
+  const sessionKey = `rl:${clientId}:${sessionId}`
+  const globalKey  = `rl:global:${clientId}`
 
-// ─── Periodic cleanup: remove fully-expired rate-limit entries every 5 min ────
-setInterval(() => {
-  const now     = Date.now()
-  let   removed = 0
-  for (const [clientId, entry] of RATE_LIMIT_MAP.entries()) {
-    if (entry.blockedUntil > 0 && entry.blockedUntil <= now) {
-      RATE_LIMIT_MAP.delete(clientId)
-      removed++
+  // 1. Session-level check
+  const sessionRl = checkRateLimit(SESSION_RL_MAP, sessionKey, SESSION_RATE_LIMIT_MAX)
+  if (sessionRl.blocked) {
+    console.warn(`[rateLimit] Session blocked: ${sessionKey}`)
+    return {
+      status: 429,
+      headers: { 'Retry-After': String(sessionRl.retryAfter) },
+      body: { error: `User rate limit exceeded. Try again in ${sessionRl.retryAfter} seconds.` },
     }
   }
-  if (removed > 0) {
-    console.log(`[rateLimit] Cleanup removed ${removed} stale entries (map size: ${RATE_LIMIT_MAP.size})`)
+  const globalRl = checkRateLimit(GLOBAL_RL_MAP, globalKey, GLOBAL_RATE_LIMIT_MAX)
+  if (globalRl.blocked) {
+    console.warn(`[rateLimit] Global client blocked: ${globalKey}`)
+    return {
+      status: 429,
+      headers: { 'Retry-After': String(globalRl.retryAfter) },
+      body: { error: `System busy. Please try again in ${globalRl.retryAfter} seconds.` },
+    }
   }
-}, 5 * 60 * 1000)
+  req._rlSession = { key: sessionKey, remaining: sessionRl.remaining }
+  req._rlGlobal  = { key: globalKey,  remaining: globalRl.remaining }
+  return null 
+}
+setInterval(() => {
+  const now     = Date.now()
+  const IDLE_MS = RATE_LIMIT_WINDOW_MS * 2
+  let removed   = 0
 
-// ─── In-flight dedup ──────────────────────────────────────────────────────────
+  for (const [key, entry] of SESSION_RL_MAP.entries()) {
+    const isExpiredBlock  = entry.blockedUntil > 0 && entry.blockedUntil <= now
+    const isIdleSession   = !entry.blockedUntil && entry.lastSeen && (now - entry.lastSeen > IDLE_MS)
+    if (isExpiredBlock || isIdleSession) { SESSION_RL_MAP.delete(key); removed++ }
+  }
+
+  for (const [key, entry] of GLOBAL_RL_MAP.entries()) {
+    if (entry.blockedUntil > 0 && entry.blockedUntil <= now) { GLOBAL_RL_MAP.delete(key); removed++ }
+  }
+
+  if (removed > 0) {
+    console.log(`[rateLimit] Cleanup: removed ${removed} stale entries (session=${SESSION_RL_MAP.size}, global=${GLOBAL_RL_MAP.size})`)
+  }
+}, 60 * 1000)
 const IN_FLIGHT = new Map()
-
-// ─── Phi-4 concurrency control ────────────────────────────────────────────────
 let phiActiveCount = 0
 const PHI_MAX_CONCURRENT = 3
 const phiQueue = []
@@ -292,42 +314,14 @@ function classifyExtension(fileName) {
   return DOC_TYPE.UNKNOWN
 }
 
-function inferSchema(fileName, textSamples) {
-  const type   = classifyExtension(fileName)
-  const schema = { type, fileName, columns: [], sampleValues: [], topics: [] }
-  if (type === DOC_TYPE.SPREADSHEET || type === DOC_TYPE.DATA) {
-    const columnSet = new Set(), valueSet = new Set()
-    for (const sample of textSamples.slice(0, 60)) {
-      for (const pair of sample.split('|').map(s => s.trim())) {
-        const colonIdx = pair.indexOf(':')
-        if (colonIdx > 0) {
-          const key = pair.slice(0, colonIdx).trim()
-          const val = pair.slice(colonIdx + 1).trim()
-          if (key && key.length < 80)  columnSet.add(key)
-          if (val && val.length < 120) valueSet.add(val)
-        }
-      }
-    }
-    schema.columns      = [...columnSet].slice(0, 30)
-    schema.sampleValues = [...valueSet].slice(0, 20)
-  } else {
-    const freq = {}
-    for (const sample of textSamples.slice(0, 30)) {
-      for (const word of sample.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/)) {
-        if (word.length > 5) freq[word] = (freq[word] || 0) + 1
-      }
-    }
-    schema.topics = Object.entries(freq).sort((a, b) => b[1] - a[1]).slice(0, 15).map(([w]) => w)
-  }
-  return schema
-}
-
 function detectQueryIntent(query) {
   const q = query.toLowerCase().trim()
   const DEFINITION_PATTERNS = [/^what\s+(is|are|does)\s+/,/^define\s+/,/^explain\s+/,/^meaning\s+of\s+/,/^tell\s+me\s+about\s+/,/^describe\s+/,/^how\s+is\s+.+\s+(calculated|defined|measured|computed)/,/\bmeaning\b/,/\bdefinition\b/,/\bwhat\s+does\b/]
   const LOOKUP_PATTERNS     = [/^(show|list|find|get|fetch|give)\s+(me\s+)?/,/^how\s+many\s+/,/^what\s+(is\s+the\s+)?(value|number|count|total|sum|amount)/]
   const COMPARISON_PATTERNS = [/\bvs\b|\bversus\b|\bdifference\b|\bcompare\b|\bbetween\b/]
   const URL_PATTERNS        = [/\burl\b/,/\blink\b/,/\breport\b.*\burl\b/,/\burl\b.*\breport\b/,/\bpower\s*bi\b/,/\bdashboard\b/]
+  const GREETING_PATTERNS   = [/^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening)|how\s+are\s+you|what's\s+up|sup)\b/]
+  if (GREETING_PATTERNS.some(p => p.test(q))) return 'greeting'
   if (URL_PATTERNS.some(p => p.test(q)))        return 'url_lookup'
   if (DEFINITION_PATTERNS.some(p => p.test(q))) return 'definition'
   if (COMPARISON_PATTERNS.some(p => p.test(q))) return 'comparison'
@@ -606,50 +600,42 @@ async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
 
 // ─── Context builder ──────────────────────────────────────────────────────────
 function buildContext(hits) {
-  return hits.map((h, i) => {
-    return `[${i + 1}]\n${(h.text || '').trim()}`
-  }).join('\n\n---\n\n')
+  // Limit context to prevent token overflow — take top 4 hits, max 300 chars each
+  return hits.slice(0, 4).map((h, i) => {
+    const text = (h.text || '').trim().slice(0, 300)
+    return `[${i + 1}] ${text}`
+  }).join('\n\n')
 }
 
-// ─── System prompt builder ────────────────────────────────────────────────────
+// ─── Optimized System Prompt Builder (<= ~600 tokens) ─────────────────────────
 const SYSTEM_PROMPT_CACHE     = new Map()
 const SYSTEM_PROMPT_CACHE_MAX = 100
 
 function buildDynamicSystemPrompt(hits, intent = 'general') {
-  const sourceKey = [...new Set(hits.map(h => h.source_file || 'unknown'))].sort().join('|')
-  const cacheKey  = `${sourceKey}::${intent}`
-  const cached    = SYSTEM_PROMPT_CACHE.get(cacheKey)
+  // Don't cache by hits content — cache by intent + doc-type combo
+  const hasSpreadsheet = hits.some(h => classifyExtension(h.source_file || '') === DOC_TYPE.SPREADSHEET)
+  const cacheKey = `${intent}::${hasSpreadsheet}`
+  const cached   = SYSTEM_PROMPT_CACHE.get(cacheKey)
   if (cached) return cached
 
-  const hasSpreadsheet = hits.some(h => classifyExtension(h.source_file || '') === DOC_TYPE.SPREADSHEET)
-
+  // Intent-specific instruction (short)
   const intentLine = {
-    definition: `The user wants a definition. Find the EXACT term in context and explain what it is, how it's calculated, and any conditions. Focus only on that term.`,
-    lookup:     `The user wants a specific value or count. Find and return the exact data — no approximations.`,
-    comparison: `The user wants a comparison. Cover each item clearly with similarities and differences in parallel structure.`,
-    url_lookup: `The user wants a URL or report link. Return ONLY the matching URL(s) — full and unbroken. Match on the specific topic they asked about, not just any URL in the context.`,
-    general:    `Scan all context. Synthesise a clear, complete answer from what's there.`,
-  }[intent] || `Scan all context. Synthesise a clear, complete answer from what's there.`
+    definition: 'Find the exact term. State what it is, how it works, and any conditions.',
+    lookup:     'Return the exact value or count. No approximations.',
+    comparison: 'Compare each item briefly with clear similarities and differences.',
+    url_lookup: 'Return ONLY the matching URL(s), full and unbroken. Match the specific topic asked.',
+    general:    'Synthesize a clear, complete answer from the context.',
+    greeting:   'Respond as a friendly assistant.',
+  }[intent] || 'Synthesize a clear, complete answer from the context.'
 
   const spreadsheetNote = hasSpreadsheet
-    ? `\nFor spreadsheet data: rows are pipe-separated key:value pairs. Lines with "is described as:" are definitions — prioritise them. Field labels like Field1/Field2 are internal column headers — never include them in your answer; use the actual values instead.`
+    ? ' For spreadsheet rows: pipe-separated key:value pairs. Lines with "is described as:" are definitions — prioritize them. Never expose Field1/Field2/etc labels.'
     : ''
 
-  const prompt = `You are a precise document assistant. Answer using ONLY the provided context.
-
-Rules:
-1. Answer only from context — never invent information.
-2. Search every excerpt before saying something is missing.
-3. Matching is case-insensitive.
-4. If information is truly absent, say: "I couldn't find that in your documents."
-5. Never include citation markers like [1], [2].
-6. Never mention file names or source names.
-7. Never expose internal field labels (Field1, Field2, Field3, etc.) in your answer.
-8. Be concise and direct — answer only what was asked.
-9. URLs: return the full URL on a single unbroken line, exactly as it appears.
-10. For URL queries: only return URLs that match the specific topic asked — ignore unrelated links.
-${spreadsheetNote}
-
+  // Compact prompt — stays well under 600 tokens
+  const prompt =
+`You are a document assistant. Answer ONLY from the provided context.
+Rules: (1) Never invent info. (2) If absent, say "I couldn't find that in your documents." (3) No citation markers like [1][2]. (4) No file names. (5) No internal labels (Field1, Field2, etc). (6) Be concise. (7) URLs: one unbroken line, exact match only.${spreadsheetNote}
 Task: ${intentLine}`
 
   if (SYSTEM_PROMPT_CACHE.size >= SYSTEM_PROMPT_CACHE_MAX) {
@@ -998,20 +984,19 @@ function warmupChunkCaches() {
   }
 }
 
+// ─── Answer builder ────────────────────────────────────────────────────────────
 async function answerWithPhi4(originalQuery, hits, intent = 'general') {
   const systemPrompt = buildDynamicSystemPrompt(hits, intent)
   const context      = buildContext(hits)
+
+  // Subject hint — very short, appended to user message
   const subjectHint  = intent === 'definition'
-    ? `\nFocus: define "${extractSubject(originalQuery)}" only.`
+    ? `\nDefine only: "${extractSubject(originalQuery)}".`
     : intent === 'url_lookup'
-    ? `\nFocus: return only the URL(s) matching the topic "${extractUrlKeywords(originalQuery).join(' ')}". Do not return unrelated links.`
+    ? `\nReturn URL(s) for: "${extractUrlKeywords(originalQuery).join(' ')}".`
     : ''
 
-  const userMessage = `CONTEXT:
-${context}
-${subjectHint}
-Question: ${originalQuery}`
-
+  const userMessage = `CONTEXT:\n${context}${subjectHint}\n\nQuestion: ${originalQuery}`
   return callPhi4(systemPrompt, userMessage)
 }
 
@@ -1066,7 +1051,8 @@ app.get('/health', (req, res) => res.json({
   chunkCacheSize:   CHUNK_CACHE.size,
   promptCacheSize:  SYSTEM_PROMPT_CACHE.size,
   responseCacheSize: RESPONSE_CACHE.size,
-  rateLimitMapSize: RATE_LIMIT_MAP.size,
+  sessionRlMapSize: SESSION_RL_MAP.size,
+  globalRlMapSize:  GLOBAL_RL_MAP.size,
   phiCircuitOpen:   phiCircuitOpen(),
   phiFailures,
 }))
@@ -1187,14 +1173,18 @@ app.post('/admin/clients/:clientId/invalidate-cache', requireAdminKey, (req, res
 // ─── Admin: reset rate limit for a specific client ────────────────────────────
 app.post('/admin/clients/:clientId/reset-rate-limit', requireAdminKey, (req, res) => {
   const { clientId } = req.params
-  const had = RATE_LIMIT_MAP.has(clientId)
-  RATE_LIMIT_MAP.delete(clientId)
-  console.log(`[rateLimit] Admin reset for ${clientId}`)
-  res.json({
-    ok:      true,
-    clientId,
-    message: had ? 'Rate limit entry cleared' : 'No active rate limit entry found',
-  })
+  let removed = 0
+
+  // Clear all session entries for this client
+  for (const key of SESSION_RL_MAP.keys()) {
+    if (key.startsWith(`rl:${clientId}:`)) { SESSION_RL_MAP.delete(key); removed++ }
+  }
+  // Clear global entry
+  const globalKey = `rl:global:${clientId}`
+  if (GLOBAL_RL_MAP.has(globalKey)) { GLOBAL_RL_MAP.delete(globalKey); removed++ }
+
+  console.log(`[rateLimit] Admin reset for ${clientId}: removed ${removed} entries`)
+  res.json({ ok: true, clientId, message: `Rate limit cleared (${removed} entries removed)` })
 })
 
 app.post('/client/login', async (req, res) => {
@@ -1295,16 +1285,25 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
     if (!query?.trim()) return res.status(400).json({ error: 'query is required' })
     const { clientId, name } = req.client
 
-    // ── ① Per-client rate limit — checked BEFORE cache or any heavy work ──────
-    const rl = rateLimitCheck(clientId)
-    if (rl.blocked) {
-      res.set('Retry-After', String(rl.retryAfter))
-      return res.status(429).json({
-        error: `Rate limit exceeded. Try again in ${rl.retryAfter} seconds.`,
+    // ── ① Rate limiting — BEFORE everything else ──────────────────────────────
+    const rlBlock = applyRateLimits(req, clientId)
+    if (rlBlock) {
+      if (rlBlock.headers) Object.entries(rlBlock.headers).forEach(([k, v]) => res.set(k, v))
+      return res.status(rlBlock.status).json(rlBlock.body)
+    }
+
+    // ── ② Greeting short-circuit — skip RAG entirely ─────────────────────────
+    const intent = detectQueryIntent(query.trim())
+    if (intent === 'greeting') {
+      return res.json({
+        answer: "Hello! I'm your document assistant. Ask me anything about your data.",
+        sources: [],
+        conversationId: conversationId || null,
+        client: { clientId, name },
       })
     }
 
-    // ── ② Response cache — fast path for repeated identical queries ───────────
+    // ── ③ Response cache — fast path for repeated identical queries ───────────
     const cacheKey = getCacheKey(clientId, query)
     const cached   = responseCacheGet(cacheKey)
     if (cached) {
@@ -1312,7 +1311,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       return res.json({ ...cached, cached: true, conversationId: conversationId || cached.conversationId })
     }
 
-    // ── ③ In-flight dedup — coalesce concurrent identical queries ─────────────
+    // ── ④ In-flight dedup — coalesce concurrent identical queries ─────────────
     if (IN_FLIGHT.has(cacheKey)) {
       console.log(`[dedup] Waiting for in-flight request: "${query.slice(0, 50)}"`)
       try {
@@ -1333,8 +1332,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         }
       }
 
-      const intent = detectQueryIntent(query.trim())
-      const hits   = await retrieveChunks(query.trim(), chunks, Math.min(topK, 20), invertedIndex)
+      const hits = await retrieveChunks(query.trim(), chunks, Math.min(topK, 20), invertedIndex)
 
       if (hits.length === 0) {
         return {
@@ -1421,11 +1419,12 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
     if (result.answer && result.answer.length > 10) {
       responseCacheSet(cacheKey, result)
     }
-    const rlState = RATE_LIMIT_MAP.get(clientId)
-    if (rlState) {
-      res.set('X-RateLimit-Limit',     String(RATE_LIMIT_MAX))
-      res.set('X-RateLimit-Remaining', String(Math.max(0, RATE_LIMIT_MAX - rlState.count)))
-      res.set('X-RateLimit-Reset',     String(Math.ceil((rlState.blockedUntil || Date.now() + RATE_LIMIT_WINDOW_MS) / 1000)))
+
+    // Attach rate limit headers for transparency
+    if (req._rlSession) {
+      res.set('X-RateLimit-Limit',           String(SESSION_RATE_LIMIT_MAX))
+      res.set('X-RateLimit-Remaining',       String(req._rlSession.remaining))
+      res.set('X-RateLimit-Global-Remaining', String(req._rlGlobal?.remaining ?? GLOBAL_RATE_LIMIT_MAX))
     }
 
     res.json(result)
@@ -1435,10 +1434,12 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
     if (!res.headersSent) res.status(500).json({ error: err.message })
   }
 }))
+
 app.use((err, req, res, next) => {
   console.error('[global error handler]', err)
   if (!res.headersSent) res.status(500).json({ error: 'An unexpected error occurred. Please try again.' })
 })
+
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => {
   console.log(`rag-client-auth running on port ${PORT}`)
@@ -1447,7 +1448,8 @@ app.listen(PORT, () => {
   console.log(`Chunk cache TTL: ${CHUNK_CACHE_TTL}ms | Embed pool limit: ${EMBED_POOL_LIMIT}`)
   console.log(`Request timeout: ${REQUEST_TIMEOUT_MS}ms | Keyword short-circuit score: ${KEYWORD_SHORTCIRCUIT_SCORE}`)
   console.log(`Blob concurrency: ${BLOB_CONCURRENCY}`)
-  console.log(`Rate limit: ${RATE_LIMIT_MAX} req → ${RATE_LIMIT_WINDOW_MS / 1000}s block`)
+  console.log(`Session rate limit: ${SESSION_RATE_LIMIT_MAX} req → ${RATE_LIMIT_WINDOW_MS / 1000}s block`)
+  console.log(`Global rate limit:  ${GLOBAL_RATE_LIMIT_MAX} req → ${RATE_LIMIT_WINDOW_MS / 1000}s block`)
   console.log(`Azure blob client: ${blobServiceClient ? 'singleton ready' : 'MISSING connection string'}`)
   startApiKeyHealthChecker()
   warmupChunkCaches()
