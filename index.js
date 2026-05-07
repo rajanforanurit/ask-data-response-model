@@ -13,7 +13,6 @@ const { simpleParser } = require('mailparser')
 const { parseOffice } = require('officeparser')
 const crypto = require('crypto')
 const app = express()
-
 const allowedOrigins = [
   'http://localhost:8080',
   'http://localhost:3000',
@@ -24,7 +23,6 @@ const allowedOrigins = [
   'https://df.powerbi.com',
   'https://api.powerbi.com',
 ]
-
 function originAllowed(origin) {
   if (!origin) return true
   if (origin === 'null') return true
@@ -32,44 +30,37 @@ function originAllowed(origin) {
   if (/\.(powerbi|microsoft|office)\.com$/.test(origin)) return true
   return false
 }
-
 app.use(cors({
   origin: (origin, callback) => callback(null, originAllowed(origin)),
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
 }))
-
 app.options('*', cors({
   origin: (origin, callback) => callback(null, true),
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
 }))
-
 app.use(express.json())
-
-// ─── ENV ──────────────────────────────────────────────────────────────────────
-const MONGODB_URI             = process.env.MONGODB_URI
-const MONGODB_DB              = process.env.MONGODB_DB || 'clientcreds'
-const CHAT_HISTORY_URI        = process.env.CHAT_HISTORY_URI
-const CHAT_HISTORY_DB         = process.env.CHAT_HISTORY_DB || 'chathistory'
+const MONGODB_URI = process.env.MONGODB_URI
+const MONGODB_DB  = process.env.MONGODB_DB || 'clientcreds'
+const CHAT_HISTORY_URI = process.env.CHAT_HISTORY_URI
+const CHAT_HISTORY_DB = process.env.CHAT_HISTORY_DB || 'chathistory'
 const AZURE_CONNECTION_STRING = process.env.AZURE_CONNECTION_STRING || ''
-const AZURE_CONTAINER_NAME    = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
-const ADMIN_API_KEY           = process.env.ADMIN_API_KEY
+const AZURE_CONTAINER_NAME = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
+const ADMIN_API_KEY  = process.env.ADMIN_API_KEY
 const KEY_CHECK_INTERVAL_MS   = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10)
-
-const PHI4_ENDPOINT    = process.env.PHI4_ENDPOINT
-const PHI4_API_KEY     = process.env.PHI4_API_KEY
-const PHI4_MODEL       = process.env.PHI4_MODEL || 'Phi-4-mini-instruct'
+const PHI4_ENDPOINT = process.env.PHI4_ENDPOINT
+const PHI4_API_KEY = process.env.PHI4_API_KEY
+const PHI4_MODEL  = process.env.PHI4_MODEL || 'Phi-4-mini-instruct'
 const PHI4_TIMEOUT_MS  = parseInt(process.env.PHI4_TIMEOUT_MS || '30000', 10)
-
 const AZURE_EMBED_ENDPOINT = process.env.AZURE_EMBED_ENDPOINT || ''
-const AZURE_EMBED_KEY      = process.env.AZURE_EMBED_KEY || ''
-const AZURE_EMBED_MODEL    = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
-const EMBED_TIMEOUT_MS     = parseInt(process.env.EMBED_TIMEOUT_MS || '10000', 10)
-const EMBED_POOL_LIMIT     = parseInt(process.env.EMBED_POOL_LIMIT || '20', 10)
-const REQUEST_TIMEOUT_MS   = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10)
+const AZURE_EMBED_KEY = process.env.AZURE_EMBED_KEY || ''
+const AZURE_EMBED_MODEL = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
+const EMBED_TIMEOUT_MS = parseInt(process.env.EMBED_TIMEOUT_MS || '10000', 10)
+const EMBED_POOL_LIMIT = parseInt(process.env.EMBED_POOL_LIMIT || '20', 10)
+const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10)
 const KEYWORD_SHORTCIRCUIT_SCORE = parseInt(process.env.KEYWORD_SHORTCIRCUIT_SCORE || '6', 10)
 
 const WARMUP_CLIENT_IDS = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
@@ -107,6 +98,7 @@ const DOC_TYPE = {
   UNKNOWN:      'unknown',
 }
 
+// ─── Response Cache ───────────────────────────────────────────────────────────
 const RESPONSE_CACHE     = new Map()
 const RESPONSE_CACHE_TTL = 10 * 60 * 1000
 const RESPONSE_CACHE_MAX = 1000
@@ -130,7 +122,76 @@ function getCacheKey(clientId, query) {
   return `${clientId}:${query.toLowerCase().trim()}`
 }
 
+// ─── Per-Client Rate Limiter ──────────────────────────────────────────────────
+const RATE_LIMIT_MAX       = parseInt(process.env.RATE_LIMIT_MAX       || '10',     10)
+const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '120000', 10) // 2 minutes
+const RATE_LIMIT_MAP       = new Map() // clientId → { count, blockedUntil }
+
+/**
+ * Check and update rate limit for a given clientId.
+ * Returns { blocked: boolean, retryAfter: number (seconds), remaining: number }
+ */
+function rateLimitCheck(clientId) {
+  const now   = Date.now()
+  const entry = RATE_LIMIT_MAP.get(clientId) || { count: 0, blockedUntil: 0 }
+
+  // 1. Client is currently blocked — reject immediately
+  if (entry.blockedUntil > now) {
+    const retryAfter = Math.ceil((entry.blockedUntil - now) / 1000)
+    return { blocked: true, retryAfter, remaining: 0 }
+  }
+
+  // 2. Block period has fully elapsed — reset counter before incrementing
+  if (entry.blockedUntil > 0 && entry.blockedUntil <= now) {
+    entry.count        = 0
+    entry.blockedUntil = 0
+    console.log(`[rateLimit] Block expired for ${clientId} — counter reset`)
+  }
+
+  // 3. Increment request count for this window
+  entry.count += 1
+
+  // 4. Limit exceeded — impose block
+  if (entry.count > RATE_LIMIT_MAX) {
+    entry.blockedUntil = now + RATE_LIMIT_WINDOW_MS
+    RATE_LIMIT_MAP.set(clientId, entry)
+    const retryAfter = Math.ceil(RATE_LIMIT_WINDOW_MS / 1000)
+    console.warn(
+      `[rateLimit] 🚫 ${clientId} BLOCKED for ${retryAfter}s ` +
+      `(hit request ${entry.count}/${RATE_LIMIT_MAX})`
+    )
+    return { blocked: true, retryAfter, remaining: 0 }
+  }
+
+  // 5. Within limit — persist updated entry and allow request
+  const remaining = RATE_LIMIT_MAX - entry.count
+  RATE_LIMIT_MAP.set(clientId, entry)
+  console.log(
+    `[rateLimit] ${clientId} — request ${entry.count}/${RATE_LIMIT_MAX} ` +
+    `(${remaining} remaining)`
+  )
+  return { blocked: false, retryAfter: 0, remaining }
+}
+
+// ─── Periodic cleanup: remove fully-expired rate-limit entries every 5 min ────
+setInterval(() => {
+  const now     = Date.now()
+  let   removed = 0
+  for (const [clientId, entry] of RATE_LIMIT_MAP.entries()) {
+    if (entry.blockedUntil > 0 && entry.blockedUntil <= now) {
+      RATE_LIMIT_MAP.delete(clientId)
+      removed++
+    }
+  }
+  if (removed > 0) {
+    console.log(`[rateLimit] Cleanup removed ${removed} stale entries (map size: ${RATE_LIMIT_MAP.size})`)
+  }
+}, 5 * 60 * 1000)
+
+// ─── In-flight dedup ──────────────────────────────────────────────────────────
 const IN_FLIGHT = new Map()
+
+// ─── Phi-4 concurrency control ────────────────────────────────────────────────
 let phiActiveCount = 0
 const PHI_MAX_CONCURRENT = 3
 const phiQueue = []
@@ -158,10 +219,8 @@ function drainPhiQueue() {
     next()
   }
 }
-
-let phiFailures      = 0
+let phiFailures  = 0
 let phiBlockedUntil  = 0
-
 function phiCircuitOpen() {
   if (Date.now() < phiBlockedUntil) return true
   if (phiBlockedUntil > 0) {
@@ -181,7 +240,6 @@ function phiRecordFailure() {
     console.error(`🚨 [phi4] Circuit breaker OPEN for 30s after ${phiFailures} failures`)
   }
 }
-
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
@@ -297,10 +355,8 @@ function extractSubject(query) {
   return q
 }
 
-// ─── FIX: Extract URL-specific keywords from query ───────────────────────────
 function extractUrlKeywords(query) {
   const q = query.toLowerCase()
-  // Remove generic words, keep meaningful ones
   const stopWords = new Set(['power', 'bi', 'report', 'url', 'link', 'for', 'the', 'a', 'an', 'of', 'in', 'get', 'me', 'show', 'give', 'find', 'fetch'])
   const words = q.replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1 && !stopWords.has(w))
   return words
@@ -418,7 +474,7 @@ async function embedBatch(texts) {
   }
 }
 
-// ─── FIX: Precision keyword search with URL-aware scoring ────────────────────
+// ─── Keyword search ───────────────────────────────────────────────────────────
 function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = null) {
   const subject      = intent === 'definition' ? extractSubject(query) : query.toLowerCase()
   const queryLower   = query.toLowerCase()
@@ -426,16 +482,14 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
   const subjectWords = subjectLower.split(/\s+/).filter(w => w.length > 1)
   const queryWords   = queryLower.replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1)
 
-  // For URL lookups, extract specific topic keywords (e.g., "occupancy" from "power BI report URL for occupancy")
   const urlKeywords = intent === 'url_lookup' ? extractUrlKeywords(query) : []
 
   let candidateIndices
   if (invertedIndex && subjectWords.length > 0) {
     const wordsToIndex = intent === 'url_lookup' ? urlKeywords : subjectWords
     const sets = wordsToIndex.map(w => invertedIndex.get(w) || new Set())
-    // Also always index for URL/Link chunks on url_lookup
     if (intent === 'url_lookup') {
-      const urlSet = invertedIndex.get('url') || new Set()
+      const urlSet  = invertedIndex.get('url')  || new Set()
       const linkSet = invertedIndex.get('link') || new Set()
       const httpSet = invertedIndex.get('http') || new Set()
       sets.push(urlSet, linkSet, httpSet)
@@ -456,14 +510,10 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
       let score = 0
 
       if (intent === 'url_lookup') {
-        // Must contain a URL
         if (!text.includes('http')) return { ...c, _score: 0 }
-        // Score by how many topic keywords match
         const topicMatches = urlKeywords.filter(w => text.includes(w)).length
         score += topicMatches * 10
-        // Penalise chunks that match none of the topic keywords
         if (topicMatches === 0) return { ...c, _score: 0 }
-        // Boost exact multi-word topic phrase
         const topicPhrase = urlKeywords.join(' ')
         if (text.includes(topicPhrase)) score += 15
       } else {
@@ -561,7 +611,7 @@ function buildContext(hits) {
   }).join('\n\n---\n\n')
 }
 
-// ─── FIX: Lean, optimised system prompt (~600-650 tokens) ─────────────────────
+// ─── System prompt builder ────────────────────────────────────────────────────
 const SYSTEM_PROMPT_CACHE     = new Map()
 const SYSTEM_PROMPT_CACHE_MAX = 100
 
@@ -573,7 +623,6 @@ function buildDynamicSystemPrompt(hits, intent = 'general') {
 
   const hasSpreadsheet = hits.some(h => classifyExtension(h.source_file || '') === DOC_TYPE.SPREADSHEET)
 
-  // ── Intent-specific instruction (short) ──────────────────────────────────
   const intentLine = {
     definition: `The user wants a definition. Find the EXACT term in context and explain what it is, how it's calculated, and any conditions. Focus only on that term.`,
     lookup:     `The user wants a specific value or count. Find and return the exact data — no approximations.`,
@@ -966,25 +1015,21 @@ Question: ${originalQuery}`
   return callPhi4(systemPrompt, userMessage)
 }
 
-// ─── FIX: Clean fallback — no technical note, no field names ─────────────────
 function buildFallbackAnswer(query, hits) {
   if (!hits || hits.length === 0) {
     return "I couldn't find relevant information in your documents for this query."
   }
   const intent = detectQueryIntent(query)
 
-  // For URL lookups, try to extract just the URL line
   if (intent === 'url_lookup') {
     const urlKeywords = extractUrlKeywords(query)
     for (const h of hits) {
       const lines = (h.text || '').split('\n')
       for (const line of lines) {
         if (!line.toLowerCase().includes('http')) continue
-        // Check if this line is relevant to the topic
         const lineLower = line.toLowerCase()
         const matches = urlKeywords.filter(w => lineLower.includes(w)).length
         if (matches > 0) {
-          // Extract just the URL
           const urlMatch = line.match(/https?:\/\/\S+/)
           if (urlMatch) return urlMatch[0].replace(/\s/g, '')
         }
@@ -992,14 +1037,12 @@ function buildFallbackAnswer(query, hits) {
     }
   }
 
-  // For definitions, find the most relevant snippet
   const subject = extractSubject(query).toLowerCase()
   const best = hits.find(h => {
     const t = (h.text || '').toLowerCase()
     return t.includes('is described as') && t.includes(subject)
   }) || hits.find(h => (h.text || '').toLowerCase().includes(subject)) || hits[0]
 
-  // Clean up internal field labels from the snippet
   const snippet = (best.text || '')
     .replace(/Field\d+:\s*/gi, '')
     .replace(/\|\s*Field\d+\b/gi, '')
@@ -1023,6 +1066,7 @@ app.get('/health', (req, res) => res.json({
   chunkCacheSize:   CHUNK_CACHE.size,
   promptCacheSize:  SYSTEM_PROMPT_CACHE.size,
   responseCacheSize: RESPONSE_CACHE.size,
+  rateLimitMapSize: RATE_LIMIT_MAP.size,
   phiCircuitOpen:   phiCircuitOpen(),
   phiFailures,
 }))
@@ -1140,6 +1184,19 @@ app.post('/admin/clients/:clientId/invalidate-cache', requireAdminKey, (req, res
   res.json({ ok: true, clientId: req.params.clientId, message: 'Chunk + prompt + response cache invalidated' })
 })
 
+// ─── Admin: reset rate limit for a specific client ────────────────────────────
+app.post('/admin/clients/:clientId/reset-rate-limit', requireAdminKey, (req, res) => {
+  const { clientId } = req.params
+  const had = RATE_LIMIT_MAP.has(clientId)
+  RATE_LIMIT_MAP.delete(clientId)
+  console.log(`[rateLimit] Admin reset for ${clientId}`)
+  res.json({
+    ok:      true,
+    clientId,
+    message: had ? 'Rate limit entry cleared' : 'No active rate limit entry found',
+  })
+})
+
 app.post('/client/login', async (req, res) => {
   try {
     const apiKey = extractApiKey(req) || req.body?.apiKey
@@ -1238,12 +1295,24 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
     if (!query?.trim()) return res.status(400).json({ error: 'query is required' })
     const { clientId, name } = req.client
 
+    // ── ① Per-client rate limit — checked BEFORE cache or any heavy work ──────
+    const rl = rateLimitCheck(clientId)
+    if (rl.blocked) {
+      res.set('Retry-After', String(rl.retryAfter))
+      return res.status(429).json({
+        error: `Rate limit exceeded. Try again in ${rl.retryAfter} seconds.`,
+      })
+    }
+
+    // ── ② Response cache — fast path for repeated identical queries ───────────
     const cacheKey = getCacheKey(clientId, query)
     const cached   = responseCacheGet(cacheKey)
     if (cached) {
       console.log(`[cache] HIT for "${query.slice(0, 50)}"`)
       return res.json({ ...cached, cached: true, conversationId: conversationId || cached.conversationId })
     }
+
+    // ── ③ In-flight dedup — coalesce concurrent identical queries ─────────────
     if (IN_FLIGHT.has(cacheKey)) {
       console.log(`[dedup] Waiting for in-flight request: "${query.slice(0, 50)}"`)
       try {
@@ -1276,7 +1345,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         }
       }
 
-      // ── Call model with 8s fast-fallback — no error note in fallback ────────
+      // ── Call model with 8s fast-fallback ────────────────────────────────────
       let rawAnswer
       try {
         rawAnswer = await Promise.race([
@@ -1290,7 +1359,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         rawAnswer = buildFallbackAnswer(query.trim(), hits)
       }
 
-      // ── FIX: Strip any residual field label patterns from model output ───────
+      // ── Strip residual field label patterns from model output ────────────────
       const cleanAnswer = fixBrokenUrls(rawAnswer)
         .replace(/\bField\d+\s*:\s*/gi, '')
         .replace(/\|\s*Field\d+\b/gi, '')
@@ -1349,10 +1418,14 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
     } finally {
       IN_FLIGHT.delete(cacheKey)
     }
-
-    // Only cache clean, complete answers
     if (result.answer && result.answer.length > 10) {
       responseCacheSet(cacheKey, result)
+    }
+    const rlState = RATE_LIMIT_MAP.get(clientId)
+    if (rlState) {
+      res.set('X-RateLimit-Limit',     String(RATE_LIMIT_MAX))
+      res.set('X-RateLimit-Remaining', String(Math.max(0, RATE_LIMIT_MAX - rlState.count)))
+      res.set('X-RateLimit-Reset',     String(Math.ceil((rlState.blockedUntil || Date.now() + RATE_LIMIT_WINDOW_MS) / 1000)))
     }
 
     res.json(result)
@@ -1362,12 +1435,10 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
     if (!res.headersSent) res.status(500).json({ error: err.message })
   }
 }))
-
 app.use((err, req, res, next) => {
   console.error('[global error handler]', err)
   if (!res.headersSent) res.status(500).json({ error: 'An unexpected error occurred. Please try again.' })
 })
-
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => {
   console.log(`rag-client-auth running on port ${PORT}`)
@@ -1376,9 +1447,9 @@ app.listen(PORT, () => {
   console.log(`Chunk cache TTL: ${CHUNK_CACHE_TTL}ms | Embed pool limit: ${EMBED_POOL_LIMIT}`)
   console.log(`Request timeout: ${REQUEST_TIMEOUT_MS}ms | Keyword short-circuit score: ${KEYWORD_SHORTCIRCUIT_SCORE}`)
   console.log(`Blob concurrency: ${BLOB_CONCURRENCY}`)
+  console.log(`Rate limit: ${RATE_LIMIT_MAX} req → ${RATE_LIMIT_WINDOW_MS / 1000}s block`)
   console.log(`Azure blob client: ${blobServiceClient ? 'singleton ready' : 'MISSING connection string'}`)
   startApiKeyHealthChecker()
   warmupChunkCaches()
 })
-
 module.exports = app
