@@ -138,13 +138,11 @@ function checkRateLimit(map, key, maxRequests) {
   const now   = Date.now()
   const entry = map.get(key) || { count: 0, blockedUntil: 0 }
 
-  // Currently blocked
   if (entry.blockedUntil > now) {
     const retryAfter = Math.ceil((entry.blockedUntil - now) / 1000)
     return { blocked: true, retryAfter, remaining: 0 }
   }
 
-  // Block period just elapsed — reset
   if (entry.blockedUntil > 0 && entry.blockedUntil <= now) {
     entry.count        = 0
     entry.blockedUntil = 0
@@ -153,7 +151,6 @@ function checkRateLimit(map, key, maxRequests) {
   entry.count    += 1
   entry.lastSeen  = now
 
-  // Limit exceeded — impose block
   if (entry.count > maxRequests) {
     entry.blockedUntil = now + RATE_LIMIT_WINDOW_MS
     map.set(key, entry)
@@ -171,7 +168,6 @@ function applyRateLimits(req, clientId) {
   const sessionKey = `rl:${clientId}:${sessionId}`
   const globalKey  = `rl:global:${clientId}`
 
-  // 1. Session-level check
   const sessionRl = checkRateLimit(SESSION_RL_MAP, sessionKey, SESSION_RATE_LIMIT_MAX)
   if (sessionRl.blocked) {
     console.warn(`[rateLimit] Session blocked: ${sessionKey}`)
@@ -598,45 +594,69 @@ async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
   return pool.slice(0, Math.min(topK, 12))
 }
 
-// ─── Context builder ──────────────────────────────────────────────────────────
 function buildContext(hits) {
-  // Limit context to prevent token overflow — take top 4 hits, max 300 chars each
-  return hits.slice(0, 4).map((h, i) => {
-    const text = (h.text || '').trim().slice(0, 300)
+  const seen = new Set()
+  const deduped = []
+  for (const h of hits) {
+    const fingerprint = (h.text || '').trim().slice(0, 80).toLowerCase()
+    if (!seen.has(fingerprint)) {
+      seen.add(fingerprint)
+      deduped.push(h)
+    }
+    if (deduped.length >= 6) break
+  }
+
+  return deduped.map((h, i) => {
+    // Give more characters to top-scoring hits
+    const charLimit = i === 0 ? 600 : i <= 2 ? 450 : 350
+    const text = (h.text || '').trim().slice(0, charLimit)
     return `[${i + 1}] ${text}`
   }).join('\n\n')
 }
-
-// ─── Optimized System Prompt Builder (<= ~600 tokens) ─────────────────────────
 const SYSTEM_PROMPT_CACHE     = new Map()
 const SYSTEM_PROMPT_CACHE_MAX = 100
 
 function buildDynamicSystemPrompt(hits, intent = 'general') {
-  // Don't cache by hits content — cache by intent + doc-type combo
   const hasSpreadsheet = hits.some(h => classifyExtension(h.source_file || '') === DOC_TYPE.SPREADSHEET)
-  const cacheKey = `${intent}::${hasSpreadsheet}`
-  const cached   = SYSTEM_PROMPT_CACHE.get(cacheKey)
+  const hasPdf         = hits.some(h => classifyExtension(h.source_file || '') === DOC_TYPE.PDF)
+  const cacheKey       = `${intent}::${hasSpreadsheet}::${hasPdf}`
+  const cached         = SYSTEM_PROMPT_CACHE.get(cacheKey)
   if (cached) return cached
+  const base = `You are a precise document assistant. Answer ONLY from the CONTEXT below.
 
-  // Intent-specific instruction (short)
-  const intentLine = {
-    definition: 'Find the exact term. State what it is, how it works, and any conditions.',
-    lookup:     'Return the exact value or count. No approximations.',
-    comparison: 'Compare each item briefly with clear similarities and differences.',
-    url_lookup: 'Return ONLY the matching URL(s), full and unbroken. Match the specific topic asked.',
-    general:    'Synthesize a clear, complete answer from the context.',
-    greeting:   'Respond as a friendly assistant.',
-  }[intent] || 'Synthesize a clear, complete answer from the context.'
+STRICT RULES:
+1. NEVER invent, assume, or add information not in CONTEXT.
+2. If the answer is absent, say: "I couldn't find that in your documents."
+3. Ignore lines that are purely copyright notices, legal boilerplate, or page headers — do not return them as answers.
+4. No citation markers ([1],[2]). No file names. No internal labels (Field1, Field2, etc).
+5. Be concise and direct. One short paragraph is ideal.`
 
-  const spreadsheetNote = hasSpreadsheet
-    ? ' For spreadsheet rows: pipe-separated key:value pairs. Lines with "is described as:" are definitions — prioritize them. Never expose Field1/Field2/etc labels.'
-    : ''
+  // ── Intent-specific instruction ─────────────────────────────────────────────
+  const intentGuide = {
+    definition: `
+DEFINITION TASK: Find lines containing "is described as", "is defined as", or a clear explanation of the exact term asked. Synthesise those lines into a clean 1-2 sentence definition. If no matching definition line exists, say "I couldn't find a definition for that term in your documents." Do NOT define a different term.`,
 
-  // Compact prompt — stays well under 600 tokens
-  const prompt =
-`You are a document assistant. Answer ONLY from the provided context.
-Rules: (1) Never invent info. (2) If absent, say "I couldn't find that in your documents." (3) No citation markers like [1][2]. (4) No file names. (5) No internal labels (Field1, Field2, etc). (6) Be concise. (7) URLs: one unbroken line, exact match only.${spreadsheetNote}
-Task: ${intentLine}`
+    lookup: `
+LOOKUP TASK: Return the exact value, count, or list from CONTEXT. Report precise numbers — no approximations. If not found, say so.`,
+
+    comparison: `
+COMPARISON TASK: Find information for EACH item and compare them clearly. Note any gaps if one side has less data.`,
+
+    url_lookup: `
+URL TASK: Find and return the full URL that matches the topic. Return the URL on its own line, unbroken, with no spaces. If multiple URLs match, list each on its own line. If none match, say not found.`,
+
+    general: `
+GENERAL TASK: Synthesise a clear, accurate answer from CONTEXT. Stay focused on what was asked.`,
+  }[intent] || `
+GENERAL TASK: Synthesise a clear, accurate answer from CONTEXT.`
+  const spreadsheetGuide = hasSpreadsheet ? `
+SPREADSHEET DATA: Rows appear as pipe-separated key:value pairs. Lines ending in "is described as: ..." are definition summaries — prioritise these for definition questions. When answering, write a natural sentence from this data — never output raw pipe-delimited rows verbatim.` : ''
+
+  // ── PDF boilerplate guard ───────────────────────────────────────────────────
+  const pdfGuide = hasPdf ? `
+PDF DATA: Ignore repeated headers, footers, copyright lines, and page numbers. Focus on substantive content.` : ''
+
+  const prompt = `${base}${intentGuide}${spreadsheetGuide}${pdfGuide}`
 
   if (SYSTEM_PROMPT_CACHE.size >= SYSTEM_PROMPT_CACHE_MAX) {
     SYSTEM_PROMPT_CACHE.delete(SYSTEM_PROMPT_CACHE.keys().next().value)
@@ -989,9 +1009,8 @@ async function answerWithPhi4(originalQuery, hits, intent = 'general') {
   const systemPrompt = buildDynamicSystemPrompt(hits, intent)
   const context      = buildContext(hits)
 
-  // Subject hint — very short, appended to user message
   const subjectHint  = intent === 'definition'
-    ? `\nDefine only: "${extractSubject(originalQuery)}".`
+    ? `\nDefine ONLY this exact term: "${extractSubject(originalQuery)}". Do not define any other term.`
     : intent === 'url_lookup'
     ? `\nReturn URL(s) for: "${extractUrlKeywords(originalQuery).join(' ')}".`
     : ''
@@ -1023,14 +1042,35 @@ function buildFallbackAnswer(query, hits) {
   }
 
   const subject = extractSubject(query).toLowerCase()
-  const best = hits.find(h => {
+
+  // For definitions: look for "is described as" lines first
+  const descLine = hits.find(h => {
     const t = (h.text || '').toLowerCase()
     return t.includes('is described as') && t.includes(subject)
-  }) || hits.find(h => (h.text || '').toLowerCase().includes(subject)) || hits[0]
+  })
+  if (descLine) {
+    const lines = (descLine.text || '').split('\n')
+    const relevantLine = lines.find(l =>
+      l.toLowerCase().includes(subject) && l.toLowerCase().includes('is described as')
+    )
+    if (relevantLine) {
+      // Extract just the description portion after "is described as:"
+      const parts = relevantLine.split(/is described as:/i)
+      if (parts[1]) {
+        return `${subject.charAt(0).toUpperCase() + subject.slice(1)} is ${parts[1].trim().slice(0, 300)}`
+      }
+    }
+  }
+
+  const best = hits.find(h => (h.text || '').toLowerCase().includes(subject)) || hits[0]
 
   const snippet = (best.text || '')
     .replace(/Field\d+:\s*/gi, '')
     .replace(/\|\s*Field\d+\b/gi, '')
+    // Strip copyright boilerplate lines
+    .split('\n')
+    .filter(l => !/(copyright|all rights reserved|proprietary|confidential|redistribution)/i.test(l))
+    .join('\n')
     .slice(0, 350)
     .trim()
 
@@ -1170,16 +1210,13 @@ app.post('/admin/clients/:clientId/invalidate-cache', requireAdminKey, (req, res
   res.json({ ok: true, clientId: req.params.clientId, message: 'Chunk + prompt + response cache invalidated' })
 })
 
-// ─── Admin: reset rate limit for a specific client ────────────────────────────
 app.post('/admin/clients/:clientId/reset-rate-limit', requireAdminKey, (req, res) => {
   const { clientId } = req.params
   let removed = 0
 
-  // Clear all session entries for this client
   for (const key of SESSION_RL_MAP.keys()) {
     if (key.startsWith(`rl:${clientId}:`)) { SESSION_RL_MAP.delete(key); removed++ }
   }
-  // Clear global entry
   const globalKey = `rl:global:${clientId}`
   if (GLOBAL_RL_MAP.has(globalKey)) { GLOBAL_RL_MAP.delete(globalKey); removed++ }
 
@@ -1285,14 +1322,12 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
     if (!query?.trim()) return res.status(400).json({ error: 'query is required' })
     const { clientId, name } = req.client
 
-    // ── ① Rate limiting — BEFORE everything else ──────────────────────────────
     const rlBlock = applyRateLimits(req, clientId)
     if (rlBlock) {
       if (rlBlock.headers) Object.entries(rlBlock.headers).forEach(([k, v]) => res.set(k, v))
       return res.status(rlBlock.status).json(rlBlock.body)
     }
 
-    // ── ② Greeting short-circuit — skip RAG entirely ─────────────────────────
     const intent = detectQueryIntent(query.trim())
     if (intent === 'greeting') {
       return res.json({
@@ -1303,7 +1338,6 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       })
     }
 
-    // ── ③ Response cache — fast path for repeated identical queries ───────────
     const cacheKey = getCacheKey(clientId, query)
     const cached   = responseCacheGet(cacheKey)
     if (cached) {
@@ -1311,7 +1345,6 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       return res.json({ ...cached, cached: true, conversationId: conversationId || cached.conversationId })
     }
 
-    // ── ④ In-flight dedup — coalesce concurrent identical queries ─────────────
     if (IN_FLIGHT.has(cacheKey)) {
       console.log(`[dedup] Waiting for in-flight request: "${query.slice(0, 50)}"`)
       try {
@@ -1343,7 +1376,6 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         }
       }
 
-      // ── Call model with 8s fast-fallback ────────────────────────────────────
       let rawAnswer
       try {
         rawAnswer = await Promise.race([
@@ -1357,7 +1389,6 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         rawAnswer = buildFallbackAnswer(query.trim(), hits)
       }
 
-      // ── Strip residual field label patterns from model output ────────────────
       const cleanAnswer = fixBrokenUrls(rawAnswer)
         .replace(/\bField\d+\s*:\s*/gi, '')
         .replace(/\|\s*Field\d+\b/gi, '')
@@ -1420,7 +1451,6 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       responseCacheSet(cacheKey, result)
     }
 
-    // Attach rate limit headers for transparency
     if (req._rlSession) {
       res.set('X-RateLimit-Limit',           String(SESSION_RATE_LIMIT_MAX))
       res.set('X-RateLimit-Remaining',       String(req._rlSession.remaining))
