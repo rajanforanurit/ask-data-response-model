@@ -122,93 +122,6 @@ function getCacheKey(clientId, query) {
   return `${clientId}:${query.toLowerCase().trim()}`
 }
 
-const SESSION_RATE_LIMIT_MAX = parseInt(process.env.SESSION_RATE_LIMIT_MAX || '15', 10)
-const GLOBAL_RATE_LIMIT_MAX = parseInt(process.env.GLOBAL_RATE_LIMIT_MAX || '120', 10)
-const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '120000', 10) 
-
-const SESSION_RL_MAP = new Map() 
-const GLOBAL_RL_MAP  = new Map() 
-function extractSessionId(req) {
-  return (req.headers['x-session-id'] || '').trim()
-    || (req.body?.sessionId || '').trim()
-    || req.ip
-    || 'unknown'
-}
-function checkRateLimit(map, key, maxRequests) {
-  const now   = Date.now()
-  const entry = map.get(key) || { count: 0, blockedUntil: 0 }
-
-  if (entry.blockedUntil > now) {
-    const retryAfter = Math.ceil((entry.blockedUntil - now) / 1000)
-    return { blocked: true, retryAfter, remaining: 0 }
-  }
-
-  if (entry.blockedUntil > 0 && entry.blockedUntil <= now) {
-    entry.count        = 0
-    entry.blockedUntil = 0
-  }
-
-  entry.count    += 1
-  entry.lastSeen  = now
-
-  if (entry.count > maxRequests) {
-    entry.blockedUntil = now + RATE_LIMIT_WINDOW_MS
-    map.set(key, entry)
-    const retryAfter = Math.ceil(RATE_LIMIT_WINDOW_MS / 1000)
-    console.warn(`[rateLimit] 🚫 BLOCKED key=${key} for ${retryAfter}s (hit ${entry.count}/${maxRequests})`)
-    return { blocked: true, retryAfter, remaining: 0 }
-  }
-
-  map.set(key, entry)
-  const remaining = maxRequests - entry.count
-  return { blocked: false, retryAfter: 0, remaining }
-}
-function applyRateLimits(req, clientId) {
-  const sessionId  = extractSessionId(req)
-  const sessionKey = `rl:${clientId}:${sessionId}`
-  const globalKey  = `rl:global:${clientId}`
-
-  const sessionRl = checkRateLimit(SESSION_RL_MAP, sessionKey, SESSION_RATE_LIMIT_MAX)
-  if (sessionRl.blocked) {
-    console.warn(`[rateLimit] Session blocked: ${sessionKey}`)
-    return {
-      status: 429,
-      headers: { 'Retry-After': String(sessionRl.retryAfter) },
-      body: { error: `User rate limit exceeded. Try again in ${sessionRl.retryAfter} seconds.` },
-    }
-  }
-  const globalRl = checkRateLimit(GLOBAL_RL_MAP, globalKey, GLOBAL_RATE_LIMIT_MAX)
-  if (globalRl.blocked) {
-    console.warn(`[rateLimit] Global client blocked: ${globalKey}`)
-    return {
-      status: 429,
-      headers: { 'Retry-After': String(globalRl.retryAfter) },
-      body: { error: `System busy. Please try again in ${globalRl.retryAfter} seconds.` },
-    }
-  }
-  req._rlSession = { key: sessionKey, remaining: sessionRl.remaining }
-  req._rlGlobal  = { key: globalKey,  remaining: globalRl.remaining }
-  return null 
-}
-setInterval(() => {
-  const now     = Date.now()
-  const IDLE_MS = RATE_LIMIT_WINDOW_MS * 2
-  let removed   = 0
-
-  for (const [key, entry] of SESSION_RL_MAP.entries()) {
-    const isExpiredBlock  = entry.blockedUntil > 0 && entry.blockedUntil <= now
-    const isIdleSession   = !entry.blockedUntil && entry.lastSeen && (now - entry.lastSeen > IDLE_MS)
-    if (isExpiredBlock || isIdleSession) { SESSION_RL_MAP.delete(key); removed++ }
-  }
-
-  for (const [key, entry] of GLOBAL_RL_MAP.entries()) {
-    if (entry.blockedUntil > 0 && entry.blockedUntil <= now) { GLOBAL_RL_MAP.delete(key); removed++ }
-  }
-
-  if (removed > 0) {
-    console.log(`[rateLimit] Cleanup: removed ${removed} stale entries (session=${SESSION_RL_MAP.size}, global=${GLOBAL_RL_MAP.size})`)
-  }
-}, 60 * 1000)
 const IN_FLIGHT = new Map()
 let phiActiveCount = 0
 const PHI_MAX_CONCURRENT = 3
@@ -607,7 +520,6 @@ function buildContext(hits) {
   }
 
   return deduped.map((h, i) => {
-    // Give more characters to top-scoring hits
     const charLimit = i === 0 ? 600 : i <= 2 ? 450 : 350
     const text = (h.text || '').trim().slice(0, charLimit)
     return `[${i + 1}] ${text}`
@@ -631,7 +543,6 @@ STRICT RULES:
 4. No citation markers ([1],[2]). No file names. No internal labels (Field1, Field2, etc).
 5. Be concise and direct. One short paragraph is ideal.`
 
-  // ── Intent-specific instruction ─────────────────────────────────────────────
   const intentGuide = {
     definition: `
 DEFINITION TASK: Find lines containing "is described as", "is defined as", or a clear explanation of the exact term asked. Synthesise those lines into a clean 1-2 sentence definition. If no matching definition line exists, say "I couldn't find a definition for that term in your documents." Do NOT define a different term.`,
@@ -652,7 +563,6 @@ GENERAL TASK: Synthesise a clear, accurate answer from CONTEXT.`
   const spreadsheetGuide = hasSpreadsheet ? `
 SPREADSHEET DATA: Rows appear as pipe-separated key:value pairs. Lines ending in "is described as: ..." are definition summaries — prioritise these for definition questions. When answering, write a natural sentence from this data — never output raw pipe-delimited rows verbatim.` : ''
 
-  // ── PDF boilerplate guard ───────────────────────────────────────────────────
   const pdfGuide = hasPdf ? `
 PDF DATA: Ignore repeated headers, footers, copyright lines, and page numbers. Focus on substantive content.` : ''
 
@@ -1043,7 +953,6 @@ function buildFallbackAnswer(query, hits) {
 
   const subject = extractSubject(query).toLowerCase()
 
-  // For definitions: look for "is described as" lines first
   const descLine = hits.find(h => {
     const t = (h.text || '').toLowerCase()
     return t.includes('is described as') && t.includes(subject)
@@ -1054,7 +963,6 @@ function buildFallbackAnswer(query, hits) {
       l.toLowerCase().includes(subject) && l.toLowerCase().includes('is described as')
     )
     if (relevantLine) {
-      // Extract just the description portion after "is described as:"
       const parts = relevantLine.split(/is described as:/i)
       if (parts[1]) {
         return `${subject.charAt(0).toUpperCase() + subject.slice(1)} is ${parts[1].trim().slice(0, 300)}`
@@ -1067,7 +975,6 @@ function buildFallbackAnswer(query, hits) {
   const snippet = (best.text || '')
     .replace(/Field\d+:\s*/gi, '')
     .replace(/\|\s*Field\d+\b/gi, '')
-    // Strip copyright boilerplate lines
     .split('\n')
     .filter(l => !/(copyright|all rights reserved|proprietary|confidential|redistribution)/i.test(l))
     .join('\n')
@@ -1091,8 +998,6 @@ app.get('/health', (req, res) => res.json({
   chunkCacheSize:   CHUNK_CACHE.size,
   promptCacheSize:  SYSTEM_PROMPT_CACHE.size,
   responseCacheSize: RESPONSE_CACHE.size,
-  sessionRlMapSize: SESSION_RL_MAP.size,
-  globalRlMapSize:  GLOBAL_RL_MAP.size,
   phiCircuitOpen:   phiCircuitOpen(),
   phiFailures,
 }))
@@ -1210,20 +1115,6 @@ app.post('/admin/clients/:clientId/invalidate-cache', requireAdminKey, (req, res
   res.json({ ok: true, clientId: req.params.clientId, message: 'Chunk + prompt + response cache invalidated' })
 })
 
-app.post('/admin/clients/:clientId/reset-rate-limit', requireAdminKey, (req, res) => {
-  const { clientId } = req.params
-  let removed = 0
-
-  for (const key of SESSION_RL_MAP.keys()) {
-    if (key.startsWith(`rl:${clientId}:`)) { SESSION_RL_MAP.delete(key); removed++ }
-  }
-  const globalKey = `rl:global:${clientId}`
-  if (GLOBAL_RL_MAP.has(globalKey)) { GLOBAL_RL_MAP.delete(globalKey); removed++ }
-
-  console.log(`[rateLimit] Admin reset for ${clientId}: removed ${removed} entries`)
-  res.json({ ok: true, clientId, message: `Rate limit cleared (${removed} entries removed)` })
-})
-
 app.post('/client/login', async (req, res) => {
   try {
     const apiKey = extractApiKey(req) || req.body?.apiKey
@@ -1321,12 +1212,6 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
     const { query, topK = 6, conversationId } = req.body
     if (!query?.trim()) return res.status(400).json({ error: 'query is required' })
     const { clientId, name } = req.client
-
-    const rlBlock = applyRateLimits(req, clientId)
-    if (rlBlock) {
-      if (rlBlock.headers) Object.entries(rlBlock.headers).forEach(([k, v]) => res.set(k, v))
-      return res.status(rlBlock.status).json(rlBlock.body)
-    }
 
     const intent = detectQueryIntent(query.trim())
     if (intent === 'greeting') {
@@ -1451,12 +1336,6 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       responseCacheSet(cacheKey, result)
     }
 
-    if (req._rlSession) {
-      res.set('X-RateLimit-Limit',           String(SESSION_RATE_LIMIT_MAX))
-      res.set('X-RateLimit-Remaining',       String(req._rlSession.remaining))
-      res.set('X-RateLimit-Global-Remaining', String(req._rlGlobal?.remaining ?? GLOBAL_RATE_LIMIT_MAX))
-    }
-
     res.json(result)
 
   } catch (err) {
@@ -1478,8 +1357,6 @@ app.listen(PORT, () => {
   console.log(`Chunk cache TTL: ${CHUNK_CACHE_TTL}ms | Embed pool limit: ${EMBED_POOL_LIMIT}`)
   console.log(`Request timeout: ${REQUEST_TIMEOUT_MS}ms | Keyword short-circuit score: ${KEYWORD_SHORTCIRCUIT_SCORE}`)
   console.log(`Blob concurrency: ${BLOB_CONCURRENCY}`)
-  console.log(`Session rate limit: ${SESSION_RATE_LIMIT_MAX} req → ${RATE_LIMIT_WINDOW_MS / 1000}s block`)
-  console.log(`Global rate limit:  ${GLOBAL_RATE_LIMIT_MAX} req → ${RATE_LIMIT_WINDOW_MS / 1000}s block`)
   console.log(`Azure blob client: ${blobServiceClient ? 'singleton ready' : 'MISSING connection string'}`)
   startApiKeyHealthChecker()
   warmupChunkCaches()
