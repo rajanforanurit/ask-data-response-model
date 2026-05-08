@@ -23,6 +23,7 @@ const allowedOrigins = [
   'https://df.powerbi.com',
   'https://api.powerbi.com',
 ]
+
 function originAllowed(origin) {
   if (!origin) return true
   if (origin === 'null') return true
@@ -30,44 +31,48 @@ function originAllowed(origin) {
   if (/\.(powerbi|microsoft|office)\.com$/.test(origin)) return true
   return false
 }
+
 app.use(cors({
   origin: (origin, callback) => callback(null, originAllowed(origin)),
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-session-id'],
   credentials: true,
 }))
+
 app.options('*', cors({
   origin: (origin, callback) => callback(null, true),
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-session-id'],
   credentials: true,
 }))
+
 app.use(express.json())
+
 const MONGODB_URI = process.env.MONGODB_URI
-const MONGODB_DB  = process.env.MONGODB_DB || 'clientcreds'
+const MONGODB_DB = process.env.MONGODB_DB || 'clientcreds'
 const CHAT_HISTORY_URI = process.env.CHAT_HISTORY_URI
 const CHAT_HISTORY_DB = process.env.CHAT_HISTORY_DB || 'chathistory'
 const AZURE_CONNECTION_STRING = process.env.AZURE_CONNECTION_STRING || ''
 const AZURE_CONTAINER_NAME = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
-const ADMIN_API_KEY  = process.env.ADMIN_API_KEY
-const KEY_CHECK_INTERVAL_MS   = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10)
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY
+const KEY_CHECK_INTERVAL_MS  = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10)
 const PHI4_ENDPOINT = process.env.PHI4_ENDPOINT
 const PHI4_API_KEY = process.env.PHI4_API_KEY
-const PHI4_MODEL  = process.env.PHI4_MODEL || 'Phi-4-mini-instruct'
-const PHI4_TIMEOUT_MS  = parseInt(process.env.PHI4_TIMEOUT_MS || '30000', 10)
-const AZURE_EMBED_ENDPOINT = process.env.AZURE_EMBED_ENDPOINT || ''
+const PHI4_MODEL = process.env.PHI4_MODEL || 'Phi-4-mini-instruct'
+const PHI4_TIMEOUT_MS = parseInt(process.env.PHI4_TIMEOUT_MS || '30000', 10)
+const AZURE_EMBED_ENDPOINT   = process.env.AZURE_EMBED_ENDPOINT || ''
 const AZURE_EMBED_KEY = process.env.AZURE_EMBED_KEY || ''
-const AZURE_EMBED_MODEL = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
+const AZURE_EMBED_MODEL  = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
 const EMBED_TIMEOUT_MS = parseInt(process.env.EMBED_TIMEOUT_MS || '10000', 10)
 const EMBED_POOL_LIMIT = parseInt(process.env.EMBED_POOL_LIMIT || '20', 10)
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10)
 const KEYWORD_SHORTCIRCUIT_SCORE = parseInt(process.env.KEYWORD_SHORTCIRCUIT_SCORE || '6', 10)
-
-const WARMUP_CLIENT_IDS = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
+const WARMUP_CLIENT_IDS  = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
 
 const RAW_PREFIX    = 'raw'
 const CHUNK_SIZE    = 500
 const CHUNK_OVERLAP = 2
+
 const blobServiceClient = AZURE_CONNECTION_STRING
   ? BlobServiceClient.fromConnectionString(AZURE_CONNECTION_STRING)
   : null
@@ -98,6 +103,8 @@ const DOC_TYPE = {
   UNKNOWN:      'unknown',
 }
 
+// ─── Response cache ───────────────────────────────────────────────────────────
+
 const RESPONSE_CACHE     = new Map()
 const RESPONSE_CACHE_TTL = 10 * 60 * 1000
 const RESPONSE_CACHE_MAX = 1000
@@ -120,6 +127,8 @@ function responseCacheSet(key, value) {
 function getCacheKey(clientId, query) {
   return `${clientId}:${query.toLowerCase().trim()}`
 }
+
+// ─── Phi-4 concurrency / circuit breaker ─────────────────────────────────────
 
 const IN_FLIGHT = new Map()
 let phiActiveCount = 0
@@ -149,8 +158,10 @@ function drainPhiQueue() {
     next()
   }
 }
-let phiFailures  = 0
-let phiBlockedUntil  = 0
+
+let phiFailures    = 0
+let phiBlockedUntil = 0
+
 function phiCircuitOpen() {
   if (Date.now() < phiBlockedUntil) return true
   if (phiBlockedUntil > 0) {
@@ -170,6 +181,9 @@ function phiRecordFailure() {
     console.error(`[phi4] Circuit breaker OPEN for 30s after ${phiFailures} failures`)
   }
 }
+
+// ─── Utilities ────────────────────────────────────────────────────────────────
+
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
@@ -229,7 +243,7 @@ function detectQueryIntent(query) {
   const URL_PATTERNS        = [/\burl\b/,/\blink\b/,/\breport\b.*\burl\b/,/\burl\b.*\breport\b/,/\bpower\s*bi\b/,/\bdashboard\b/]
   const GREETING_PATTERNS   = [/^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening)|how\s+are\s+you|what's\s+up|sup)\b/]
   if (GREETING_PATTERNS.some(p => p.test(q))) return 'greeting'
-  if (URL_PATTERNS.some(p => p.test(q)))        return 'url_lookup'
+  if (URL_PATTERNS.some(p => p.test(q)))      return 'url_lookup'
   if (DEFINITION_PATTERNS.some(p => p.test(q))) return 'definition'
   if (COMPARISON_PATTERNS.some(p => p.test(q))) return 'comparison'
   if (LOOKUP_PATTERNS.some(p => p.test(q)))     return 'lookup'
@@ -297,6 +311,8 @@ function buildInvertedIndex(chunks) {
   return index
 }
 
+// ─── Phi-4 call ───────────────────────────────────────────────────────────────
+
 async function callPhi4(systemPrompt, userMessage) {
   if (!PHI4_ENDPOINT || !PHI4_API_KEY) throw new Error('PHI4_ENDPOINT and PHI4_API_KEY environment variables are required')
   if (phiCircuitOpen()) throw new Error('Model temporarily unavailable (circuit breaker open)')
@@ -333,6 +349,8 @@ async function callPhi4(systemPrompt, userMessage) {
   })
 }
 
+// ─── Embeddings ───────────────────────────────────────────────────────────────
+
 async function embedQueryAzure(query) {
   if (!AZURE_EMBED_ENDPOINT || !AZURE_EMBED_KEY) return null
   try {
@@ -353,7 +371,6 @@ async function embedQueryAzure(query) {
     return null
   }
 }
-
 async function embedBatch(texts) {
   if (!AZURE_EMBED_ENDPOINT || !AZURE_EMBED_KEY || !texts.length) return []
   try {
@@ -374,6 +391,8 @@ async function embedBatch(texts) {
     return []
   }
 }
+
+// ─── Retrieval ────────────────────────────────────────────────────────────────
 
 function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = null) {
   const subject      = intent === 'definition' ? extractSubject(query) : query.toLowerCase()
@@ -448,7 +467,6 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
 
         if (docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) {
           if (text.includes(subjectLower)) score += subjectWords.length * 5
-
           for (const w of subjectWords) {
             const kvPattern = new RegExp(`:\\s*${escapeRegex(w)}\\b|\\|\\s*${escapeRegex(w)}\\b`, 'i')
             if (kvPattern.test(c.text || '')) score += 2
@@ -521,7 +539,6 @@ async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
 
   return pool.slice(0, Math.min(topK, 12))
 }
-
 function buildContext(hits) {
   const seen = new Set()
   const deduped = []
@@ -540,41 +557,9 @@ function buildContext(hits) {
     return `[${i + 1}] ${text}`
   }).join('\n\n')
 }
-
 const SYSTEM_PROMPT_CACHE     = new Map()
 const SYSTEM_PROMPT_CACHE_MAX = 100
-
-function buildDynamicSystemPrompt(hits, intent = 'general') {
-  const schemas = hits.map(h => ({ type: classifyExtension(h.source_file || '') }))
-  const uniqueTypes = [...new Set(schemas.map(s => s.type))]
-
-  const spreadsheets  = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.SPREADSHEET)
-  const pdfDocs       = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.PDF)
-  const wordDocs      = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.WORD)
-  const presentations = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.PRESENTATION)
-  const codeFiles     = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.CODE)
-  const dataFiles     = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.DATA)
-  const textFiles     = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.TEXT)
-  const emailFiles    = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.EMAIL)
-  const webFiles      = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.WEB)
-
-  const cacheKey = [
-    intent,
-    spreadsheets.length > 0 ? 'ss' : '',
-    pdfDocs.length > 0 ? 'pdf' : '',
-    wordDocs.length > 0 ? 'word' : '',
-    presentations.length > 0 ? 'ppt' : '',
-    codeFiles.length > 0 ? 'code' : '',
-    dataFiles.length > 0 ? 'data' : '',
-    textFiles.length > 0 ? 'txt' : '',
-    emailFiles.length > 0 ? 'eml' : '',
-    webFiles.length > 0 ? 'web' : '',
-  ].filter(Boolean).join('::')
-
-  const cached = SYSTEM_PROMPT_CACHE.get(cacheKey)
-  if (cached) return cached
-
-  const INTENT_STRATEGY = {
+const INTENT_STRATEGY = {
   definition: `TASK: Define the exact term asked. Write 1–3 natural English sentences. If there's a formula, state it plainly (e.g. "calculated by dividing X by Y"). Combine multiple excerpts if needed.`,
   lookup:     `TASK: Find and report the exact value or list asked for. State clearly what it represents.`,
   comparison: `TASK: Compare the items asked. Write a structured but natural summary — similarities and differences.`,
@@ -594,7 +579,7 @@ const TYPE_NOTES = {
   [DOC_TYPE.WEB]:          `Focus on main body content; ignore repetitive navigation text. Include URLs exactly as written.`,
 }
 
-const BASE = `You are a document assistant. Answer ONLY from the provided context.
+const BASE_SYSTEM_PROMPT = `You are a document assistant. Answer ONLY from the provided context.
 
 RULES (apply once, always):
 - Write in natural English sentences. Never output raw pipe-delimited rows, "is described as:" lines, or dumps of key:value pairs.
@@ -606,15 +591,15 @@ RULES (apply once, always):
 - Keep answers concise — 1–4 sentences unless a list or formula is needed.`
 
 function buildDynamicSystemPrompt(hits, intent = 'general') {
-  const types = [...new Set(hits.map(h => classifyExtension(h.source_file || '')))]
+  const types     = [...new Set(hits.map(h => classifyExtension(h.source_file || '')))]
   const typeNotes = types.map(t => TYPE_NOTES[t]).filter(Boolean)
 
   const cacheKey = `${intent}::${types.sort().join(',')}`
-  const cached = SYSTEM_PROMPT_CACHE.get(cacheKey)
+  const cached   = SYSTEM_PROMPT_CACHE.get(cacheKey)
   if (cached) return cached
 
   const parts = [
-    BASE,
+    BASE_SYSTEM_PROMPT,
     INTENT_STRATEGY[intent] || INTENT_STRATEGY.general,
   ]
   if (typeNotes.length) parts.push('SOURCE NOTES:\n' + typeNotes.map((n, i) => `${i + 1}. ${n}`).join('\n'))
@@ -627,6 +612,8 @@ function buildDynamicSystemPrompt(hits, intent = 'general') {
   SYSTEM_PROMPT_CACHE.set(cacheKey, prompt)
   return prompt
 }
+
+// ─── MongoDB helpers ──────────────────────────────────────────────────────────
 
 let db = null
 async function getDb() {
@@ -647,6 +634,8 @@ async function getChatDb() {
   chatDb = client.db(CHAT_HISTORY_DB)
   return chatDb
 }
+
+// ─── Client cache / auth ──────────────────────────────────────────────────────
 
 const CLIENT_CACHE = new Map()
 const CACHE_TTL_MS = 5 * 60 * 1000
@@ -708,7 +697,6 @@ function requireAdminKey(req, res, next) {
 function generateApiKey() {
   return `rak_${crypto.randomBytes(32).toString('hex')}`
 }
-
 async function extractPdf(buffer)  { const r = await pdfParse(buffer); return r.text || '' }
 async function extractWord(buffer) { const r = await mammoth.extractRawText({ buffer }); return r.value || '' }
 
@@ -831,6 +819,8 @@ async function extractTextFromBuffer(buffer, fileName) {
   return ''
 }
 
+// ─── Chunking ─────────────────────────────────────────────────────────────────
+
 function chunkText(text, sourceFile) {
   const chunks = []
   let index    = 0
@@ -851,6 +841,8 @@ function chunkText(text, sourceFile) {
   }
   return chunks
 }
+
+// ─── Blob / chunk loading ─────────────────────────────────────────────────────
 
 async function downloadBlobAsBuffer(containerClient, blobName) {
   const download = await containerClient.getBlobClient(blobName).download()
@@ -964,7 +956,6 @@ function warmupChunkCaches() {
       .catch(err => console.warn(`[warmup] ${clientId} — ${err.message}`))
   }
 }
-
 async function answerWithPhi4(originalQuery, hits, intent = 'general') {
   const systemPrompt = buildDynamicSystemPrompt(hits, intent)
   const context      = buildContext(hits)
@@ -1015,13 +1006,11 @@ function buildFallbackAnswer(query, hits) {
     if (relevantLine) {
       const parts = relevantLine.split(/is described as:/i)
       if (parts[1]) {
-        // Parse the pipe-delimited description into a natural sentence
         const rawDesc = parts[1].trim().slice(0, 300)
         const descParts = rawDesc.split('|').map(p => p.trim()).filter(Boolean)
         if (descParts.length === 1) {
           return `${subject.charAt(0).toUpperCase() + subject.slice(1)} is ${descParts[0]}.`
         }
-        // Check if any part looks like a formula (contains "divided by", "/", etc.)
         const formulaPart = descParts.find(p => /divided by|\/|\bper\b/i.test(p))
         if (formulaPart) {
           const desc = descParts.filter(p => p !== formulaPart).join('. ')
@@ -1037,7 +1026,6 @@ function buildFallbackAnswer(query, hits) {
     const lines = (h.text || '').split('\n')
     for (const line of lines) {
       if (line.toLowerCase().includes(subject) && line.trim().length > 20) {
-        // Skip raw pipe-delimited data lines
         if ((line.match(/\|/g) || []).length > 3) continue
         if (/is described as:/i.test(line)) continue
         allMatchingLines.push(line.trim())
@@ -1058,15 +1046,17 @@ function generateTitle(query) {
   return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned
 }
 
+// ─── Routes ───────────────────────────────────────────────────────────────────
+
 app.get('/health', (req, res) => res.json({
-  ok:               true,
-  service:          'ask-data',
-  model:            'ask-data-response-model',
-  embeddings:       AZURE_EMBED_ENDPOINT ? 'azure-anurit' : 'keyword-only',
-  chunkCacheSize:   CHUNK_CACHE.size,
-  promptCacheSize:  SYSTEM_PROMPT_CACHE.size,
+  ok:                true,
+  service:           'ask-data',
+  model:             'ask-data-response-model',
+  embeddings:        AZURE_EMBED_ENDPOINT ? 'azure-anurit' : 'keyword-only',
+  chunkCacheSize:    CHUNK_CACHE.size,
+  promptCacheSize:   SYSTEM_PROMPT_CACHE.size,
   responseCacheSize: RESPONSE_CACHE.size,
-  phiCircuitOpen:   phiCircuitOpen(),
+  phiCircuitOpen:    phiCircuitOpen(),
   phiFailures,
 }))
 
@@ -1344,9 +1334,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       const cleanAnswer = fixBrokenUrls(rawAnswer)
         .replace(/\bField\d+\s*:\s*/gi, '')
         .replace(/\|\s*Field\d+\b/gi, '')
-        // Remove any leaked "is described as:" lines that may have slipped through
         .replace(/^.+\s+is described as:\s*.+$/gmi, '')
-        // Remove lines that are clearly raw pipe-delimited data (4+ pipes)
         .replace(/^[^\n]*\|[^\n]*\|[^\n]*\|[^\n]*\|[^\n]*$/gm, '')
         .replace(/\n{3,}/g, '\n\n')
         .trim()
@@ -1429,4 +1417,5 @@ app.listen(PORT, () => {
   startApiKeyHealthChecker()
   warmupChunkCaches()
 })
+
 module.exports = app
