@@ -62,10 +62,12 @@ const EMBED_TIMEOUT_MS = parseInt(process.env.EMBED_TIMEOUT_MS || '10000', 10)
 const EMBED_POOL_LIMIT = parseInt(process.env.EMBED_POOL_LIMIT || '20', 10)
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10)
 const KEYWORD_SHORTCIRCUIT_SCORE = parseInt(process.env.KEYWORD_SHORTCIRCUIT_SCORE || '6', 10)
+
 const WARMUP_CLIENT_IDS = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
-const RAW_PREFIX = 'raw'
-const CHUNK_SIZE    = 220  
-const CHUNK_OVERLAP = 1     
+
+const RAW_PREFIX    = 'raw'
+const CHUNK_SIZE    = 500
+const CHUNK_OVERLAP = 2
 const blobServiceClient = AZURE_CONNECTION_STRING
   ? BlobServiceClient.fromConnectionString(AZURE_CONNECTION_STRING)
   : null
@@ -248,7 +250,6 @@ function extractSubject(query) {
     /^meaning\s+of\s+(?:an?\s+|the\s+)?(.+)$/,
     /^describe\s+(?:an?\s+|the\s+)?(.+)$/,
     /^how\s+is\s+(.+?)\s+(calculated|defined|measured|computed)$/,
-    /^definition\s+of\s+(?:an?\s+|the\s+)?(.+)$/,
   ]
   for (const p of patterns) {
     const m = q.match(p)
@@ -297,30 +298,6 @@ function buildInvertedIndex(chunks) {
   return index
 }
 
-// ─── FIX 1: Exact term validation ────────────────────────────────────────────
-// Checks that the exact subject term (not just partial words) exists in hits.
-// Prevents "region" from matching "resolution", "occupancy" from matching "occupied", etc.
-function containsExactTerm(query, hits) {
-  const subject = extractSubject(query).toLowerCase().trim()
-  const normalizedSubject = subject.replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim()
-
-  return hits.some(h => {
-    const text = (h.text || '')
-      .toLowerCase()
-      .replace(/[^\w\s]/g, ' ')
-      .replace(/\s+/g, ' ')
-
-    // Full phrase exact match
-    if (text.includes(normalizedSubject)) return true
-
-    // All words must appear as whole words (word boundary check)
-    const words = normalizedSubject.split(' ').filter(w => w.length > 1)
-    return words.length > 0 && words.every(w =>
-      new RegExp(`\\b${escapeRegex(w)}\\b`).test(text)
-    )
-  })
-}
-
 // ─── Phi-4 call ───────────────────────────────────────────────────────────────
 async function callPhi4(systemPrompt, userMessage) {
   if (!PHI4_ENDPOINT || !PHI4_API_KEY) throw new Error('PHI4_ENDPOINT and PHI4_API_KEY environment variables are required')
@@ -336,8 +313,8 @@ async function callPhi4(systemPrompt, userMessage) {
           body: JSON.stringify({
             model:       PHI4_MODEL,
             messages:    [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
-            temperature: 0.0,   // zero temperature — deterministic, no creative drift
-            max_tokens:  400,   // reduced from 512 — keep answers tight
+            temperature: 0.1,
+            max_tokens:  512,
           }),
         },
         PHI4_TIMEOUT_MS
@@ -400,25 +377,16 @@ async function embedBatch(texts) {
   }
 }
 
-// ─── FIX 4+5: Keyword search — exact word boundaries, no partial matching ────
-// REMOVED: partial word scoring (`subjectWords.filter(w => text.includes(w)).length * 2`)
-// REPLACED: text.includes(subjectLower) → word-boundary regex (\\bterm\\b)
-// This stops "region" hitting "resolution", "occupancy" hitting "occupied", etc.
+// ─── Keyword search ───────────────────────────────────────────────────────────
 function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = null) {
   const subject      = intent === 'definition' ? extractSubject(query) : query.toLowerCase()
   const queryLower   = query.toLowerCase()
-  const subjectLower = subject.toLowerCase().trim()
+  const subjectLower = subject.toLowerCase()
   const subjectWords = subjectLower.split(/\s+/).filter(w => w.length > 1)
   const queryWords   = queryLower.replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1)
 
   const urlKeywords = intent === 'url_lookup' ? extractUrlKeywords(query) : []
 
-  // Build exact-match pattern (full phrase with word boundaries)
-  const exactPattern = new RegExp(`\\b${escapeRegex(subjectLower)}\\b`, 'i')
-
-  // ── FIX 6: No random fallback candidates ────────────────────────────────────
-  // Old code: `chunks.slice(0, 100)` as fallback — this injected random chunks.
-  // New code: if no index candidates, return empty — refuse to guess.
   let candidateIndices
   if (invertedIndex && subjectWords.length > 0) {
     const wordsToIndex = intent === 'url_lookup' ? urlKeywords : subjectWords
@@ -434,12 +402,9 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
     candidateIndices = union
   }
 
-  // CRITICAL FIX: No candidates → return empty, not random chunks
-  if (!candidateIndices || candidateIndices.size === 0) {
-    return []
-  }
-
-  const source = [...candidateIndices].map(i => chunks[i]).filter(Boolean)
+  const source = candidateIndices
+    ? [...candidateIndices].map(i => chunks[i]).filter(Boolean)
+    : chunks.slice(0, 100)
 
   return source
     .map(c => {
@@ -455,16 +420,13 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
         const topicPhrase = urlKeywords.join(' ')
         if (text.includes(topicPhrase)) score += 15
       } else {
-        // FIX 5: Exact word-boundary match (replaces text.includes which caused partial hits)
-        if (exactPattern.test(text)) {
-          score += 15  // strong signal: exact term present
-
+        if (text.includes(subjectLower)) {
+          score += subjectWords.length * 4
           const defPattern = new RegExp(`${escapeRegex(subjectLower)}\\s*(is|are)\\s*(defined|described|calculated|measured|computed)`, 'i')
           if (defPattern.test(c.text || '')) score += subjectWords.length * 6
         }
 
-        // NOTE: Removed `subjectWords.filter(w => text.includes(w)).length * 2`
-        // That partial-word scoring caused region→resolution, occupancy→occupied contamination.
+        score += subjectWords.filter(w => text.includes(w)).length * 2
 
         if ((docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) && intent === 'definition') {
           const descPattern = new RegExp(`${escapeRegex(subjectLower)}\\s*(is described as|is defined as):`, 'i')
@@ -473,14 +435,12 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
 
         if (docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) {
           for (const w of subjectWords) {
-            // Use word boundary here too, not loose includes
-            const kvPattern = new RegExp(`:\\s*\\b${escapeRegex(w)}\\b|\\|\\s*\\b${escapeRegex(w)}\\b`, 'i')
+            const kvPattern = new RegExp(`:\\s*${escapeRegex(w)}\\b|\\|\\s*${escapeRegex(w)}\\b`, 'i')
             if (kvPattern.test(c.text || '')) score += 2
           }
         }
 
-        // Full query match (secondary signal)
-        if (exactPattern.test(queryLower) && text.includes(queryLower)) score += queryWords.length * 2
+        if (text.includes(queryLower)) score += queryWords.length * 2
       }
 
       return { ...c, _score: score }
@@ -490,43 +450,20 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
     .slice(0, topK)
 }
 
-async function retrieveChunks(query, chunks, topK = 3, invertedIndex = null) {
+async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
   const intent          = detectQueryIntent(query)
   const normalizedQuery = query.toLowerCase().trim().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
-  const subjectLower    = extractSubject(query).toLowerCase().trim()
+  const keywordTopK     = intent === 'definition' ? Math.min(150, chunks.length) : Math.min(100, chunks.length)
+  const candidates      = keywordSearch(normalizedQuery, chunks, keywordTopK, intent, invertedIndex)
+  const pool            = candidates.length > 0 ? candidates : chunks.slice(0, 100)
 
-  // ── FIX 8: Exact-match-first for definitions ─────────────────────────────
-  // For definition queries, scan ALL chunks for exact term before any embedding.
-  // This bypasses embedding entirely when we have a solid exact match.
-  if (intent === 'definition') {
-    const exactHits = chunks
-      .map(c => {
-        const text = (c.text || '').toLowerCase()
-        const exact = new RegExp(`\\b${escapeRegex(subjectLower)}\\b`, 'i').test(text)
-        return { ...c, _score: exact ? 20 : 0 }
-      })
-      .filter(c => c._score > 0)
-      .slice(0, topK)  // FIX 10: topK=2 for definitions (set at call site)
-
-    if (exactHits.length > 0) {
-      console.log(`[retrieveChunks] exact-match-first: found ${exactHits.length} hits for "${subjectLower}"`)
-      return exactHits
-    }
-    // No exact hits for definition — return empty, refuse to guess
-    console.log(`[retrieveChunks] no exact hits for definition: "${subjectLower}"`)
-    return []
+  if (pool.length > 0 && pool[0]._score >= KEYWORD_SHORTCIRCUIT_SCORE) {
+    console.log(`[retrieveChunks] keyword short-circuit (score=${pool[0]._score}) — skipping embed`)
+    return pool.slice(0, Math.min(topK, 10))
   }
 
-  const keywordTopK = Math.min(100, chunks.length)
-  const candidates  = keywordSearch(normalizedQuery, chunks, keywordTopK, intent, invertedIndex)
-  const pool        = candidates  // no fallback to random chunks
-
-  if (pool.length === 0) return []
-
-  // ── FIX 7: Safe keyword shortcut — only if exact term confirmed ───────────
-  if (pool[0]._score >= KEYWORD_SHORTCIRCUIT_SCORE && containsExactTerm(query, pool)) {
-    console.log(`[retrieveChunks] keyword short-circuit (score=${pool[0]._score}) — exact term confirmed`)
-    return pool.slice(0, Math.min(topK, 5))
+  if (intent === 'definition' && pool.length > 0 && pool[0]._score >= 4) {
+    return pool.slice(0, Math.min(topK, 10))
   }
 
   if (intent === 'url_lookup' && pool.length > 0) {
@@ -542,7 +479,9 @@ async function retrieveChunks(query, chunks, topK = 3, invertedIndex = null) {
         const embeddings = await embedBatch(chunkTexts)
 
         const maxKeyword = pool[0]._score || 1
-        const weight     = { semantic: 0.50, keyword: 0.50 }  // balanced — keyword anchors precision
+        const weight     = intent === 'definition'
+          ? { semantic: 0.35, keyword: 0.65 }
+          : { semantic: 0.70, keyword: 0.30 }
 
         const scored = poolSlice.map((c, i) => {
           const chunkVec = embeddings[i]
@@ -551,23 +490,23 @@ async function retrieveChunks(query, chunks, topK = 3, invertedIndex = null) {
           const keywordNorm   = typeof c._score === 'number' ? c._score / maxKeyword : 0
           return { ...c, _score: semanticScore * weight.semantic + keywordNorm * weight.keyword }
         })
+        const remainder = pool.slice(EMBED_POOL_LIMIT).map(c => ({
+          ...c,
+          _score: (typeof c._score === 'number' ? c._score / maxKeyword : 0) * weight.keyword,
+        }))
 
-        // ── FIX 9: Filter out low-confidence chunks ──────────────────────────
-        const filtered = scored.filter(c => c._score >= 0.25)
-
-        return filtered
+        return [...scored, ...remainder]
           .sort((a, b) => b._score - a._score)
-          .slice(0, Math.min(topK, 5))
+          .slice(0, Math.min(topK, 12))
       }
     } catch (err) {
       console.warn('[retrieveChunks] Azure embed failed, keyword fallback:', err.message)
     }
   }
 
-  return pool.slice(0, Math.min(topK, 5))
+  return pool.slice(0, Math.min(topK, 12))
 }
 
-// ── FIX 14: buildContext — compact, deduplicated, noise-filtered ──────────────
 function buildContext(hits) {
   const seen = new Set()
   const deduped = []
@@ -577,104 +516,180 @@ function buildContext(hits) {
       seen.add(fingerprint)
       deduped.push(h)
     }
-    if (deduped.length >= 3) break  // max 3 chunks for Phi-4-mini
+    if (deduped.length >= 6) break
   }
 
   return deduped.map((h, i) => {
-    // Tighter char limits — keep context lean for small model
-    const charLimit = i === 0 ? 400 : 280
-    const lines = (h.text || '')
-      .split('\n')
-      // Remove noisy metadata lines
-      .filter(l => !/(copyright|all rights reserved|page \d+|proprietary|redistribution|www\.|http)/i.test(l) || l.toLowerCase().includes('http'))
-      // Remove empty or very short lines
-      .filter(l => l.trim().length > 4)
-      .join('\n')
-      .trim()
-      .slice(0, charLimit)
-
-    return `[${i + 1}] ${lines}`
+    const charLimit = i === 0 ? 600 : i <= 2 ? 450 : 350
+    const text = (h.text || '').trim().slice(0, charLimit)
+    return `[${i + 1}] ${text}`
   }).join('\n\n')
 }
 
+// ─── System Prompt Cache ──────────────────────────────────────────────────────
 const SYSTEM_PROMPT_CACHE     = new Map()
 const SYSTEM_PROMPT_CACHE_MAX = 100
 
-// ── FIX 12: Strict system prompt for Phi-4-mini ───────────────────────────────
-// Old prompt allowed model to infer/substitute. New prompt enforces strict grounding.
+/**
+ * Builds a rich, intent-aware and doc-type-aware system prompt.
+ * Integrates per-document-type rules and intent-specific answer strategies.
+ */
 function buildDynamicSystemPrompt(hits, intent = 'general') {
-  const hasSpreadsheet = hits.some(h => classifyExtension(h.source_file || '') === DOC_TYPE.SPREADSHEET)
-  const hasPdf         = hits.some(h => classifyExtension(h.source_file || '') === DOC_TYPE.PDF)
-  const cacheKey       = `${intent}::${hasSpreadsheet}::${hasPdf}`
-  const cached         = SYSTEM_PROMPT_CACHE.get(cacheKey)
+  // Classify which doc types are present in the retrieved hits
+  const schemas = hits.map(h => ({ type: classifyExtension(h.source_file || '') }))
+  const uniqueTypes = [...new Set(schemas.map(s => s.type))]
+
+  const spreadsheets = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.SPREADSHEET)
+  const pdfDocs      = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.PDF)
+  const wordDocs     = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.WORD)
+  const presentations = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.PRESENTATION)
+  const codeFiles    = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.CODE)
+  const dataFiles    = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.DATA)
+  const textFiles    = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.TEXT)
+  const emailFiles   = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.EMAIL)
+  const webFiles     = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.WEB)
+
+  // Build a cache key from intent + doc type presence flags
+  const cacheKey = [
+    intent,
+    spreadsheets.length > 0 ? 'ss' : '',
+    pdfDocs.length > 0 ? 'pdf' : '',
+    wordDocs.length > 0 ? 'word' : '',
+    presentations.length > 0 ? 'ppt' : '',
+    codeFiles.length > 0 ? 'code' : '',
+    dataFiles.length > 0 ? 'data' : '',
+    textFiles.length > 0 ? 'txt' : '',
+    emailFiles.length > 0 ? 'eml' : '',
+    webFiles.length > 0 ? 'web' : '',
+  ].filter(Boolean).join('::')
+
+  const cached = SYSTEM_PROMPT_CACHE.get(cacheKey)
   if (cached) return cached
 
-  const base = `You are a STRICT document QA assistant.
+  // ── Intent-specific answer strategy ──────────────────────────────────────
+  const intentInstructions = {
+    definition: `ANSWER STRATEGY — DEFINITION QUERY:
+The user is asking for the definition or meaning of a specific term or metric.
+1. Scan ALL excerpts for: the EXACT term, "is defined as", "is described as", "is calculated as", or any sentence that explains what the term IS.
+2. If found, state the definition clearly and completely. Include calculation logic, filters, or conditions if mentioned.
+3. If the term appears as a column name or value in structured data, explain its role in that context.
+4. Do NOT describe tangentially related metrics — focus on the EXACT term asked about.
+5. If multiple excerpts define the same term differently, reconcile them or present both definitions.`,
 
-Answer ONLY using the retrieved context below.
+    lookup: `ANSWER STRATEGY — LOOKUP QUERY:
+The user wants a specific value, count, or list from the data.
+1. Find the exact records, rows, or values that match the query.
+2. Report the precise values — do not approximate.
+3. For spreadsheet data, scan all rows; the answer may span multiple records.
+4. State clearly where the data comes from (metric name, column name, etc.).`,
 
-ABSOLUTE RULES:
-- NEVER guess or infer
-- NEVER use outside knowledge  
-- NEVER substitute a similar word or concept
-- NEVER answer if the exact term is not in context
-- If a term is absent from context: say "I couldn't find that exact information in your documents."
-- If retrieved context is weak or unrelated: say "I couldn't find an accurate answer for that in your documents."
-- Do NOT add citation markers like [1], [2]
-- Do NOT mention file names
-- Keep answers concise and precise`
+    comparison: `ANSWER STRATEGY — COMPARISON QUERY:
+The user wants to compare two or more items.
+1. Find all relevant information for EACH item being compared.
+2. Structure the answer as a clear comparison — similarities and differences.
+3. Use parallel structure so the comparison is easy to follow.
+4. If one side has more data than the other, note the gap explicitly.`,
 
-  const intentGuide = {
-    definition: `
+    url_lookup: `ANSWER STRATEGY — URL LOOKUP QUERY:
+The user is asking for a URL or link.
+1. Find and return the full URL that matches the topic exactly as it appears — no truncation.
+2. Return the URL on its own line, unbroken, with no spaces.
+3. If multiple URLs match, list each on its own line.
+4. If none match, say not found.`,
 
-TASK — DEFINITION:
-Find lines where the EXACT term asked is defined, described, or explained.
-Look for: "X is defined as", "X is described as", "X means", "X: <explanation>".
-Return the definition clearly. If the exact term is absent, say not found.`,
+    general: `ANSWER STRATEGY — GENERAL QUERY:
+Scan all excerpts carefully. Find information that directly answers the question. Synthesise a clear, complete answer. If the information spans multiple excerpts, combine it coherently.`,
+  }[intent] || `ANSWER STRATEGY — GENERAL QUERY:
+Scan all excerpts carefully and synthesise a clear, complete answer.`
 
-    lookup: `
+  // ── Base rules ────────────────────────────────────────────────────────────
+  const base = `You are a knowledgeable document assistant. Answer questions ONLY using the document context provided.
 
-TASK — LOOKUP:
-Return the exact value, count, or list from context.
-Report precise numbers only. If not found, say so.`,
+UNIVERSAL RULES:
+1. Answer ONLY from the context. Never invent or assume information.
+2. Search the ENTIRE context — every excerpt — before concluding something is absent.
+3. Case-insensitive matching: "applicant count", "Applicant Count", "APPLICANT COUNT" are identical.
+4. If a term appears ANYWHERE in the context — as a label, value, heading, or inline text — treat it as present.
+5. If information is truly absent after thorough search, say: "I couldn't find specific information about that in your documents."
+6. Do NOT add citation markers like [1], [2], [3].
+7. Do NOT mention file names or source document names in your answer.
+8. Write clearly, concisely, and directly — like a knowledgeable colleague.
+9. Answer only what was asked. No padding or filler.
+10. NEVER say "the context does not define" or "not mentioned" if the term appears anywhere.
+11. If a URL is present, ALWAYS return the FULL URL exactly as-is. Never truncate or shorten URLs.
+12. URLs must be returned in one continuous line with no line breaks or spaces.
 
-    comparison: `
+${intentInstructions}`
 
-TASK — COMPARISON:
-Find data for EACH item and compare clearly.
-Use parallel structure. Note gaps explicitly if one side has less data.`,
+  // ── Per-doc-type rules ────────────────────────────────────────────────────
+  const typeBlocks = []
 
-    url_lookup: `
+  if (spreadsheets.length > 0) {
+    typeBlocks.push(`SPREADSHEET RULES:
+- Data is serialised as pipe-delimited key:value rows. Each line = one record.
+- Lines like "X is described as: ..." are definition summaries — prioritise them for definition queries.
+- For definition queries: a field name matching the subject IS a definition. Explain it from surrounding values.
+- Scan ALL rows — the answer may not be in the first matching row.
+- When answering, write a natural sentence from this data — never output raw pipe-delimited rows verbatim.`)
+  }
 
-TASK — URL:
-Find and return the full URL matching the topic.
-Return the URL unbroken on its own line. If none match, say not found.`,
+  if (dataFiles.length > 0) {
+    typeBlocks.push(`STRUCTURED DATA RULES (JSON/YAML/CSV):
+- Fields and values may be nested. Treat "parent.child: value" as a nested attribute.
+- Every key and every value is meaningful data — no prose definition required.`)
+  }
 
-    general: `
+  if (pdfDocs.length > 0) {
+    typeBlocks.push(`PDF RULES:
+- Content is extracted from PDF pages. Minor formatting artefacts may exist.
+- Read numbers, dates, and figures exactly as they appear.
+- Ignore repeated headers, footers, copyright lines, and page numbers. Focus on substantive content.`)
+  }
 
-TASK — GENERAL:
-Answer directly from context. Stay focused on what was asked.`,
-  }[intent] || `
+  if (wordDocs.length > 0) {
+    typeBlocks.push(`WORD DOCUMENT RULES:
+- Context contains prose, lists, and tables. Headings indicate section structure.
+- Quote definitions or policy statements accurately.`)
+  }
 
-TASK — GENERAL:
-Answer directly from context. Stay focused on what was asked.`
+  if (presentations.length > 0) {
+    typeBlocks.push(`PRESENTATION RULES:
+- Slide titles are section headers; bullets are supporting detail.
+- Do not infer beyond what the slide explicitly states.`)
+  }
 
-  const spreadsheetGuide = hasSpreadsheet
-    ? `
+  if (codeFiles.length > 0) {
+    typeBlocks.push(`CODE RULES:
+- Read code literally. Function/variable names and comments are all meaningful.
+- Describe what code does in plain English unless code output is requested.`)
+  }
 
-SPREADSHEET DATA: Rows are pipe-separated key:value pairs.
-Lines ending "is described as: ..." are definition summaries — prioritise these.
-Write a natural sentence from data. Never output raw pipe-delimited rows verbatim.`
+  if (textFiles.length > 0) {
+    typeBlocks.push(`TEXT/MARKDOWN RULES:
+- Markdown formatting (##, **, -) indicates structure. Interpret accordingly.
+- Lists represent discrete facts or steps.`)
+  }
+
+  if (emailFiles.length > 0) {
+    typeBlocks.push(`EMAIL RULES:
+- Attribute statements to their sender. Do not mix up correspondents.
+- Dates and times are as stated in the email header.`)
+  }
+
+  if (webFiles.length > 0) {
+    typeBlocks.push(`WEB/HTML RULES:
+- Focus on main body content. Ignore repetitive navigation text.
+- Include URLs exactly if mentioned.`)
+  }
+
+  // ── Mixed-doc note ────────────────────────────────────────────────────────
+  const mixedNote = uniqueTypes.length > 1
+    ? `\nMIXED DOCUMENT SET: Context contains ${uniqueTypes.length} document types (${uniqueTypes.join(', ')}). Apply the relevant rules above for each excerpt.`
     : ''
 
-  const pdfGuide = hasPdf
-    ? `
+  const prompt = [base, ...typeBlocks, mixedNote].filter(Boolean).join('\n\n')
 
-PDF DATA: Ignore headers, footers, page numbers. Focus on substantive content.`
-    : ''
-
-  const prompt = `${base}${intentGuide}${spreadsheetGuide}${pdfGuide}`
-
+  // Cache with LRU eviction
   if (SYSTEM_PROMPT_CACHE.size >= SYSTEM_PROMPT_CACHE_MAX) {
     SYSTEM_PROMPT_CACHE.delete(SYSTEM_PROMPT_CACHE.keys().next().value)
   }
@@ -784,18 +799,17 @@ function extractSpreadsheet(buffer) {
     for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
       const row = rawRows[i]
       if (!row.some(cell => String(cell).trim() !== '')) continue
-      const pairs = []
+      const pairs = [], values = []
       for (let j = 0; j < Math.max(headers.length, row.length); j++) {
         const val = String(row[j] || '').trim()
         if (!val) continue
         const key = headers[j] && headers[j] !== '' ? headers[j] : `Field${j + 1}`
         pairs.push(`${key}: ${val}`)
+        values.push(val)
       }
       if (pairs.length > 0) {
         parts.push(pairs.join(' | '))
-        // FIX 3: REMOVED synthetic "X is described as: ..." generation.
-        // This was creating false semantic relationships that contaminated embeddings.
-        // e.g. "Lease Resolution is described as: ..." caused occupancy→lease resolution hits.
+        if (values.length >= 2) parts.push(`${values[0]} is described as: ${pairs.slice(1).join(', ')}`)
       }
     }
     parts.push('')
@@ -1028,7 +1042,7 @@ async function answerWithPhi4(originalQuery, hits, intent = 'general') {
   const context      = buildContext(hits)
 
   const subjectHint  = intent === 'definition'
-    ? `\nDefine ONLY the exact term: "${extractSubject(originalQuery)}". Do not define any other term. If not found in context, say "I couldn't find that exact information in your documents."`
+    ? `\nDefine ONLY this exact term: "${extractSubject(originalQuery)}". Do not define any other term.`
     : intent === 'url_lookup'
     ? `\nReturn URL(s) for: "${extractUrlKeywords(originalQuery).join(' ')}".`
     : ''
@@ -1037,33 +1051,59 @@ async function answerWithPhi4(originalQuery, hits, intent = 'general') {
   return callPhi4(systemPrompt, userMessage)
 }
 
-// ── FIX 13: Strict fallback — exact match only, no guessing ──────────────────
 function buildFallbackAnswer(query, hits) {
-  if (!hits?.length) {
-    return "I couldn't find that in your documents."
+  if (!hits || hits.length === 0) {
+    return "I couldn't find relevant information in your documents for this query."
+  }
+  const intent = detectQueryIntent(query)
+
+  if (intent === 'url_lookup') {
+    const urlKeywords = extractUrlKeywords(query)
+    for (const h of hits) {
+      const lines = (h.text || '').split('\n')
+      for (const line of lines) {
+        if (!line.toLowerCase().includes('http')) continue
+        const lineLower = line.toLowerCase()
+        const matches = urlKeywords.filter(w => lineLower.includes(w)).length
+        if (matches > 0) {
+          const urlMatch = line.match(/https?:\/\/\S+/)
+          if (urlMatch) return urlMatch[0].replace(/\s/g, '')
+        }
+      }
+    }
   }
 
-  const subject = extractSubject(query).toLowerCase().trim()
+  const subject = extractSubject(query).toLowerCase()
 
-  // Only return a fallback if the exact term actually appears in the chunk
-  const exact = hits.find(h => {
-    const text = (h.text || '').toLowerCase()
-    return new RegExp(`\\b${escapeRegex(subject)}\\b`, 'i').test(text)
+  const descLine = hits.find(h => {
+    const t = (h.text || '').toLowerCase()
+    return t.includes('is described as') && t.includes(subject)
   })
-
-  if (!exact) {
-    return "I couldn't find an exact match for that term in your documents."
+  if (descLine) {
+    const lines = (descLine.text || '').split('\n')
+    const relevantLine = lines.find(l =>
+      l.toLowerCase().includes(subject) && l.toLowerCase().includes('is described as')
+    )
+    if (relevantLine) {
+      const parts = relevantLine.split(/is described as:/i)
+      if (parts[1]) {
+        return `${subject.charAt(0).toUpperCase() + subject.slice(1)} is ${parts[1].trim().slice(0, 300)}`
+      }
+    }
   }
 
-  // Return a clean snippet from the matching chunk
-  return exact.text
+  const best = hits.find(h => (h.text || '').toLowerCase().includes(subject)) || hits[0]
+
+  const snippet = (best.text || '')
     .replace(/Field\d+:\s*/gi, '')
     .replace(/\|\s*Field\d+\b/gi, '')
     .split('\n')
-    .filter(l => !/(copyright|all rights reserved|proprietary|confidential)/i.test(l))
+    .filter(l => !/(copyright|all rights reserved|proprietary|confidential|redistribution)/i.test(l))
     .join('\n')
-    .slice(0, 300)
+    .slice(0, 350)
     .trim()
+
+  return snippet || "I couldn't find that specific information in your documents."
 }
 
 function generateTitle(query) {
@@ -1291,7 +1331,7 @@ app.post('/chat/conversations/delete', requireClientKey, async (req, res) => {
 // ─── MAIN CHAT ENDPOINT ───────────────────────────────────────────────────────
 app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) => {
   try {
-    const { query, topK = 3, conversationId } = req.body  // FIX 10: default topK=3
+    const { query, topK = 6, conversationId } = req.body
     if (!query?.trim()) return res.status(400).json({ error: 'query is required' })
     const { clientId, name } = req.client
 
@@ -1332,28 +1372,11 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         }
       }
 
-      // FIX 10: Use intent-appropriate topK — small for definitions, slightly larger for general
-      const effectiveTopK = intent === 'definition' ? 2 : Math.min(topK, 5)
-      const hits = await retrieveChunks(query.trim(), chunks, effectiveTopK, invertedIndex)
+      const hits = await retrieveChunks(query.trim(), chunks, Math.min(topK, 20), invertedIndex)
 
-      // ── FIX 15: Retrieval debug logging ──────────────────────────────────────
-      console.log({
-        query: query.trim(),
-        intent,
-        hitsCount: hits.length,
-        topHits: hits.slice(0, 5).map(h => ({
-          score:   h._score,
-          source:  h.source_file,
-          preview: h.text?.slice(0, 120),
-        })),
-      })
-
-      // ── FIX 2: Strict confidence filter — never send weak hits to Phi-4 ─────
-      const bestScore = hits[0]?._score || 0
-      if (hits.length === 0 || bestScore < 3 || !containsExactTerm(query, hits)) {
-        console.log(`[confidence] REFUSED — bestScore=${bestScore}, exactMatch=${containsExactTerm(query, hits)}`)
+      if (hits.length === 0) {
         return {
-          answer: "I couldn't find an accurate answer for that in your documents.",
+          answer: "I couldn't find that in your documents. Try rephrasing your question.",
           sources: [],
           conversationId: conversationId || null,
           client: { clientId, name },
@@ -1456,7 +1479,6 @@ app.listen(PORT, () => {
   console.log(`Chunk cache TTL: ${CHUNK_CACHE_TTL}ms | Embed pool limit: ${EMBED_POOL_LIMIT}`)
   console.log(`Request timeout: ${REQUEST_TIMEOUT_MS}ms | Keyword short-circuit score: ${KEYWORD_SHORTCIRCUIT_SCORE}`)
   console.log(`Blob concurrency: ${BLOB_CONCURRENCY}`)
-  console.log(`Chunk size: ${CHUNK_SIZE} | Chunk overlap: ${CHUNK_OVERLAP}`)
   console.log(`Azure blob client: ${blobServiceClient ? 'singleton ready' : 'MISSING connection string'}`)
   startApiKeyHealthChecker()
   warmupChunkCaches()
