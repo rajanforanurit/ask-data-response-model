@@ -1,18 +1,40 @@
+/**
+ * index.js  –  RAG query server (Node.js / Express)
+ *
+ * ARCHITECTURE (after pipeline.py changes):
+ * =========================================
+ *
+ * Ingestion (Python pipeline.py):
+ *   file → extract → chunk → MiniLM embed → vectors JSON
+ *   → blob: meta/<clientId>/vectors/<stem>.json
+ *
+ * Query (this file):
+ *   query → MiniLM embed (via Python sidecar HTTP) → load stored vectors
+ *   → cosine similarity → top-k chunks → Phi-4 answer
+ *
+ * KEY CHANGES vs old version:
+ *  - _doLoadChunks()   : reads meta/<clientId>/vectors/*.json (NOT raw/)
+ *                        chunks already have .embedding[]  — no re-extraction
+ *  - retrieveChunks()  : pure cosine similarity on stored embeddings (primary)
+ *                        + keyword re-rank as tie-breaker (secondary)
+ *  - embedQuery()      : calls local MiniLM sidecar (SAME model as ingestion)
+ *                        falls back to keyword-only if sidecar unavailable
+ *  - REMOVED:          embedBatch(), embedQueryAzure() — Azure ada no longer used
+ *  - REMOVED:          extractTextFromBuffer(), chunkText() from query path
+ *  - REMOVED:          downloadBlobAsBuffer() for raw files in hot path
+ *  - KEPT:             all auth, MongoDB, Phi-4, cache, rate-limit, CORS logic
+ */
+
 require('dotenv').config()
-const express = require('express')
-const cors = require('cors')
+const express    = require('express')
+const cors       = require('cors')
 const { MongoClient, ObjectId } = require('mongodb')
-const { BlobServiceClient } = require('@azure/storage-blob')
-const pdfParse = require('pdf-parse')
-const mammoth = require('mammoth')
-const XLSX = require('xlsx')
-const { parse: htmlParse } = require('node-html-parser')
-const yaml = require('js-yaml')
-const Papa = require('papaparse')
-const { simpleParser } = require('mailparser')
-const { parseOffice } = require('officeparser')
-const crypto = require('crypto')
+const { BlobServiceClient }     = require('@azure/storage-blob')
+const crypto     = require('crypto')
+
 const app = express()
+
+// ─── CORS ──────────────────────────────────────────────────────────────────────
 const allowedOrigins = [
   'http://localhost:8080',
   'http://localhost:3000',
@@ -31,74 +53,53 @@ function originAllowed(origin) {
   return false
 }
 app.use(cors({
-  origin: (origin, callback) => callback(null, originAllowed(origin)),
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-session-id'],
-  credentials: true,
+  origin:         (origin, cb) => cb(null, originAllowed(origin)),
+  methods:        ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','x-session-id'],
+  credentials:    true,
 }))
 app.options('*', cors({
-  origin: (origin, callback) => callback(null, true),
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-session-id'],
-  credentials: true,
+  origin:         (origin, cb) => cb(null, true),
+  methods:        ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','x-session-id'],
+  credentials:    true,
 }))
 app.use(express.json())
-const MONGODB_URI = process.env.MONGODB_URI
-const MONGODB_DB  = process.env.MONGODB_DB || 'clientcreds'
-const CHAT_HISTORY_URI = process.env.CHAT_HISTORY_URI
-const CHAT_HISTORY_DB = process.env.CHAT_HISTORY_DB || 'chathistory'
+
+// ─── ENV ───────────────────────────────────────────────────────────────────────
+const MONGODB_URI          = process.env.MONGODB_URI
+const MONGODB_DB           = process.env.MONGODB_DB           || 'clientcreds'
+const CHAT_HISTORY_URI     = process.env.CHAT_HISTORY_URI
+const CHAT_HISTORY_DB      = process.env.CHAT_HISTORY_DB      || 'chathistory'
 const AZURE_CONNECTION_STRING = process.env.AZURE_CONNECTION_STRING || ''
 const AZURE_CONTAINER_NAME = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
-const ADMIN_API_KEY  = process.env.ADMIN_API_KEY
-const KEY_CHECK_INTERVAL_MS   = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10)
-const PHI4_ENDPOINT = process.env.PHI4_ENDPOINT
-const PHI4_API_KEY = process.env.PHI4_API_KEY
-const PHI4_MODEL  = process.env.PHI4_MODEL || 'Phi-4-mini-instruct'
-const PHI4_TIMEOUT_MS  = parseInt(process.env.PHI4_TIMEOUT_MS || '30000', 10)
-const AZURE_EMBED_ENDPOINT = process.env.AZURE_EMBED_ENDPOINT || ''
-const AZURE_EMBED_KEY = process.env.AZURE_EMBED_KEY || ''
-const AZURE_EMBED_MODEL = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
-const EMBED_TIMEOUT_MS = parseInt(process.env.EMBED_TIMEOUT_MS || '10000', 10)
-const EMBED_POOL_LIMIT = parseInt(process.env.EMBED_POOL_LIMIT || '20', 10)
-const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10)
-const KEYWORD_SHORTCIRCUIT_SCORE = parseInt(process.env.KEYWORD_SHORTCIRCUIT_SCORE || '6', 10)
+const ADMIN_API_KEY        = process.env.ADMIN_API_KEY
+const KEY_CHECK_INTERVAL_MS = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10)
 
-const WARMUP_CLIENT_IDS = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
+const PHI4_ENDPOINT    = process.env.PHI4_ENDPOINT
+const PHI4_API_KEY     = process.env.PHI4_API_KEY
+const PHI4_MODEL       = process.env.PHI4_MODEL       || 'Phi-4-mini-instruct'
+const PHI4_TIMEOUT_MS  = parseInt(process.env.PHI4_TIMEOUT_MS  || '30000', 10)
 
-const RAW_PREFIX    = 'raw'
-const CHUNK_SIZE    = 500
-const CHUNK_OVERLAP = 2
+// MiniLM sidecar: a tiny Python FastAPI that exposes POST /embed
+// Run alongside this server:  uvicorn embed_sidecar:app --port 5001
+// Falls back to keyword-only if not available.
+const MINILM_SIDECAR_URL   = process.env.MINILM_SIDECAR_URL   || 'http://localhost:5001'
+const EMBED_TIMEOUT_MS      = parseInt(process.env.EMBED_TIMEOUT_MS      || '5000',  10)
+
+const REQUEST_TIMEOUT_MS         = parseInt(process.env.REQUEST_TIMEOUT_MS         || '60000', 10)
+const KEYWORD_SHORTCIRCUIT_SCORE = parseInt(process.env.KEYWORD_SHORTCIRCUIT_SCORE || '6',     10)
+const WARMUP_CLIENT_IDS          = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
+const BLOB_CONCURRENCY           = parseInt(process.env.BLOB_CONCURRENCY || '8', 10)
+
+// Vector prefix written by pipeline.py
+const VECTORS_PREFIX = (clientId) => `meta/${clientId}/vectors/`
+
 const blobServiceClient = AZURE_CONNECTION_STRING
   ? BlobServiceClient.fromConnectionString(AZURE_CONNECTION_STRING)
   : null
 
-const SUPPORTED_EXTENSIONS = new Set([
-  '.pdf', '.docx', '.doc', '.txt', '.rtf', '.odt',
-  '.xlsx', '.xls', '.ods', '.csv', '.tsv',
-  '.pptx', '.ppt',
-  '.html', '.htm', '.xml', '.md', '.markdown', '.rst',
-  '.json', '.jsonl', '.yaml', '.yml', '.toml',
-  '.py', '.js', '.ts', '.jsx', '.tsx',
-  '.java', '.cpp', '.c', '.h', '.cs',
-  '.go', '.rb', '.php', '.swift', '.kt',
-  '.r', '.sql', '.sh', '.bash', '.ps1',
-  '.epub', '.eml',
-])
-
-const DOC_TYPE = {
-  SPREADSHEET:  'spreadsheet',
-  PDF:          'pdf',
-  WORD:         'word',
-  PRESENTATION: 'presentation',
-  CODE:         'code',
-  DATA:         'data',
-  TEXT:         'text',
-  EMAIL:        'email',
-  WEB:          'web',
-  UNKNOWN:      'unknown',
-}
-
-// ─── Response Cache ───────────────────────────────────────────────────────────
+// ─── Response cache ───────────────────────────────────────────────────────────
 const RESPONSE_CACHE     = new Map()
 const RESPONSE_CACHE_TTL = 10 * 60 * 1000
 const RESPONSE_CACHE_MAX = 1000
@@ -109,19 +110,17 @@ function responseCacheGet(key) {
   if (Date.now() - entry.ts > RESPONSE_CACHE_TTL) { RESPONSE_CACHE.delete(key); return null }
   return entry.value
 }
-
 function responseCacheSet(key, value) {
   if (RESPONSE_CACHE.size >= RESPONSE_CACHE_MAX) {
-    const firstKey = RESPONSE_CACHE.keys().next().value
-    RESPONSE_CACHE.delete(firstKey)
+    RESPONSE_CACHE.delete(RESPONSE_CACHE.keys().next().value)
   }
   RESPONSE_CACHE.set(key, { value, ts: Date.now() })
 }
-
 function getCacheKey(clientId, query) {
   return `${clientId}:${query.toLowerCase().trim()}`
 }
 
+// ─── Phi-4 concurrency + circuit breaker ──────────────────────────────────────
 const IN_FLIGHT = new Map()
 let phiActiveCount = 0
 const PHI_MAX_CONCURRENT = 3
@@ -133,37 +132,24 @@ function runWithPhiLimit(fn) {
       if (phiActiveCount < PHI_MAX_CONCURRENT) {
         phiActiveCount++
         Promise.resolve().then(fn).then(
-          result => { phiActiveCount--; drainPhiQueue(); resolve(result) },
-          err    => { phiActiveCount--; drainPhiQueue(); reject(err) }
+          r  => { phiActiveCount--; drainPhiQueue(); resolve(r) },
+          e  => { phiActiveCount--; drainPhiQueue(); reject(e) }
         )
-      } else {
-        phiQueue.push(tryRun)
-      }
+      } else { phiQueue.push(tryRun) }
     }
     tryRun()
   })
 }
-
 function drainPhiQueue() {
-  if (phiQueue.length > 0 && phiActiveCount < PHI_MAX_CONCURRENT) {
-    const next = phiQueue.shift()
-    next()
-  }
+  if (phiQueue.length > 0 && phiActiveCount < PHI_MAX_CONCURRENT) phiQueue.shift()()
 }
-let phiFailures  = 0
-let phiBlockedUntil  = 0
+let phiFailures = 0, phiBlockedUntil = 0
 function phiCircuitOpen() {
   if (Date.now() < phiBlockedUntil) return true
-  if (phiBlockedUntil > 0) {
-    phiBlockedUntil = 0
-    phiFailures     = 0
-    console.log('[phi4] Circuit breaker reset (timeout elapsed)')
-  }
+  if (phiBlockedUntil > 0) { phiBlockedUntil = 0; phiFailures = 0 }
   return false
 }
-
 function phiRecordSuccess() { phiFailures = 0; phiBlockedUntil = 0 }
-
 function phiRecordFailure() {
   phiFailures++
   if (phiFailures >= 3) {
@@ -171,12 +157,13 @@ function phiRecordFailure() {
     console.error(`🚨 [phi4] Circuit breaker OPEN for 30s after ${phiFailures} failures`)
   }
 }
+
+// ─── Fetch helpers ────────────────────────────────────────────────────────────
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
-    const response = await fetch(url, { ...options, signal: controller.signal })
-    return response
+    return await fetch(url, { ...options, signal: controller.signal })
   } catch (err) {
     if (err.name === 'AbortError') throw new Error(`Request timed out after ${timeoutMs}ms: ${url}`)
     throw err
@@ -195,31 +182,92 @@ function withRequestTimeout(fn, timeoutMs = REQUEST_TIMEOUT_MS) {
         if (!res.headersSent) res.status(503).json({ error: 'Request timed out. Please try again.' })
       }
     }, timeoutMs)
-    try {
-      await fn(req, res, next)
-    } catch (err) {
-      if (!settled) next(err)
-    } finally {
-      settled = true
-      clearTimeout(timer)
+    try { await fn(req, res, next) } catch (err) { if (!settled) next(err) } finally {
+      settled = true; clearTimeout(timer)
     }
   }
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── MiniLM sidecar embedding (SAME model as pipeline.py ingestion) ───────────
+/**
+ * Embed a single query string using the MiniLM sidecar.
+ *
+ * The sidecar is a tiny FastAPI app (embed_sidecar.py) that wraps
+ * sentence-transformers/all-MiniLM-L6-v2 — the SAME model used at ingestion.
+ * Using the same model is mandatory for cosine similarity to be meaningful.
+ *
+ * Returns float[] or null if sidecar is down (keyword-only fallback kicks in).
+ *
+ * embed_sidecar.py (put this next to index.js and run with uvicorn):
+ * -------------------------------------------------------------------
+ * from fastapi import FastAPI
+ * from pydantic import BaseModel
+ * from sentence_transformers import SentenceTransformer
+ * import numpy as np
+ *
+ * app = FastAPI()
+ * model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+ *
+ * class EmbedRequest(BaseModel):
+ *     text: str
+ *
+ * @app.post("/embed")
+ * def embed(req: EmbedRequest):
+ *     vec = model.encode([req.text], normalize_embeddings=True)[0]
+ *     return {"embedding": vec.tolist()}
+ * -------------------------------------------------------------------
+ */
+async function embedQuery(query) {
+  try {
+    const response = await fetchWithTimeout(
+      `${MINILM_SIDECAR_URL}/embed`,
+      {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ text: query }),
+      },
+      EMBED_TIMEOUT_MS
+    )
+    if (!response.ok) return null
+    const data = await response.json()
+    return data.embedding || null          // float[]
+  } catch (err) {
+    console.warn('[embedQuery] MiniLM sidecar unavailable, keyword-only mode:', err.message)
+    return null
+  }
+}
+
+// ─── Pure-JS cosine similarity ────────────────────────────────────────────────
+function cosineSim(a, b) {
+  let dot = 0, na = 0, nb = 0
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i]
+    na  += a[i] * a[i]
+    nb  += b[i] * b[i]
+  }
+  return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-9)
+}
+
+// ─── Query intent & keyword helpers ───────────────────────────────────────────
+const DOC_TYPE = {
+  SPREADSHEET: 'spreadsheet', PDF: 'pdf', WORD: 'word',
+  PRESENTATION: 'presentation', CODE: 'code', DATA: 'data',
+  TEXT: 'text', EMAIL: 'email', WEB: 'web', UNKNOWN: 'unknown',
+}
+
 function classifyExtension(fileName) {
-  const ext = ('.' + fileName.split('.').pop()).toLowerCase()
-  if (['.xlsx', '.xls', '.ods'].includes(ext))                               return DOC_TYPE.SPREADSHEET
-  if (ext === '.pdf')                                                         return DOC_TYPE.PDF
-  if (['.docx', '.doc', '.odt', '.rtf'].includes(ext))                       return DOC_TYPE.WORD
-  if (['.pptx', '.ppt'].includes(ext))                                       return DOC_TYPE.PRESENTATION
-  if (['.py','.js','.ts','.jsx','.tsx','.java','.cpp','.c','.h','.cs',
-       '.go','.rb','.php','.swift','.kt','.r','.sql','.sh','.bash','.ps1']
-      .includes(ext))                                                         return DOC_TYPE.CODE
+  const ext = ('.' + (fileName || '').split('.').pop()).toLowerCase()
+  if (['.xlsx','.xls','.ods'].includes(ext))                         return DOC_TYPE.SPREADSHEET
+  if (ext === '.pdf')                                                 return DOC_TYPE.PDF
+  if (['.docx','.doc','.odt','.rtf'].includes(ext))                 return DOC_TYPE.WORD
+  if (['.pptx','.ppt'].includes(ext))                               return DOC_TYPE.PRESENTATION
+  if (['.py','.js','.ts','.jsx','.tsx','.java','.cpp','.c','.h',
+       '.cs','.go','.rb','.php','.swift','.kt','.r','.sql','.sh',
+       '.bash','.ps1'].includes(ext))                                return DOC_TYPE.CODE
   if (['.json','.jsonl','.yaml','.yml','.toml','.csv','.tsv'].includes(ext)) return DOC_TYPE.DATA
-  if (['.txt','.md','.markdown','.rst'].includes(ext))                       return DOC_TYPE.TEXT
-  if (ext === '.eml')                                                         return DOC_TYPE.EMAIL
-  if (['.html','.htm','.xml'].includes(ext))                                 return DOC_TYPE.WEB
+  if (['.txt','.md','.markdown','.rst'].includes(ext))              return DOC_TYPE.TEXT
+  if (ext === '.eml')                                               return DOC_TYPE.EMAIL
+  if (['.html','.htm','.xml'].includes(ext))                       return DOC_TYPE.WEB
   return DOC_TYPE.UNKNOWN
 }
 
@@ -231,7 +279,7 @@ function detectQueryIntent(query) {
   const URL_PATTERNS        = [/\burl\b/,/\blink\b/,/\breport\b.*\burl\b/,/\burl\b.*\breport\b/,/\bpower\s*bi\b/,/\bdashboard\b/]
   const GREETING_PATTERNS   = [/^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening)|how\s+are\s+you|what's\s+up|sup)\b/]
   if (GREETING_PATTERNS.some(p => p.test(q))) return 'greeting'
-  if (URL_PATTERNS.some(p => p.test(q)))        return 'url_lookup'
+  if (URL_PATTERNS.some(p => p.test(q)))       return 'url_lookup'
   if (DEFINITION_PATTERNS.some(p => p.test(q))) return 'definition'
   if (COMPARISON_PATTERNS.some(p => p.test(q))) return 'comparison'
   if (LOOKUP_PATTERNS.some(p => p.test(q)))     return 'lookup'
@@ -251,44 +299,26 @@ function extractSubject(query) {
     /^describe\s+(?:an?\s+|the\s+)?(.+)$/,
     /^how\s+is\s+(.+?)\s+(calculated|defined|measured|computed)$/,
   ]
-  for (const p of patterns) {
-    const m = q.match(p)
-    if (m) return m[1].trim()
-  }
+  for (const p of patterns) { const m = q.match(p); if (m) return m[1].trim() }
   return q
 }
 
 function extractUrlKeywords(query) {
   const q = query.toLowerCase()
-  const stopWords = new Set(['power', 'bi', 'report', 'url', 'link', 'for', 'the', 'a', 'an', 'of', 'in', 'get', 'me', 'show', 'give', 'find', 'fetch'])
-  const words = q.replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1 && !stopWords.has(w))
-  return words
+  const stop = new Set(['power','bi','report','url','link','for','the','a','an','of','in','get','me','show','give','find','fetch'])
+  return q.replace(/[^\w\s]/g,' ').split(/\s+/).filter(w => w.length > 1 && !stop.has(w))
 }
 
 function fixBrokenUrls(text) {
-  return text.replace(/https:\/\/[^\s]+(\s+[^\s]+)/g, (match) => match.replace(/\s/g, ''))
+  return text.replace(/https:\/\/[^\s]+(\s+[^\s]+)/g, m => m.replace(/\s/g,''))
 }
 
-function escapeRegex(str) {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
-function cosineSim(a, b) {
-  let dot = 0, normA = 0, normB = 0
-  for (let i = 0; i < a.length; i++) {
-    dot   += a[i] * b[i]
-    normA += a[i] * a[i]
-    normB += b[i] * b[i]
-  }
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB) + 1e-9)
-}
+function escapeRegex(str) { return str.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') }
 
 function buildInvertedIndex(chunks) {
   const index = new Map()
   for (let i = 0; i < chunks.length; i++) {
-    const words = (chunks[i].text || '').toLowerCase()
-      .replace(/[^\w\s]/g, ' ')
-      .split(/\s+/)
+    const words = (chunks[i].text || '').toLowerCase().replace(/[^\w\s]/g,' ').split(/\s+/)
     for (const w of words) {
       if (w.length < 3) continue
       if (!index.has(w)) index.set(w, new Set())
@@ -298,9 +328,9 @@ function buildInvertedIndex(chunks) {
   return index
 }
 
-// ─── Phi-4 call ───────────────────────────────────────────────────────────────
+// ─── Phi-4 ────────────────────────────────────────────────────────────────────
 async function callPhi4(systemPrompt, userMessage) {
-  if (!PHI4_ENDPOINT || !PHI4_API_KEY) throw new Error('PHI4_ENDPOINT and PHI4_API_KEY environment variables are required')
+  if (!PHI4_ENDPOINT || !PHI4_API_KEY) throw new Error('PHI4_ENDPOINT and PHI4_API_KEY are required')
   if (phiCircuitOpen()) throw new Error('Model temporarily unavailable (circuit breaker open)')
 
   return runWithPhiLimit(async () => {
@@ -319,12 +349,10 @@ async function callPhi4(systemPrompt, userMessage) {
         },
         PHI4_TIMEOUT_MS
       )
-
       if (!response.ok) {
         const errText = await response.text()
         throw new Error(`Phi-4 API error ${response.status}: ${errText}`)
       }
-
       const data = await response.json()
       phiRecordSuccess()
       return data.choices?.[0]?.message?.content || ''
@@ -335,67 +363,162 @@ async function callPhi4(systemPrompt, userMessage) {
   })
 }
 
-async function embedQueryAzure(query) {
-  if (!AZURE_EMBED_ENDPOINT || !AZURE_EMBED_KEY) return null
-  try {
-    const response = await fetchWithTimeout(
-      AZURE_EMBED_ENDPOINT,
-      {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json', 'api-key': AZURE_EMBED_KEY },
-        body:    JSON.stringify({ input: query, model: AZURE_EMBED_MODEL }),
-      },
-      EMBED_TIMEOUT_MS
-    )
-    if (!response.ok) return null
-    const data = await response.json()
-    return data.data?.[0]?.embedding || null
-  } catch (err) {
-    console.warn('[embedQueryAzure] failed:', err.message)
-    return null
-  }
-}
+// ─── VECTOR LOADER  (replaces _doLoadChunks) ─────────────────────────────────
+/**
+ * Load all pre-embedded vector JSON files from:
+ *   meta/<clientId>/vectors/<stem>.json
+ *
+ * Each file is an array of records:
+ *   { text, embedding: float[], source_file, chunk_index, doc_id,
+ *     chunk_id, page, char_count, uploaded_at }
+ *
+ * Returns { chunks, invertedIndex }
+ *
+ * This replaces the old _doLoadChunks() which:
+ *  - downloaded raw blobs
+ *  - extracted text with pdf-parse / mammoth / xlsx etc.
+ *  - re-chunked on every request
+ *  - re-embedded with Azure ada (wrong model)
+ *
+ * Now chunks arrive pre-embedded, pre-chunked, ready for cosine search.
+ */
+async function _doLoadVectors(clientId) {
+  if (!blobServiceClient) throw new Error('AZURE_CONNECTION_STRING not set')
 
-async function embedBatch(texts) {
-  if (!AZURE_EMBED_ENDPOINT || !AZURE_EMBED_KEY || !texts.length) return []
-  try {
-    const response = await fetchWithTimeout(
-      AZURE_EMBED_ENDPOINT,
-      {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json', 'api-key': AZURE_EMBED_KEY },
-        body:    JSON.stringify({ input: texts, model: AZURE_EMBED_MODEL }),
-      },
-      EMBED_TIMEOUT_MS
-    )
-    if (!response.ok) return []
-    const data = await response.json()
-    return (data.data || []).sort((a, b) => a.index - b.index).map(d => d.embedding)
-  } catch (err) {
-    console.warn('[embedBatch] failed:', err.message)
+  const containerClient = blobServiceClient.getContainerClient(AZURE_CONTAINER_NAME)
+  const prefix          = VECTORS_PREFIX(clientId)
+
+  // List all .json files under meta/<clientId>/vectors/
+  const blobNames = []
+  for await (const blob of containerClient.listBlobsFlat({ prefix })) {
+    if (blob.name.endsWith('.json')) blobNames.push(blob.name)
+  }
+
+  if (blobNames.length === 0) {
+    console.warn(`[vectorLoader] No vector files found at prefix: ${prefix}`)
     return []
   }
+
+  const allChunks = []
+
+  for (let i = 0; i < blobNames.length; i += BLOB_CONCURRENCY) {
+    const batch   = blobNames.slice(i, i + BLOB_CONCURRENCY)
+    const results = await Promise.allSettled(
+      batch.map(async (blobName) => {
+        const downloadResponse = await containerClient.getBlobClient(blobName).download()
+        const parts = []
+        for await (const chunk of downloadResponse.readableStreamBody)
+          parts.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+        const raw  = Buffer.concat(parts).toString('utf-8')
+        const records = JSON.parse(raw)
+        if (!Array.isArray(records)) {
+          console.warn(`[vectorLoader] Unexpected format in ${blobName} — expected array`)
+          return []
+        }
+        // Validate each record has an embedding
+        return records.filter(r => r && r.text && Array.isArray(r.embedding) && r.embedding.length > 0)
+      })
+    )
+
+    for (const result of results) {
+      if (result.status === 'fulfilled') allChunks.push(...result.value)
+      else console.warn(`[vectorLoader] Failed to load blob:`, result.reason?.message)
+    }
+  }
+
+  console.log(`[vectorLoader] Loaded ${allChunks.length} pre-embedded chunks for client '${clientId}' from ${blobNames.length} vector files`)
+  return allChunks
 }
 
-// ─── Keyword search ───────────────────────────────────────────────────────────
+// ─── Chunk / vector cache ─────────────────────────────────────────────────────
+const CHUNK_CACHE     = new Map()
+const CHUNK_CACHE_TTL = parseInt(process.env.CHUNK_CACHE_TTL_MS || '300000', 10)
+
+async function loadChunksForClient(clientId) {
+  const now    = Date.now()
+  const cached = CHUNK_CACHE.get(clientId)
+
+  if (cached && cached.chunks) {
+    const isStale = now - cached.ts > CHUNK_CACHE_TTL
+    if (!isStale) {
+      return { chunks: cached.chunks, invertedIndex: cached.invertedIndex }
+    }
+    if (!cached.loading) {
+      console.log(`[vectorCache] Stale for ${clientId}, refreshing in background`)
+      const refreshPromise = _doLoadVectors(clientId)
+        .then(chunks => {
+          const invertedIndex = buildInvertedIndex(chunks)
+          CHUNK_CACHE.set(clientId, { chunks, invertedIndex, ts: Date.now(), loading: null })
+          console.log(`[vectorCache] Background refresh done for ${clientId}: ${chunks.length} chunks`)
+          return chunks
+        })
+        .catch(err => {
+          const existing = CHUNK_CACHE.get(clientId)
+          CHUNK_CACHE.set(clientId, { ...existing, loading: null })
+          console.warn(`[vectorCache] Background refresh failed for ${clientId}: ${err.message}`)
+        })
+      CHUNK_CACHE.set(clientId, { ...cached, loading: refreshPromise })
+      return { chunks: cached.chunks, invertedIndex: cached.invertedIndex }
+    }
+    return { chunks: cached.chunks, invertedIndex: cached.invertedIndex }
+  }
+
+  if (cached && cached.loading) {
+    const chunks = await cached.loading
+    const entry  = CHUNK_CACHE.get(clientId)
+    return { chunks: chunks || entry?.chunks || [], invertedIndex: entry?.invertedIndex || null }
+  }
+
+  const loadPromise = _doLoadVectors(clientId)
+    .then(chunks => {
+      const invertedIndex = buildInvertedIndex(chunks)
+      CHUNK_CACHE.set(clientId, { chunks, invertedIndex, ts: Date.now(), loading: null })
+      console.log(`[vectorCache] Loaded ${chunks.length} vectors + built inverted index for ${clientId}`)
+      return chunks
+    })
+    .catch(err => {
+      CHUNK_CACHE.set(clientId, { chunks: null, invertedIndex: null, ts: 0, loading: null })
+      throw err
+    })
+
+  CHUNK_CACHE.set(clientId, { chunks: null, invertedIndex: null, ts: 0, loading: loadPromise })
+  const chunks = await loadPromise
+  const entry  = CHUNK_CACHE.get(clientId)
+  return { chunks, invertedIndex: entry?.invertedIndex || null }
+}
+
+function invalidateChunkCache(clientId) {
+  CHUNK_CACHE.delete(clientId)
+  console.log(`[vectorCache] Invalidated cache for client: ${clientId}`)
+}
+
+function warmupChunkCaches() {
+  if (!WARMUP_CLIENT_IDS.length || !blobServiceClient) return
+  console.log(`[warmup] Pre-loading vectors for ${WARMUP_CLIENT_IDS.length} client(s): ${WARMUP_CLIENT_IDS.join(', ')}`)
+  for (const clientId of WARMUP_CLIENT_IDS) {
+    loadChunksForClient(clientId)
+      .then(({ chunks }) => console.log(`[warmup] ✓ ${clientId} — ${chunks.length} chunks ready`))
+      .catch(err => console.warn(`[warmup] ✗ ${clientId} — ${err.message}`))
+  }
+}
+
+// ─── Keyword search (secondary signal / fallback) ─────────────────────────────
 function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = null) {
   const subject      = intent === 'definition' ? extractSubject(query) : query.toLowerCase()
   const queryLower   = query.toLowerCase()
   const subjectLower = subject.toLowerCase()
   const subjectWords = subjectLower.split(/\s+/).filter(w => w.length > 1)
-  const queryWords   = queryLower.replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1)
-
-  const urlKeywords = intent === 'url_lookup' ? extractUrlKeywords(query) : []
+  const queryWords   = queryLower.replace(/[^\w\s]/g,' ').split(/\s+/).filter(w => w.length > 1)
+  const urlKeywords  = intent === 'url_lookup' ? extractUrlKeywords(query) : []
 
   let candidateIndices
   if (invertedIndex && subjectWords.length > 0) {
     const wordsToIndex = intent === 'url_lookup' ? urlKeywords : subjectWords
     const sets = wordsToIndex.map(w => invertedIndex.get(w) || new Set())
     if (intent === 'url_lookup') {
-      const urlSet  = invertedIndex.get('url')  || new Set()
-      const linkSet = invertedIndex.get('link') || new Set()
-      const httpSet = invertedIndex.get('http') || new Set()
-      sets.push(urlSet, linkSet, httpSet)
+      sets.push(invertedIndex.get('url') || new Set())
+      sets.push(invertedIndex.get('link') || new Set())
+      sets.push(invertedIndex.get('http') || new Set())
     }
     const union = new Set()
     for (const s of sets) for (const idx of s) union.add(idx)
@@ -404,127 +527,118 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
 
   const source = candidateIndices
     ? [...candidateIndices].map(i => chunks[i]).filter(Boolean)
-    : chunks.slice(0, 100)
+    : chunks.slice(0, 200)
 
-  return source
-    .map(c => {
-      const text    = (c.text || '').toLowerCase()
-      const docType = classifyExtension(c.source_file || '')
-      let score = 0
+  return source.map(c => {
+    const text = (c.text || '').toLowerCase()
+    let score  = 0
 
-      if (intent === 'url_lookup') {
-        if (!text.includes('http')) return { ...c, _score: 0 }
-        const topicMatches = urlKeywords.filter(w => text.includes(w)).length
-        score += topicMatches * 10
-        if (topicMatches === 0) return { ...c, _score: 0 }
-        const topicPhrase = urlKeywords.join(' ')
-        if (text.includes(topicPhrase)) score += 15
-      } else {
-        if (text.includes(subjectLower)) {
-          score += subjectWords.length * 4
-          const defPattern = new RegExp(`${escapeRegex(subjectLower)}\\s*(is|are)\\s*(defined|described|calculated|measured|computed)`, 'i')
-          if (defPattern.test(c.text || '')) score += subjectWords.length * 6
-        }
-
-        score += subjectWords.filter(w => text.includes(w)).length * 2
-
-        if ((docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) && intent === 'definition') {
-          const descPattern = new RegExp(`${escapeRegex(subjectLower)}\\s*(is described as|is defined as):`, 'i')
-          if (descPattern.test(c.text || '')) score += subjectWords.length * 8
-        }
-
-        if (docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) {
-          for (const w of subjectWords) {
-            const kvPattern = new RegExp(`:\\s*${escapeRegex(w)}\\b|\\|\\s*${escapeRegex(w)}\\b`, 'i')
-            if (kvPattern.test(c.text || '')) score += 2
-          }
-        }
-
-        if (text.includes(queryLower)) score += queryWords.length * 2
+    if (intent === 'url_lookup') {
+      if (!text.includes('http')) return { ...c, _kwScore: 0 }
+      const topicMatches = urlKeywords.filter(w => text.includes(w)).length
+      score += topicMatches * 10
+      if (topicMatches === 0) return { ...c, _kwScore: 0 }
+      if (text.includes(urlKeywords.join(' '))) score += 15
+    } else {
+      if (text.includes(subjectLower)) {
+        score += subjectWords.length * 4
+        const defPat = new RegExp(`${escapeRegex(subjectLower)}\\s*(is|are)\\s*(defined|described|calculated|measured|computed)`,'i')
+        if (defPat.test(c.text || '')) score += subjectWords.length * 6
       }
+      score += subjectWords.filter(w => text.includes(w)).length * 2
 
-      return { ...c, _score: score }
-    })
-    .filter(c => c._score > 0)
-    .sort((a, b) => b._score - a._score)
+      const docType = classifyExtension(c.source_file || '')
+      if ((docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) && intent === 'definition') {
+        const descPat = new RegExp(`${escapeRegex(subjectLower)}\\s*(is described as|is defined as):`,'i')
+        if (descPat.test(c.text || '')) score += subjectWords.length * 8
+      }
+      if (text.includes(queryLower)) score += queryWords.length * 2
+    }
+
+    return { ...c, _kwScore: score }
+  })
+    .filter(c => c._kwScore > 0)
+    .sort((a, b) => b._kwScore - a._kwScore)
     .slice(0, topK)
 }
-
 async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
-  const intent          = detectQueryIntent(query)
-  const normalizedQuery = query.toLowerCase().trim().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
-  const keywordTopK     = intent === 'definition' ? Math.min(150, chunks.length) : Math.min(100, chunks.length)
-  const candidates      = keywordSearch(normalizedQuery, chunks, keywordTopK, intent, invertedIndex)
-  const pool            = candidates.length > 0 ? candidates : chunks.slice(0, 100)
-
-  if (pool.length > 0 && pool[0]._score >= KEYWORD_SHORTCIRCUIT_SCORE) {
-    console.log(`[retrieveChunks] keyword short-circuit (score=${pool[0]._score}) — skipping embed`)
-    return pool.slice(0, Math.min(topK, 10))
+  const intent = detectQueryIntent(query)
+  if (intent === 'url_lookup') {
+    const kwResults = keywordSearch(query, chunks, Math.min(topK + 4, 20), intent, invertedIndex)
+    return kwResults.slice(0, topK).map(c => ({ ...c, _score: c._kwScore || 0 }))
+  }
+  const kwTopK      = intent === 'definition' ? Math.min(300, chunks.length) : Math.min(200, chunks.length)
+  const kwCandidates = keywordSearch(query, chunks, kwTopK, intent, invertedIndex)
+  if (kwCandidates.length > 0 && kwCandidates[0]._kwScore >= KEYWORD_SHORTCIRCUIT_SCORE && intent === 'definition') {
+    console.log(`[retrieve] keyword short-circuit score=${kwCandidates[0]._kwScore}`)
+    return kwCandidates.slice(0, Math.min(topK, 10)).map(c => ({ ...c, _score: c._kwScore || 0 }))
   }
 
-  if (intent === 'definition' && pool.length > 0 && pool[0]._score >= 4) {
-    return pool.slice(0, Math.min(topK, 10))
-  }
+  // Working set: use keyword candidates if available, else all chunks (capped)
+  const workingSet = kwCandidates.length > 0 ? kwCandidates : chunks.slice(0, 500)
+  const maxKw      = (kwCandidates[0]?._kwScore) || 1
 
-  if (intent === 'url_lookup' && pool.length > 0) {
-    return pool.slice(0, Math.min(topK, 6))
-  }
+  // ── Embed query with MiniLM sidecar ───────────────────────────────────────
+  const queryVec = await embedQuery(query)
 
-  if (AZURE_EMBED_ENDPOINT && AZURE_EMBED_KEY) {
-    try {
-      const queryVec = await embedQueryAzure(normalizedQuery)
-      if (queryVec) {
-        const poolSlice  = pool.slice(0, EMBED_POOL_LIMIT)
-        const chunkTexts = poolSlice.map(c => (c.text || '').toLowerCase().slice(0, 512))
-        const embeddings = await embedBatch(chunkTexts)
+  if (queryVec) {
+    // Cosine similarity against every chunk in working set
+    const COSINE_WEIGHT  = 0.85
+    const KEYWORD_WEIGHT = 0.15
 
-        const maxKeyword = pool[0]._score || 1
-        const weight     = intent === 'definition'
-          ? { semantic: 0.35, keyword: 0.65 }
-          : { semantic: 0.70, keyword: 0.30 }
+    const scored = workingSet.map(c => {
+      const cosine  = (c.embedding && c.embedding.length > 0)
+        ? cosineSim(queryVec, c.embedding)
+        : 0
+      const kwNorm  = typeof c._kwScore === 'number' ? c._kwScore / maxKw : 0
+      const blended = cosine * COSINE_WEIGHT + kwNorm * KEYWORD_WEIGHT
+      return { ...c, _score: blended, _cosine: cosine, _kwNorm: kwNorm }
+    })
 
-        const scored = poolSlice.map((c, i) => {
-          const chunkVec = embeddings[i]
-          if (!chunkVec) return c
-          const semanticScore = cosineSim(queryVec, chunkVec)
-          const keywordNorm   = typeof c._score === 'number' ? c._score / maxKeyword : 0
-          return { ...c, _score: semanticScore * weight.semantic + keywordNorm * weight.keyword }
+    // For chunks NOT in working set (when working set = kwCandidates): also score
+    // the rest of the corpus lightly so we don't miss semantically related chunks
+    // that keyword filter missed.
+    let fullScored = scored
+    if (kwCandidates.length > 0 && kwCandidates.length < chunks.length) {
+      const kwSet = new Set(kwCandidates.map(c => c.chunk_id || c.text?.slice(0,40)))
+      const rest  = chunks
+        .filter(c => !kwSet.has(c.chunk_id || c.text?.slice(0,40)))
+        .slice(0, 200)
+        .map(c => {
+          const cosine = (c.embedding && c.embedding.length > 0)
+            ? cosineSim(queryVec, c.embedding)
+            : 0
+          return { ...c, _score: cosine * COSINE_WEIGHT, _cosine: cosine }
         })
-        const remainder = pool.slice(EMBED_POOL_LIMIT).map(c => ({
-          ...c,
-          _score: (typeof c._score === 'number' ? c._score / maxKeyword : 0) * weight.keyword,
-        }))
-
-        return [...scored, ...remainder]
-          .sort((a, b) => b._score - a._score)
-          .slice(0, Math.min(topK, 12))
-      }
-    } catch (err) {
-      console.warn('[retrieveChunks] Azure embed failed, keyword fallback:', err.message)
+      fullScored = [...scored, ...rest]
     }
+
+    return fullScored
+      .sort((a, b) => b._score - a._score)
+      .slice(0, Math.min(topK, 12))
   }
 
-  return pool.slice(0, Math.min(topK, 12))
+  // ── Fallback: keyword-only (sidecar unavailable) ──────────────────────────
+  console.warn('[retrieve] MiniLM sidecar unavailable — keyword-only mode')
+  return kwCandidates.slice(0, Math.min(topK, 12)).map(c => ({ ...c, _score: c._kwScore || 0 }))
 }
 
+// ─── Context builder ──────────────────────────────────────────────────────────
 function buildContext(hits) {
-  const seen = new Set()
+  const seen   = new Set()
   const deduped = []
   for (const h of hits) {
-    const fingerprint = (h.text || '').trim().slice(0, 80).toLowerCase()
-    if (!seen.has(fingerprint)) {
-      seen.add(fingerprint)
-      deduped.push(h)
-    }
+    const fp = (h.text || '').trim().slice(0, 80).toLowerCase()
+    if (!seen.has(fp)) { seen.add(fp); deduped.push(h) }
     if (deduped.length >= 6) break
   }
-
   return deduped.map((h, i) => {
-    const charLimit = i === 0 ? 600 : i <= 2 ? 450 : 350
-    const text = (h.text || '').trim().slice(0, charLimit)
-    return `[${i + 1}] ${text}`
+    const limit = i === 0 ? 600 : i <= 2 ? 450 : 350
+    return `[${i + 1}] ${(h.text || '').trim().slice(0, limit)}`
   }).join('\n\n')
 }
+
+// ─── System prompt builder ────────────────────────────────────────────────────
 const SYSTEM_PROMPT_CACHE     = new Map()
 const SYSTEM_PROMPT_CACHE_MAX = 100
 
@@ -534,6 +648,7 @@ function buildDynamicSystemPrompt(hits, intent = 'general') {
   const cacheKey       = `${intent}::${hasSpreadsheet}::${hasPdf}`
   const cached         = SYSTEM_PROMPT_CACHE.get(cacheKey)
   if (cached) return cached
+
   const base = `You are a highly precise document QA assistant.
 
 You MUST follow this reasoning process:
@@ -550,37 +665,93 @@ STRICT RULES:
 
   const intentGuide = {
     definition: `
-DEFINITION TASK: Find lines containing "is described as", "is defined as", or a clear explanation of the exact term asked. Synthesise those lines into a clean 1-2 sentence definition. If no matching definition line exists, say "I couldn't find a definition for that term in your documents." Do NOT define a different term.`,
-
+DEFINITION TASK: Find lines containing "is described as", "is defined as", or a clear explanation of the exact term asked. Synthesise into a clean 1-2 sentence definition. If not found, say "I couldn't find a definition for that term in your documents." Do NOT define a different term.`,
     lookup: `
-LOOKUP TASK: Return the exact value, count, or list from CONTEXT. Report precise numbers — no approximations. If not found, say so.`,
-
+LOOKUP TASK: Return the exact value, count, or list from CONTEXT. Report precise numbers — no approximations.`,
     comparison: `
-COMPARISON TASK: Find information for EACH item and compare them clearly. Note any gaps if one side has less data.`,
-
+COMPARISON TASK: Find information for EACH item and compare them clearly. Note any gaps.`,
     url_lookup: `
-URL TASK: Find and return the full URL that matches the topic. Return the URL on its own line, unbroken, with no spaces. If multiple URLs match, list each on its own line. If none match, say not found.`,
-
+URL TASK: Find and return the full URL that matches the topic. Return the URL on its own line, unbroken. If multiple match, list each. If none, say not found.`,
     general: `
 GENERAL TASK: Synthesise a clear, accurate answer from CONTEXT. Stay focused on what was asked.`,
-  }[intent] || `
-GENERAL TASK: Synthesise a clear, accurate answer from CONTEXT.`
-  const spreadsheetGuide = hasSpreadsheet ? `
-SPREADSHEET DATA: Rows appear as pipe-separated key:value pairs. Lines ending in "is described as: ..." are definition summaries — prioritise these for definition questions. When answering, write a natural sentence from this data — never output raw pipe-delimited rows verbatim.` : ''
+  }[intent] || '\nGENERAL TASK: Synthesise a clear, accurate answer from CONTEXT.'
 
-  const pdfGuide = hasPdf ? `
-PDF DATA: Ignore repeated headers, footers, copyright lines, and page numbers. Focus on substantive content.` : ''
+  const spreadsheetGuide = hasSpreadsheet
+    ? `\nSPREADSHEET DATA: Rows appear as pipe-separated key:value pairs. Lines ending in "is described as: ..." are definition summaries — prioritise these. Write a natural sentence — never output raw pipe-delimited rows verbatim.`
+    : ''
+
+  const pdfGuide = hasPdf
+    ? `\nPDF DATA: Ignore repeated headers, footers, copyright lines, and page numbers.`
+    : ''
 
   const prompt = `${base}${intentGuide}${spreadsheetGuide}${pdfGuide}`
 
-  if (SYSTEM_PROMPT_CACHE.size >= SYSTEM_PROMPT_CACHE_MAX) {
+  if (SYSTEM_PROMPT_CACHE.size >= SYSTEM_PROMPT_CACHE_MAX)
     SYSTEM_PROMPT_CACHE.delete(SYSTEM_PROMPT_CACHE.keys().next().value)
-  }
   SYSTEM_PROMPT_CACHE.set(cacheKey, prompt)
   return prompt
 }
 
-// ─── Mongo helpers ────────────────────────────────────────────────────────────
+// ─── Answer builders ──────────────────────────────────────────────────────────
+async function answerWithPhi4(originalQuery, hits, intent = 'general') {
+  const systemPrompt = buildDynamicSystemPrompt(hits, intent)
+  const context      = buildContext(hits)
+  const subjectHint  =
+    intent === 'definition'
+      ? `\nDefine ONLY this exact term: "${extractSubject(originalQuery)}". Do not define any other term.`
+      : intent === 'url_lookup'
+      ? `\nReturn URL(s) for: "${extractUrlKeywords(originalQuery).join(' ')}".`
+      : ''
+  const userMessage = `CONTEXT:\n${context}${subjectHint}\n\nQuestion: ${originalQuery}`
+  return callPhi4(systemPrompt, userMessage)
+}
+
+function buildFallbackAnswer(query, hits) {
+  if (!hits || hits.length === 0) return "I couldn't find relevant information in your documents for this query."
+  const intent = detectQueryIntent(query)
+
+  if (intent === 'url_lookup') {
+    const urlKeywords = extractUrlKeywords(query)
+    for (const h of hits) {
+      for (const line of (h.text || '').split('\n')) {
+        if (!line.toLowerCase().includes('http')) continue
+        if (urlKeywords.filter(w => line.toLowerCase().includes(w)).length > 0) {
+          const m = line.match(/https?:\/\/\S+/)
+          if (m) return m[0].replace(/\s/g,'')
+        }
+      }
+    }
+  }
+
+  const subject  = extractSubject(query).toLowerCase()
+  const descLine = hits.find(h => {
+    const t = (h.text || '').toLowerCase()
+    return t.includes('is described as') && t.includes(subject)
+  })
+  if (descLine) {
+    const lines = (descLine.text || '').split('\n')
+    const rel   = lines.find(l => l.toLowerCase().includes(subject) && l.toLowerCase().includes('is described as'))
+    if (rel) {
+      const parts = rel.split(/is described as:/i)
+      if (parts[1]) return `${subject.charAt(0).toUpperCase() + subject.slice(1)} is ${parts[1].trim().slice(0, 300)}`
+    }
+  }
+
+  const best    = hits.find(h => (h.text || '').toLowerCase().includes(subject)) || hits[0]
+  const snippet = (best.text || '')
+    .replace(/Field\d+:\s*/gi,'').replace(/\|\s*Field\d+\b/gi,'')
+    .split('\n')
+    .filter(l => !/(copyright|all rights reserved|proprietary|confidential|redistribution)/i.test(l))
+    .join('\n').slice(0, 350).trim()
+  return snippet || "I couldn't find that specific information in your documents."
+}
+
+function generateTitle(query) {
+  const cleaned = query.trim().replace(/[?!.]+$/,'')
+  return cleaned.length > 50 ? cleaned.slice(0,50) + '…' : cleaned
+}
+
+// ─── MongoDB helpers ──────────────────────────────────────────────────────────
 let db = null
 async function getDb() {
   if (db) return db
@@ -610,8 +781,8 @@ function getCached(apiKey) {
   if (Date.now() - entry.cachedAt > CACHE_TTL_MS) { CLIENT_CACHE.delete(apiKey); return null }
   return entry
 }
-function setCache(apiKey, data) { CLIENT_CACHE.set(apiKey, { ...data, cachedAt: Date.now() }) }
-function evictCache(apiKey)     { if (apiKey) CLIENT_CACHE.delete(apiKey) }
+function setCache(apiKey, data)  { CLIENT_CACHE.set(apiKey, { ...data, cachedAt: Date.now() }) }
+function evictCache(apiKey)      { if (apiKey) CLIENT_CACHE.delete(apiKey) }
 
 async function verifyApiKey(apiKey) {
   if (!apiKey || !apiKey.startsWith('rak_')) return null
@@ -658,349 +829,17 @@ function requireAdminKey(req, res, next) {
   next()
 }
 
-function generateApiKey() {
-  return `rak_${crypto.randomBytes(32).toString('hex')}`
-}
-
-// ─── Document extraction ──────────────────────────────────────────────────────
-async function extractPdf(buffer)  { const r = await pdfParse(buffer); return r.text || '' }
-async function extractWord(buffer) { const r = await mammoth.extractRawText({ buffer }); return r.value || '' }
-
-function extractSpreadsheet(buffer) {
-  const workbook = XLSX.read(buffer, { type: 'buffer' })
-  const parts    = []
-  for (const sheetName of workbook.SheetNames) {
-    const sheet   = workbook.Sheets[sheetName]
-    const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: '', header: 1 })
-    if (!rawRows.length) continue
-    parts.push(`=== Sheet: ${sheetName} ===`)
-    let headerRowIdx = 0
-    for (let i = 0; i < Math.min(10, rawRows.length); i++) {
-      if (rawRows[i].some(cell => String(cell).trim() !== '')) { headerRowIdx = i; break }
-    }
-    const headers = rawRows[headerRowIdx].map(h => String(h).trim())
-    for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
-      const row = rawRows[i]
-      if (!row.some(cell => String(cell).trim() !== '')) continue
-      const pairs = [], values = []
-      for (let j = 0; j < Math.max(headers.length, row.length); j++) {
-        const val = String(row[j] || '').trim()
-        if (!val) continue
-        const key = headers[j] && headers[j] !== '' ? headers[j] : `Field${j + 1}`
-        pairs.push(`${key}: ${val}`)
-        values.push(val)
-      }
-      if (pairs.length > 0) {
-        parts.push(pairs.join(' | '))
-        if (values.length >= 2) parts.push(`${values[0]} is described as: ${pairs.slice(1).join(', ')}`)
-      }
-    }
-    parts.push('')
-    parts.push('[All values in this sheet:]')
-    for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
-      const row = rawRows[i]
-      const rowValues = row.map((cell, j) => {
-        const val = String(cell || '').trim()
-        if (!val) return ''
-        const key = headers[j] && headers[j] !== '' ? headers[j] : `Field${j + 1}`
-        return `${val} (${key})`
-      }).filter(Boolean)
-      if (rowValues.length) parts.push(rowValues.join(', '))
-    }
-  }
-  return parts.join('\n')
-}
-
-function extractCsv(buffer, delimiter = ',') {
-  const text   = buffer.toString('utf-8')
-  const result = Papa.parse(text, { header: true, skipEmptyLines: true, delimiter })
-  if (!result.data?.length) return text
-  return result.data.map((row, i) => `Row ${i + 1}: ` + Object.entries(row).map(([k, v]) => `${k}=${v}`).join(' | ')).join('\n')
-}
-
-async function extractOffice(buffer) {
-  return new Promise((resolve, reject) => {
-    parseOffice(buffer, (text, err) => {
-      if (err) reject(err)
-      else resolve(text || '')
-    }, { outputErrorToConsole: false })
-  })
-}
-
-function extractHtml(buffer) {
-  const root = htmlParse(buffer.toString('utf-8'))
-  root.querySelectorAll('script, style').forEach(n => n.remove())
-  return root.structuredText || root.innerText || root.rawText || ''
-}
-
-function extractXml(buffer)  { return buffer.toString('utf-8').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() }
-function extractJson(buffer) { try { return JSON.stringify(JSON.parse(buffer.toString('utf-8')), null, 2) } catch { return buffer.toString('utf-8') } }
-function extractJsonl(buffer) {
-  return buffer.toString('utf-8').split('\n').filter(Boolean)
-    .map(line => { try { return JSON.stringify(JSON.parse(line)) } catch { return line } })
-    .join('\n')
-}
-function extractYaml(buffer) { try { return JSON.stringify(yaml.load(buffer.toString('utf-8')), null, 2) } catch { return buffer.toString('utf-8') } }
-
-async function extractEml(buffer) {
-  const parsed = await simpleParser(buffer)
-  const parts  = []
-  if (parsed.subject) parts.push(`Subject: ${parsed.subject}`)
-  if (parsed.from)    parts.push(`From: ${parsed.from.text}`)
-  if (parsed.to)      parts.push(`To: ${parsed.to.text}`)
-  if (parsed.date)    parts.push(`Date: ${parsed.date}`)
-  if (parsed.text)    parts.push(`\n${parsed.text}`)
-  else if (parsed.html) parts.push(`\n${extractHtml(Buffer.from(parsed.html))}`)
-  return parts.join('\n')
-}
-
-async function extractEpub(buffer) {
-  return new Promise(resolve => {
-    parseOffice(buffer, (text, err) => {
-      resolve(err || !text ? '[EPUB: convert to PDF for best results]' : text)
-    }, { outputErrorToConsole: false })
-  })
-}
-
-async function extractTextFromBuffer(buffer, fileName) {
-  const ext = ('.' + fileName.split('.').pop()).toLowerCase()
-  if (ext === '.pdf')                           return extractPdf(buffer)
-  if (ext === '.docx' || ext === '.doc')        return extractWord(buffer)
-  if (ext === '.odt'  || ext === '.rtf')        return extractOffice(buffer)
-  if (['.xlsx','.xls','.ods'].includes(ext))    return extractSpreadsheet(buffer)
-  if (ext === '.csv')                           return extractCsv(buffer, ',')
-  if (ext === '.tsv')                           return extractCsv(buffer, '\t')
-  if (ext === '.pptx' || ext === '.ppt')        return extractOffice(buffer)
-  if (ext === '.html' || ext === '.htm')        return extractHtml(buffer)
-  if (ext === '.xml')                           return extractXml(buffer)
-  if (['.md','.markdown','.rst'].includes(ext)) return buffer.toString('utf-8')
-  if (ext === '.json')                          return extractJson(buffer)
-  if (ext === '.jsonl')                         return extractJsonl(buffer)
-  if (ext === '.yaml' || ext === '.yml')        return extractYaml(buffer)
-  if (ext === '.toml')                          return buffer.toString('utf-8')
-  const plainText = new Set(['.txt','.py','.js','.ts','.jsx','.tsx','.java','.cpp','.c','.h','.cs','.go','.rb','.php','.swift','.kt','.r','.sql','.sh','.bash','.ps1'])
-  if (plainText.has(ext))                       return buffer.toString('utf-8')
-  if (ext === '.epub')                          return extractEpub(buffer)
-  if (ext === '.eml')                           return extractEml(buffer)
-  return ''
-}
-
-function chunkText(text, sourceFile) {
-  const chunks = []
-  let index    = 0
-  const lines  = text.replace(/\r\n/g, '\n').split('\n').map(l => l.trim()).filter(l => l.length > 0)
-  let buffer   = []
-  for (const line of lines) {
-    const projectedLength = buffer.join('\n').length + (buffer.length ? 1 : 0) + line.length
-    if (buffer.length > 0 && projectedLength > CHUNK_SIZE) {
-      const chunkTextStr = buffer.join('\n')
-      if (chunkTextStr.length > 30) chunks.push({ text: chunkTextStr, source_file: sourceFile, chunk_index: index++, embedding: [] })
-      buffer = buffer.slice(-CHUNK_OVERLAP)
-    }
-    buffer.push(line)
-  }
-  if (buffer.length > 0) {
-    const chunkTextStr = buffer.join('\n')
-    if (chunkTextStr.length > 30) chunks.push({ text: chunkTextStr, source_file: sourceFile, chunk_index: index++, embedding: [] })
-  }
-  return chunks
-}
-
-async function downloadBlobAsBuffer(containerClient, blobName) {
-  const download = await containerClient.getBlobClient(blobName).download()
-  const parts    = []
-  for await (const chunk of download.readableStreamBody)
-    parts.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
-  return Buffer.concat(parts)
-}
-
-const BLOB_CONCURRENCY = parseInt(process.env.BLOB_CONCURRENCY || '8', 10)
-
-async function _doLoadChunks(clientId) {
-  if (!blobServiceClient) throw new Error('AZURE_CONNECTION_STRING not set')
-  const containerClient = blobServiceClient.getContainerClient(AZURE_CONTAINER_NAME)
-  const prefix          = `${RAW_PREFIX}/${clientId}/`
-
-  const blobNames = []
-  for await (const blob of containerClient.listBlobsFlat({ prefix })) {
-    const fileName = blob.name.split('/').pop()
-    const ext      = ('.' + fileName.split('.').pop()).toLowerCase()
-    if (SUPPORTED_EXTENSIONS.has(ext)) blobNames.push(blob.name)
-  }
-
-  const allChunks = []
-  for (let i = 0; i < blobNames.length; i += BLOB_CONCURRENCY) {
-    const batch   = blobNames.slice(i, i + BLOB_CONCURRENCY)
-    const results = await Promise.allSettled(
-      batch.map(async (blobName) => {
-        const fileName = blobName.split('/').pop()
-        const buffer   = await downloadBlobAsBuffer(containerClient, blobName)
-        const text     = await extractTextFromBuffer(buffer, fileName)
-        if (!text?.trim()) return []
-        return chunkText(text, fileName)
-      })
-    )
-    for (const result of results) {
-      if (result.status === 'fulfilled') allChunks.push(...result.value)
-      else console.warn(`[loadChunks] blob failed:`, result.reason?.message)
-    }
-  }
-  return allChunks
-}
-
-const CHUNK_CACHE     = new Map()
-const CHUNK_CACHE_TTL = parseInt(process.env.CHUNK_CACHE_TTL_MS || '300000', 10)
-
-async function loadChunksForClient(clientId) {
-  const now    = Date.now()
-  const cached = CHUNK_CACHE.get(clientId)
-
-  if (cached && cached.chunks) {
-    const isStale = now - cached.ts > CHUNK_CACHE_TTL
-    if (!isStale) {
-      return { chunks: cached.chunks, invertedIndex: cached.invertedIndex }
-    }
-    if (!cached.loading) {
-      console.log(`[chunkCache] Serving stale cache for ${clientId}, refreshing in background`)
-      const refreshPromise = _doLoadChunks(clientId)
-        .then(chunks => {
-          const invertedIndex = buildInvertedIndex(chunks)
-          CHUNK_CACHE.set(clientId, { chunks, invertedIndex, ts: Date.now(), loading: null })
-          console.log(`[chunkCache] Background refresh done for ${clientId}: ${chunks.length} chunks`)
-          return chunks
-        })
-        .catch(err => {
-          const existing = CHUNK_CACHE.get(clientId)
-          CHUNK_CACHE.set(clientId, { ...existing, loading: null })
-          console.warn(`[chunkCache] Background refresh failed for ${clientId}: ${err.message}`)
-        })
-      CHUNK_CACHE.set(clientId, { ...cached, loading: refreshPromise })
-      return { chunks: cached.chunks, invertedIndex: cached.invertedIndex }
-    }
-    return { chunks: cached.chunks, invertedIndex: cached.invertedIndex }
-  }
-
-  if (cached && cached.loading) {
-    const chunks = await cached.loading
-    const entry  = CHUNK_CACHE.get(clientId)
-    return { chunks: chunks || entry?.chunks || [], invertedIndex: entry?.invertedIndex || null }
-  }
-
-  const loadPromise = _doLoadChunks(clientId)
-    .then(chunks => {
-      const invertedIndex = buildInvertedIndex(chunks)
-      CHUNK_CACHE.set(clientId, { chunks, invertedIndex, ts: Date.now(), loading: null })
-      console.log(`[chunkCache] Loaded ${chunks.length} chunks + built inverted index for ${clientId}`)
-      return chunks
-    })
-    .catch(err => {
-      CHUNK_CACHE.set(clientId, { chunks: null, invertedIndex: null, ts: 0, loading: null })
-      throw err
-    })
-
-  CHUNK_CACHE.set(clientId, { chunks: null, invertedIndex: null, ts: 0, loading: loadPromise })
-  const chunks = await loadPromise
-  const entry  = CHUNK_CACHE.get(clientId)
-  return { chunks, invertedIndex: entry?.invertedIndex || null }
-}
-
-function invalidateChunkCache(clientId) {
-  CHUNK_CACHE.delete(clientId)
-  console.log(`[chunkCache] Invalidated cache for client: ${clientId}`)
-}
-
-function warmupChunkCaches() {
-  if (!WARMUP_CLIENT_IDS.length || !blobServiceClient) return
-  console.log(`[warmup] Pre-loading chunks for ${WARMUP_CLIENT_IDS.length} client(s): ${WARMUP_CLIENT_IDS.join(', ')}`)
-  for (const clientId of WARMUP_CLIENT_IDS) {
-    loadChunksForClient(clientId)
-      .then(({ chunks }) => console.log(`[warmup] ✓ ${clientId} — ${chunks.length} chunks ready`))
-      .catch(err => console.warn(`[warmup] ✗ ${clientId} — ${err.message}`))
-  }
-}
-
-// ─── Answer builder ────────────────────────────────────────────────────────────
-async function answerWithPhi4(originalQuery, hits, intent = 'general') {
-  const systemPrompt = buildDynamicSystemPrompt(hits, intent)
-  const context      = buildContext(hits)
-
-  const subjectHint  = intent === 'definition'
-    ? `\nDefine ONLY this exact term: "${extractSubject(originalQuery)}". Do not define any other term.`
-    : intent === 'url_lookup'
-    ? `\nReturn URL(s) for: "${extractUrlKeywords(originalQuery).join(' ')}".`
-    : ''
-
-  const userMessage = `CONTEXT:\n${context}${subjectHint}\n\nQuestion: ${originalQuery}`
-  return callPhi4(systemPrompt, userMessage)
-}
-
-function buildFallbackAnswer(query, hits) {
-  if (!hits || hits.length === 0) {
-    return "I couldn't find relevant information in your documents for this query."
-  }
-  const intent = detectQueryIntent(query)
-
-  if (intent === 'url_lookup') {
-    const urlKeywords = extractUrlKeywords(query)
-    for (const h of hits) {
-      const lines = (h.text || '').split('\n')
-      for (const line of lines) {
-        if (!line.toLowerCase().includes('http')) continue
-        const lineLower = line.toLowerCase()
-        const matches = urlKeywords.filter(w => lineLower.includes(w)).length
-        if (matches > 0) {
-          const urlMatch = line.match(/https?:\/\/\S+/)
-          if (urlMatch) return urlMatch[0].replace(/\s/g, '')
-        }
-      }
-    }
-  }
-
-  const subject = extractSubject(query).toLowerCase()
-
-  const descLine = hits.find(h => {
-    const t = (h.text || '').toLowerCase()
-    return t.includes('is described as') && t.includes(subject)
-  })
-  if (descLine) {
-    const lines = (descLine.text || '').split('\n')
-    const relevantLine = lines.find(l =>
-      l.toLowerCase().includes(subject) && l.toLowerCase().includes('is described as')
-    )
-    if (relevantLine) {
-      const parts = relevantLine.split(/is described as:/i)
-      if (parts[1]) {
-        return `${subject.charAt(0).toUpperCase() + subject.slice(1)} is ${parts[1].trim().slice(0, 300)}`
-      }
-    }
-  }
-
-  const best = hits.find(h => (h.text || '').toLowerCase().includes(subject)) || hits[0]
-
-  const snippet = (best.text || '')
-    .replace(/Field\d+:\s*/gi, '')
-    .replace(/\|\s*Field\d+\b/gi, '')
-    .split('\n')
-    .filter(l => !/(copyright|all rights reserved|proprietary|confidential|redistribution)/i.test(l))
-    .join('\n')
-    .slice(0, 350)
-    .trim()
-
-  return snippet || "I couldn't find that specific information in your documents."
-}
-
-function generateTitle(query) {
-  const cleaned = query.trim().replace(/[?!.]+$/, '')
-  return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned
-}
+function generateApiKey() { return `rak_${crypto.randomBytes(32).toString('hex')}` }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
+
 app.get('/health', (req, res) => res.json({
   ok:               true,
   service:          'ask-data',
-  model:            'ask-data-response-model',
-  embeddings:       AZURE_EMBED_ENDPOINT ? 'azure-anurit' : 'keyword-only',
-  chunkCacheSize:   CHUNK_CACHE.size,
+  retrievalMode:    'minilm-vector-cosine',
+  embeddingModel:   'all-MiniLM-L6-v2',
+  sidecarUrl:       MINILM_SIDECAR_URL,
+  vectorCacheSize:  CHUNK_CACHE.size,
   promptCacheSize:  SYSTEM_PROMPT_CACHE.size,
   responseCacheSize: RESPONSE_CACHE.size,
   phiCircuitOpen:   phiCircuitOpen(),
@@ -1021,11 +860,8 @@ app.post('/admin/clients', requireAdminKey, async (req, res) => {
   try {
     let { name, clientId, apiKey } = req.body
     if (!name || !clientId) return res.status(400).json({ error: 'name and clientId are required' })
-    if (!apiKey) {
-      apiKey = generateApiKey()
-    } else if (!apiKey.startsWith('rak_')) {
-      return res.status(400).json({ error: 'apiKey must start with "rak_"' })
-    }
+    if (!apiKey) { apiKey = generateApiKey() }
+    else if (!apiKey.startsWith('rak_')) return res.status(400).json({ error: 'apiKey must start with "rak_"' })
     const database = await getDb()
     const col      = database.collection('clients')
     const existing = await col.findOne({ $or: [{ clientId }, { apiKey }] })
@@ -1117,7 +953,7 @@ app.post('/admin/clients/:clientId/invalidate-cache', requireAdminKey, (req, res
   invalidateChunkCache(req.params.clientId)
   SYSTEM_PROMPT_CACHE.clear()
   RESPONSE_CACHE.clear()
-  res.json({ ok: true, clientId: req.params.clientId, message: 'Chunk + prompt + response cache invalidated' })
+  res.json({ ok: true, clientId: req.params.clientId, message: 'Vector + prompt + response cache invalidated' })
 })
 
 app.post('/client/login', async (req, res) => {
@@ -1194,7 +1030,11 @@ app.post('/chat/conversations/rename', requireClientKey, async (req, res) => {
     const { conversationId, title } = req.body
     if (!conversationId || !title) return res.status(400).json({ error: 'conversationId and title are required' })
     const database = await getChatDb()
-    const result   = await database.collection('conversations').findOneAndUpdate({ _id: new ObjectId(conversationId), clientId: req.client.clientId }, { $set: { title: title.trim(), updatedAt: new Date() } }, { returnDocument: 'after', projection: { messages: 0 } })
+    const result   = await database.collection('conversations').findOneAndUpdate(
+      { _id: new ObjectId(conversationId), clientId: req.client.clientId },
+      { $set: { title: title.trim(), updatedAt: new Date() } },
+      { returnDocument: 'after', projection: { messages: 0 } }
+    )
     if (!result) return res.status(404).json({ error: 'Conversation not found' })
     res.json(result)
   } catch (err) { res.status(500).json({ error: err.message }) }
@@ -1217,17 +1057,18 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
     const { query, topK = 6, conversationId } = req.body
     if (!query?.trim()) return res.status(400).json({ error: 'query is required' })
     const { clientId, name } = req.client
-
     const intent = detectQueryIntent(query.trim())
+
     if (intent === 'greeting') {
       return res.json({
-        answer: "Hello! I'm your document assistant. Ask me anything about your data.",
-        sources: [],
+        answer:         "Hello! I'm your document assistant. Ask me anything about your data.",
+        sources:        [],
         conversationId: conversationId || null,
-        client: { clientId, name },
+        client:         { clientId, name },
       })
     }
 
+    // ── Response cache ──────────────────────────────────────────────────────
     const cacheKey = getCacheKey(clientId, query)
     const cached   = responseCacheGet(cacheKey)
     if (cached) {
@@ -1235,8 +1076,9 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       return res.json({ ...cached, cached: true, conversationId: conversationId || cached.conversationId })
     }
 
+    // ── In-flight dedup ─────────────────────────────────────────────────────
     if (IN_FLIGHT.has(cacheKey)) {
-      console.log(`[dedup] Waiting for in-flight request: "${query.slice(0, 50)}"`)
+      console.log(`[dedup] Waiting for in-flight: "${query.slice(0, 50)}"`)
       try {
         const result = await IN_FLIGHT.get(cacheKey)
         return res.json({ ...result, conversationId: conversationId || result.conversationId })
@@ -1244,28 +1086,31 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
     }
 
     const requestPromise = (async () => {
+      // Load pre-embedded vectors from blob (cached after first call)
       const { chunks, invertedIndex } = await loadChunksForClient(clientId)
 
       if (chunks.length === 0) {
         return {
-          answer: 'No documents found for your account. Please ensure your documents have been ingested first.',
-          sources: [],
+          answer:         'No documents found for your account. Please ensure your documents have been ingested first.',
+          sources:        [],
           conversationId: conversationId || null,
-          client: { clientId, name },
+          client:         { clientId, name },
         }
       }
 
+      // Cosine similarity retrieval (primary) + keyword (secondary)
       const hits = await retrieveChunks(query.trim(), chunks, Math.min(topK, 20), invertedIndex)
 
       if (hits.length === 0) {
         return {
-          answer: "I couldn't find that in your documents. Try rephrasing your question.",
-          sources: [],
+          answer:         "I couldn't find that in your documents. Try rephrasing your question.",
+          sources:        [],
           conversationId: conversationId || null,
-          client: { clientId, name },
+          client:         { clientId, name },
         }
       }
 
+      // Phi-4 answer generation
       let rawAnswer
       try {
         rawAnswer = await Promise.race([
@@ -1275,7 +1120,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
           ),
         ])
       } catch (err) {
-        console.warn(`⚠️ [phi4] Using fallback answer: ${err.message}`)
+        console.warn(`⚠️ [phi4] Fallback answer: ${err.message}`)
         rawAnswer = buildFallbackAnswer(query.trim(), hits)
       }
 
@@ -1284,14 +1129,15 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         .replace(/\|\s*Field\d+\b/gi, '')
         .trim()
 
-      const answer  = cleanAnswer
       const sources = hits.map(h => ({
         source_file: h.source_file  || 'unknown',
         chunk_index: h.chunk_index  ?? 0,
         score:       typeof h._score === 'number' ? parseFloat(h._score.toFixed(4)) : null,
+        cosine:      typeof h._cosine === 'number' ? parseFloat(h._cosine.toFixed(4)) : null,
         preview:     (h.text || '').slice(0, 300),
       }))
 
+      // Persist conversation to MongoDB
       let activeConversationId = conversationId || null
       try {
         const chatDatabase = await getChatDb()
@@ -1300,49 +1146,43 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         const userMsg      = { role: 'user',      content: query.trim(), timestamp: now }
         const assistantMsg = {
           role:      'assistant',
-          content:   answer,
+          content:   cleanAnswer,
           sources:   sources.map(s => ({ source_file: s.source_file, score: s.score })),
           timestamp: now,
         }
-
         if (activeConversationId) {
           const updated = await col.findOneAndUpdate(
             { _id: new ObjectId(activeConversationId), clientId },
             { $push: { messages: { $each: [userMsg, assistantMsg] } }, $set: { updatedAt: now } },
             { returnDocument: 'after', projection: { _id: 1 } }
           )
-          if (!updated) {
-            console.warn(`[chat/message] conversationId ${activeConversationId} not found for ${clientId}, creating new`)
-            activeConversationId = null
-          }
+          if (!updated) activeConversationId = null
         }
-
         if (!activeConversationId) {
-          const title  = generateTitle(query.trim())
-          const result = await col.insertOne({ clientId, title, messages: [userMsg, assistantMsg], createdAt: now, updatedAt: now })
+          const result = await col.insertOne({
+            clientId,
+            title:     generateTitle(query.trim()),
+            messages:  [userMsg, assistantMsg],
+            createdAt: now,
+            updatedAt: now,
+          })
           activeConversationId = result.insertedId.toString()
         }
       } catch (saveErr) {
         console.warn('[chat/message] Failed to save conversation:', saveErr.message)
       }
 
-      return { answer, sources, conversationId: activeConversationId, client: { clientId, name } }
+      return { answer: cleanAnswer, sources, conversationId: activeConversationId, client: { clientId, name } }
     })()
 
     IN_FLIGHT.set(cacheKey, requestPromise)
-
     let result
-    try {
-      result = await requestPromise
-    } finally {
-      IN_FLIGHT.delete(cacheKey)
-    }
-    if (result.answer && result.answer.length > 10) {
-      responseCacheSet(cacheKey, result)
-    }
+    try { result = await requestPromise }
+    finally { IN_FLIGHT.delete(cacheKey) }
+
+    if (result.answer && result.answer.length > 10) responseCacheSet(cacheKey, result)
 
     res.json(result)
-
   } catch (err) {
     console.error('[chat/message] Error:', err.message)
     if (!res.headersSent) res.status(500).json({ error: err.message })
@@ -1354,16 +1194,20 @@ app.use((err, req, res, next) => {
   if (!res.headersSent) res.status(500).json({ error: 'An unexpected error occurred. Please try again.' })
 })
 
+// ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => {
   console.log(`rag-client-auth running on port ${PORT}`)
-  console.log(`Model: ${PHI4_MODEL} | Endpoint: ${PHI4_ENDPOINT ? 'configured' : 'MISSING'}`)
-  console.log(`Phi-4 timeout: ${PHI4_TIMEOUT_MS}ms | Embed timeout: ${EMBED_TIMEOUT_MS}ms`)
-  console.log(`Chunk cache TTL: ${CHUNK_CACHE_TTL}ms | Embed pool limit: ${EMBED_POOL_LIMIT}`)
-  console.log(`Request timeout: ${REQUEST_TIMEOUT_MS}ms | Keyword short-circuit score: ${KEYWORD_SHORTCIRCUIT_SCORE}`)
+  console.log(`Retrieval mode : MiniLM vector cosine search`)
+  console.log(`MiniLM sidecar : ${MINILM_SIDECAR_URL}`)
+  console.log(`Phi-4 model    : ${PHI4_MODEL} | Endpoint: ${PHI4_ENDPOINT ? 'configured' : 'MISSING'}`)
+  console.log(`Phi-4 timeout  : ${PHI4_TIMEOUT_MS}ms`)
+  console.log(`Embed timeout  : ${EMBED_TIMEOUT_MS}ms`)
+  console.log(`Vector cache TTL: ${CHUNK_CACHE_TTL}ms`)
   console.log(`Blob concurrency: ${BLOB_CONCURRENCY}`)
-  console.log(`Azure blob client: ${blobServiceClient ? 'singleton ready' : 'MISSING connection string'}`)
+  console.log(`Azure blob     : ${blobServiceClient ? 'singleton ready' : 'MISSING connection string'}`)
   startApiKeyHealthChecker()
   warmupChunkCaches()
 })
+
 module.exports = app
