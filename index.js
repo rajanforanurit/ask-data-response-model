@@ -574,124 +574,56 @@ function buildDynamicSystemPrompt(hits, intent = 'general') {
   const cached = SYSTEM_PROMPT_CACHE.get(cacheKey)
   if (cached) return cached
 
-  const intentInstructions = {
-    definition: `ANSWER STRATEGY — DEFINITION QUERY:
-The user wants the definition or meaning of a specific term or metric.
-1. Scan ALL excerpts for the EXACT term. Look for sentences like "X is defined as", "X is described as", "X is calculated as", or any sentence that directly explains what the term IS.
-2. Write a clean, complete answer in plain English. Use 1–3 sentences. Do NOT copy or paste raw data rows.
-3. If the term has a formula, state it naturally: e.g. "It is calculated by dividing X by Y."
-4. If multiple excerpts define the same term, combine them into one coherent answer.
-5. NEVER output pipe-delimited rows, "is described as:" lines, or raw serialized data as your answer.`,
+  const INTENT_STRATEGY = {
+  definition: `TASK: Define the exact term asked. Write 1–3 natural English sentences. If there's a formula, state it plainly (e.g. "calculated by dividing X by Y"). Combine multiple excerpts if needed.`,
+  lookup:     `TASK: Find and report the exact value or list asked for. State clearly what it represents.`,
+  comparison: `TASK: Compare the items asked. Write a structured but natural summary — similarities and differences.`,
+  url_lookup: `TASK: Return the full URL that matches the topic, on its own line, unmodified. If none found, say so.`,
+  general:    `TASK: Find information that directly answers the question and write a clear, complete summary.`,
+}
 
-    lookup: `ANSWER STRATEGY — LOOKUP QUERY:
-The user wants a specific value, count, or list from the data.
-1. Find the exact records or values that match the query.
-2. Report precise values in plain English. Do NOT output raw data rows verbatim.
-3. State clearly what the value represents.`,
+const TYPE_NOTES = {
+  [DOC_TYPE.SPREADSHEET]:  `Spreadsheet data is serialized as pipe-delimited rows and "X is described as: …" lines — these are internal representations. Read them to understand meaning; never reproduce them verbatim.`,
+  [DOC_TYPE.DATA]:         `JSON/YAML/CSV fields may be nested ("parent.child: value"). Read for meaning; never dump raw key:value pairs.`,
+  [DOC_TYPE.PDF]:          `PDF text may have minor extraction artefacts. Read numbers and dates exactly as shown; ignore headers, footers, and page numbers.`,
+  [DOC_TYPE.WORD]:         `Word docs contain prose, lists, and tables. Headings show section structure. Quote policy/definition statements accurately.`,
+  [DOC_TYPE.PRESENTATION]: `Slide titles are section headers; bullets are detail. Do not infer beyond what the slide states.`,
+  [DOC_TYPE.CODE]:         `Read code literally — function/variable names and comments all matter. Describe what code does in plain English unless code output is requested.`,
+  [DOC_TYPE.TEXT]:         `Markdown formatting (##, **, -) indicates structure. Lists represent discrete facts or steps.`,
+  [DOC_TYPE.EMAIL]:        `Attribute statements to their sender. Dates and times are as stated in the email header.`,
+  [DOC_TYPE.WEB]:          `Focus on main body content; ignore repetitive navigation text. Include URLs exactly as written.`,
+}
 
-    comparison: `ANSWER STRATEGY — COMPARISON QUERY:
-The user wants to compare two or more items.
-1. Find all relevant information for EACH item.
-2. Write a clear, structured comparison in plain English — similarities and differences.
-3. Do NOT output raw data rows. Synthesise into readable prose or a short list.`,
+const BASE = `You are a document assistant. Answer ONLY from the provided context.
 
-    url_lookup: `ANSWER STRATEGY — URL LOOKUP QUERY:
-The user is asking for a URL or link.
-1. Find and return the FULL URL that matches the topic exactly as it appears — no truncation, no spaces.
-2. If none match, say "I couldn't find a URL for that report in your documents."`,
+RULES (apply once, always):
+- Write in natural English sentences. Never output raw pipe-delimited rows, "is described as:" lines, or dumps of key:value pairs.
+- Use only information present in the context. Never invent or assume.
+- Match terms case-insensitively.
+- No citation markers ([1], [2]…). No padding or caveats.
+- If a URL appears, return it exactly as-is on its own line.
+- If the answer is genuinely absent: "I couldn't find that in your documents."
+- Keep answers concise — 1–4 sentences unless a list or formula is needed.`
 
-    general: `ANSWER STRATEGY — GENERAL QUERY:
-Scan all excerpts carefully. Find information that directly answers the question. Write a clear, complete answer in plain English. Do NOT output raw data rows or pipe-delimited text. Synthesise the information naturally.`,
-  }[intent] || `ANSWER STRATEGY — GENERAL QUERY:
-Scan all excerpts carefully. Write a clear, complete answer in plain English. Do NOT copy raw data rows.`
+function buildDynamicSystemPrompt(hits, intent = 'general') {
+  const types = [...new Set(hits.map(h => classifyExtension(h.source_file || '')))]
+  const typeNotes = types.map(t => TYPE_NOTES[t]).filter(Boolean)
 
-  const base = `You are a knowledgeable document assistant. Answer questions ONLY using the document context provided.
+  const cacheKey = `${intent}::${types.sort().join(',')}`
+  const cached = SYSTEM_PROMPT_CACHE.get(cacheKey)
+  if (cached) return cached
 
-CRITICAL OUTPUT RULES — APPLY TO EVERY RESPONSE:
-1. NEVER copy or paste raw serialized data into your answer. This includes pipe-delimited rows (e.g. "Field1: X | Field2: Y"), "is described as:" lines, truncated data rows, or any chunk of raw structured data.
-2. ALWAYS write your answer in clean, natural English sentences — like a knowledgeable colleague explaining something.
-3. Answer ONLY from the context. Never invent or assume information not present.
-4. Search the ENTIRE context before concluding something is absent.
-5. Case-insensitive matching: "applicant count", "Applicant Count", "APPLICANT COUNT" are identical.
-6. If information is truly absent after thorough search, say: "I couldn't find specific information about that in your documents."
-7. Do NOT add citation markers like [1], [2], [3].
-8. Answer only what was asked. No padding or unnecessary caveats.
-9. If a URL is present, return the FULL URL exactly as-is on its own line with no line breaks or spaces inserted.
-10. Keep answers concise — typically 1–4 sentences unless a list or formula is required.
+  const parts = [
+    BASE,
+    INTENT_STRATEGY[intent] || INTENT_STRATEGY.general,
+  ]
+  if (typeNotes.length) parts.push('SOURCE NOTES:\n' + typeNotes.map((n, i) => `${i + 1}. ${n}`).join('\n'))
+  if (types.length > 1) parts.push(`Context spans ${types.length} source types — apply the relevant note per excerpt.`)
 
-${intentInstructions}`
+  const prompt = parts.join('\n\n')
 
-  const typeBlocks = []
-
-  if (spreadsheets.length > 0) {
-    typeBlocks.push(`SPREADSHEET DATA INTERPRETATION:
-The context contains spreadsheet data serialized as pipe-delimited key:value rows and "X is described as: ..." summary lines. These are internal data representations — do NOT reproduce them in your answer.
-Instead:
-- Read these rows to understand what the data says.
-- Extract the meaning and write it out in plain English.
-- For definition queries: find the term, read its description/formula, then explain it naturally in a sentence or two.
-- For formula queries: state the formula in plain English (e.g. "calculated by dividing A by B") or as a simple equation.
-- Never output "X is described as: ..." verbatim. Rewrite it as a natural sentence.`)
-  }
-
-  if (dataFiles.length > 0) {
-    typeBlocks.push(`STRUCTURED DATA RULES (JSON/YAML/CSV):
-- Fields and values may be nested. Treat "parent.child: value" as a nested attribute.
-- Read the data to understand meaning. Write answers in plain English — never dump raw key:value pairs.`)
-  }
-
-  if (pdfDocs.length > 0) {
-    typeBlocks.push(`PDF RULES:
-- Content is extracted from PDF pages. Minor formatting artefacts may exist.
-- Read numbers, dates, and figures exactly as they appear.
-- Ignore repeated headers, footers, copyright lines, and page numbers. Focus on substantive content.`)
-  }
-
-  if (wordDocs.length > 0) {
-    typeBlocks.push(`WORD DOCUMENT RULES:
-- Context contains prose, lists, and tables. Headings indicate section structure.
-- Quote definitions or policy statements accurately.`)
-  }
-
-  if (presentations.length > 0) {
-    typeBlocks.push(`PRESENTATION RULES:
-- Slide titles are section headers; bullets are supporting detail.
-- Do not infer beyond what the slide explicitly states.`)
-  }
-
-  if (codeFiles.length > 0) {
-    typeBlocks.push(`CODE RULES:
-- Read code literally. Function/variable names and comments are all meaningful.
-- Describe what code does in plain English unless code output is requested.`)
-  }
-
-  if (textFiles.length > 0) {
-    typeBlocks.push(`TEXT/MARKDOWN RULES:
-- Markdown formatting (##, **, -) indicates structure. Interpret accordingly.
-- Lists represent discrete facts or steps.`)
-  }
-
-  if (emailFiles.length > 0) {
-    typeBlocks.push(`EMAIL RULES:
-- Attribute statements to their sender. Do not mix up correspondents.
-- Dates and times are as stated in the email header.`)
-  }
-
-  if (webFiles.length > 0) {
-    typeBlocks.push(`WEB/HTML RULES:
-- Focus on main body content. Ignore repetitive navigation text.
-- Include URLs exactly if mentioned.`)
-  }
-
-  const mixedNote = uniqueTypes.length > 1
-    ? `\nMIXED DOCUMENT SET: Context contains ${uniqueTypes.length} document types (${uniqueTypes.join(', ')}). Apply the relevant rules above for each excerpt.`
-    : ''
-
-  const prompt = [base, ...typeBlocks, mixedNote].filter(Boolean).join('\n\n')
-
-  if (SYSTEM_PROMPT_CACHE.size >= SYSTEM_PROMPT_CACHE_MAX) {
+  if (SYSTEM_PROMPT_CACHE.size >= SYSTEM_PROMPT_CACHE_MAX)
     SYSTEM_PROMPT_CACHE.delete(SYSTEM_PROMPT_CACHE.keys().next().value)
-  }
   SYSTEM_PROMPT_CACHE.set(cacheKey, prompt)
   return prompt
 }
