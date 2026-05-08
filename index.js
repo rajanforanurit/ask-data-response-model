@@ -1036,47 +1036,28 @@ function warmupChunkCaches() {
   }
 }
 
-function extractUrlsFromHits(hits, urlKeywords) {
-  const results = []
-  const seen = new Set()
+async function answerWithPhi4(originalQuery, hits, intent = 'general') {
+  const systemPrompt = buildDynamicSystemPrompt(hits, intent)
+  const context      = buildContext(hits)
 
-  const scoredChunks = hits
-    .map(h => {
-      const text = h.text || ''
-      const textLower = text.toLowerCase()
-      if (!textLower.includes('http')) return null
-      const topicMatches = urlKeywords.filter(w => textLower.includes(w)).length
-      if (topicMatches === 0) return null
-      return { text, topicMatches, score: topicMatches * 10 + (h._score || 0) }
-    })
-    .filter(Boolean)
-    .sort((a, b) => b.score - a.score)
+  const subjectHint  = intent === 'definition'
+    ? `\nDefine ONLY this exact term: "${extractSubject(originalQuery)}". Do not define any other term.`
+    : intent === 'url_lookup'
+    ? `\nReturn URL(s) for: "${extractUrlKeywords(originalQuery).join(' ')}".`
+    : ''
 
-  for (const chunk of scoredChunks) {
-    const urlRegex = /https?:\/\/[^\s"'<>\]\[)(\u0000-\u001F]+/gi
-    const matches = chunk.text.match(urlRegex) || []
-    for (const rawUrl of matches) {
-      const cleanUrl = rawUrl.replace(/[.,;:!?)]+$/, '').replace(/\s/g, '')
-      if (seen.has(cleanUrl)) continue
-      seen.add(cleanUrl)
-      const urlLower = cleanUrl.toLowerCase()
-      const matchCount = urlKeywords.filter(w => urlLower.includes(w) || chunk.text.toLowerCase().includes(w)).length
-      if (matchCount > 0) results.push({ url: cleanUrl, matchCount, chunkScore: chunk.topicMatches })
-    }
-  }
-  results.sort((a, b) => b.matchCount - a.matchCount || b.chunkScore - a.chunkScore)
-  return results.map(r => r.url)
+  const userMessage = `CONTEXT:\n${context}${subjectHint}\n\nQuestion: ${originalQuery}`
+  return callPhi4(systemPrompt, userMessage)
 }
+
 function buildFallbackAnswer(query, hits) {
   if (!hits || hits.length === 0) {
     return "I couldn't find relevant information in your documents for this query."
   }
   const intent = detectQueryIntent(query)
+
   if (intent === 'url_lookup') {
     const urlKeywords = extractUrlKeywords(query)
-    const urls = extractUrlsFromHits(hits, urlKeywords)
-    if (urls.length > 0) return urls.join('\n')
-
     for (const h of hits) {
       const lines = (h.text || '').split('\n')
       for (const line of lines) {
@@ -1089,7 +1070,6 @@ function buildFallbackAnswer(query, hits) {
         }
       }
     }
-    return "I couldn't find a URL for that topic in your documents."
   }
 
   const subject = extractSubject(query).toLowerCase()
@@ -1142,28 +1122,6 @@ function buildFallbackAnswer(query, hits) {
 function generateTitle(query) {
   const cleaned = query.trim().replace(/[?!.]+$/, '')
   return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned
-}
-
-async function answerWithPhi4(originalQuery, hits, intent = 'general') {
-  const systemPrompt = buildDynamicSystemPrompt(hits, intent)
-  const context      = buildContext(hits)
-
-  const subjectHint  = intent === 'definition'
-    ? `\nDefine ONLY this exact term: "${extractSubject(originalQuery)}". Do not define any other term.`
-    : ''
-
-  const userMessage = `CONTEXT:\n${context}${subjectHint}\n\nQuestion: ${originalQuery}`
-  return callPhi4(systemPrompt, userMessage)
-}
-
-function isPhiAnswerRepetitive(text) {
-  if (!text || text.length < 20) return false
-  const sample = text.slice(0, 200)
-  const words = sample.split(/\s+/)
-  if (words.length < 5) return false
-  const word = words[0]
-  const repeatCount = words.filter(w => w === word).length
-  return repeatCount > words.length * 0.6
 }
 
 app.get('/health', (req, res) => res.json({
@@ -1437,26 +1395,16 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       }
 
       let rawAnswer
-
-      if (intent === 'url_lookup') {
+      try {
+        rawAnswer = await Promise.race([
+          answerWithPhi4(query.trim(), hits, intent),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Model response timeout (15s)')), 15000)
+          ),
+        ])
+      } catch (err) {
+        console.warn(`[phi4] Using fallback answer: ${err.message}`)
         rawAnswer = buildFallbackAnswer(query.trim(), hits)
-        console.log(`[url_lookup] Resolved directly, bypassing Phi-4`)
-      } else {
-        try {
-          rawAnswer = await Promise.race([
-            answerWithPhi4(query.trim(), hits, intent),
-            new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('Model response timeout (15s)')), 15000)
-            ),
-          ])
-          if (isPhiAnswerRepetitive(rawAnswer)) {
-            console.warn(`[phi4] Repetitive output detected, switching to fallback`)
-            rawAnswer = buildFallbackAnswer(query.trim(), hits)
-          }
-        } catch (err) {
-          console.warn(`[phi4] Using fallback answer: ${err.message}`)
-          rawAnswer = buildFallbackAnswer(query.trim(), hits)
-        }
       }
 
       const cleanAnswer = fixBrokenUrls(rawAnswer)
@@ -1508,6 +1456,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
 
       return { answer, sources, conversationId: activeConversationId, client: { clientId, name } }
     })()
+
     IN_FLIGHT.set(cacheKey, requestPromise)
 
     let result
@@ -1519,9 +1468,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
     if (result.answer && result.answer.length > 10) {
       responseCacheSet(cacheKey, result)
     }
-
     res.json(result)
-
   } catch (err) {
     console.error('[chat/message] Error:', err.message)
     if (!res.headersSent) res.status(500).json({ error: err.message })
