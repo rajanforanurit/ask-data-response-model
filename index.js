@@ -1,40 +1,10 @@
-/**
- * index.js  –  RAG query server (Node.js / Express)
- *
- * ARCHITECTURE (after pipeline.py changes):
- * =========================================
- *
- * Ingestion (Python pipeline.py):
- *   file → extract → chunk → MiniLM embed → vectors JSON
- *   → blob: meta/<clientId>/vectors/<stem>.json
- *
- * Query (this file):
- *   query → MiniLM embed (via Python sidecar HTTP) → load stored vectors
- *   → cosine similarity → top-k chunks → Phi-4 answer
- *
- * KEY CHANGES vs old version:
- *  - _doLoadChunks()   : reads meta/<clientId>/vectors/*.json (NOT raw/)
- *                        chunks already have .embedding[]  — no re-extraction
- *  - retrieveChunks()  : pure cosine similarity on stored embeddings (primary)
- *                        + keyword re-rank as tie-breaker (secondary)
- *  - embedQuery()      : calls local MiniLM sidecar (SAME model as ingestion)
- *                        falls back to keyword-only if sidecar unavailable
- *  - REMOVED:          embedBatch(), embedQueryAzure() — Azure ada no longer used
- *  - REMOVED:          extractTextFromBuffer(), chunkText() from query path
- *  - REMOVED:          downloadBlobAsBuffer() for raw files in hot path
- *  - KEPT:             all auth, MongoDB, Phi-4, cache, rate-limit, CORS logic
- */
-
 require('dotenv').config()
-const express    = require('express')
-const cors       = require('cors')
+const express = require('express')
+const cors = require('cors')
 const { MongoClient, ObjectId } = require('mongodb')
-const { BlobServiceClient }     = require('@azure/storage-blob')
-const crypto     = require('crypto')
-
+const { BlobServiceClient } = require('@azure/storage-blob')
+const crypto = require('crypto')
 const app = express()
-
-// ─── CORS ──────────────────────────────────────────────────────────────────────
 const allowedOrigins = [
   'http://localhost:8080',
   'http://localhost:3000',
@@ -80,10 +50,6 @@ const PHI4_ENDPOINT    = process.env.PHI4_ENDPOINT
 const PHI4_API_KEY     = process.env.PHI4_API_KEY
 const PHI4_MODEL       = process.env.PHI4_MODEL       || 'Phi-4-mini-instruct'
 const PHI4_TIMEOUT_MS  = parseInt(process.env.PHI4_TIMEOUT_MS  || '30000', 10)
-
-// MiniLM sidecar: a tiny Python FastAPI that exposes POST /embed
-// Run alongside this server:  uvicorn embed_sidecar:app --port 5001
-// Falls back to keyword-only if not available.
 const MINILM_SIDECAR_URL   = process.env.MINILM_SIDECAR_URL   || 'http://localhost:5001'
 const EMBED_TIMEOUT_MS      = parseInt(process.env.EMBED_TIMEOUT_MS      || '5000',  10)
 
@@ -91,8 +57,6 @@ const REQUEST_TIMEOUT_MS         = parseInt(process.env.REQUEST_TIMEOUT_MS      
 const KEYWORD_SHORTCIRCUIT_SCORE = parseInt(process.env.KEYWORD_SHORTCIRCUIT_SCORE || '6',     10)
 const WARMUP_CLIENT_IDS          = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
 const BLOB_CONCURRENCY           = parseInt(process.env.BLOB_CONCURRENCY || '8', 10)
-
-// Vector prefix written by pipeline.py
 const VECTORS_PREFIX = (clientId) => `meta/${clientId}/vectors/`
 
 const blobServiceClient = AZURE_CONNECTION_STRING
@@ -187,36 +151,6 @@ function withRequestTimeout(fn, timeoutMs = REQUEST_TIMEOUT_MS) {
     }
   }
 }
-
-// ─── MiniLM sidecar embedding (SAME model as pipeline.py ingestion) ───────────
-/**
- * Embed a single query string using the MiniLM sidecar.
- *
- * The sidecar is a tiny FastAPI app (embed_sidecar.py) that wraps
- * sentence-transformers/all-MiniLM-L6-v2 — the SAME model used at ingestion.
- * Using the same model is mandatory for cosine similarity to be meaningful.
- *
- * Returns float[] or null if sidecar is down (keyword-only fallback kicks in).
- *
- * embed_sidecar.py (put this next to index.js and run with uvicorn):
- * -------------------------------------------------------------------
- * from fastapi import FastAPI
- * from pydantic import BaseModel
- * from sentence_transformers import SentenceTransformer
- * import numpy as np
- *
- * app = FastAPI()
- * model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
- *
- * class EmbedRequest(BaseModel):
- *     text: str
- *
- * @app.post("/embed")
- * def embed(req: EmbedRequest):
- *     vec = model.encode([req.text], normalize_embeddings=True)[0]
- *     return {"embedding": vec.tolist()}
- * -------------------------------------------------------------------
- */
 async function embedQuery(query) {
   try {
     const response = await fetchWithTimeout(
@@ -247,8 +181,6 @@ function cosineSim(a, b) {
   }
   return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-9)
 }
-
-// ─── Query intent & keyword helpers ───────────────────────────────────────────
 const DOC_TYPE = {
   SPREADSHEET: 'spreadsheet', PDF: 'pdf', WORD: 'word',
   PRESENTATION: 'presentation', CODE: 'code', DATA: 'data',
@@ -273,16 +205,36 @@ function classifyExtension(fileName) {
 
 function detectQueryIntent(query) {
   const q = query.toLowerCase().trim()
-  const DEFINITION_PATTERNS = [/^what\s+(is|are|does)\s+/,/^define\s+/,/^explain\s+/,/^meaning\s+of\s+/,/^tell\s+me\s+about\s+/,/^describe\s+/,/^how\s+is\s+.+\s+(calculated|defined|measured|computed)/,/\bmeaning\b/,/\bdefinition\b/,/\bwhat\s+does\b/]
-  const LOOKUP_PATTERNS     = [/^(show|list|find|get|fetch|give)\s+(me\s+)?/,/^how\s+many\s+/,/^what\s+(is\s+the\s+)?(value|number|count|total|sum|amount)/]
-  const COMPARISON_PATTERNS = [/\bvs\b|\bversus\b|\bdifference\b|\bcompare\b|\bbetween\b/]
-  const URL_PATTERNS        = [/\burl\b/,/\blink\b/,/\breport\b.*\burl\b/,/\burl\b.*\breport\b/,/\bpower\s*bi\b/,/\bdashboard\b/]
   const GREETING_PATTERNS   = [/^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening)|how\s+are\s+you|what's\s+up|sup)\b/]
-  if (GREETING_PATTERNS.some(p => p.test(q))) return 'greeting'
-  if (URL_PATTERNS.some(p => p.test(q)))       return 'url_lookup'
+  const URL_PATTERNS        = [/\burl\b/,/\blink\b/,/\breport\b.*\burl\b/,/\burl\b.*\breport\b/,/\bpower\s*bi\b/,/\bdashboard\b/]
+  // lookup BEFORE definition so "what is application count" → lookup not definition
+  const LOOKUP_PATTERNS     = [
+    /^(show|list|find|get|fetch|give)\s+(me\s+)?/,
+    /^how\s+many\s+/,
+    /\bcount\b/,
+    /\btotal\b/,
+    /\bsum\b/,
+    /\bnumber\s+of\b/,
+    /^what\s+(is\s+the\s+)?(value|number|count|total|sum|amount)\b/,
+  ]
+  const DEFINITION_PATTERNS = [
+    /^what\s+(is|are|does)\s+/,
+    /^define\s+/,
+    /^explain\s+/,
+    /^meaning\s+of\s+/,
+    /^tell\s+me\s+about\s+/,
+    /^describe\s+/,
+    /^how\s+is\s+.+\s+(calculated|defined|measured|computed)/,
+    /\bmeaning\b/,
+    /\bdefinition\b/,
+    /\bwhat\s+does\b/,
+  ]
+  const COMPARISON_PATTERNS = [/\bvs\b|\bversus\b|\bdifference\b|\bcompare\b|\bbetween\b/]
+  if (GREETING_PATTERNS.some(p => p.test(q)))   return 'greeting'
+  if (URL_PATTERNS.some(p => p.test(q)))         return 'url_lookup'
+  if (LOOKUP_PATTERNS.some(p => p.test(q)))      return 'lookup'
   if (DEFINITION_PATTERNS.some(p => p.test(q))) return 'definition'
   if (COMPARISON_PATTERNS.some(p => p.test(q))) return 'comparison'
-  if (LOOKUP_PATTERNS.some(p => p.test(q)))     return 'lookup'
   return 'general'
 }
 
@@ -362,33 +314,11 @@ async function callPhi4(systemPrompt, userMessage) {
     }
   })
 }
-
-// ─── VECTOR LOADER  (replaces _doLoadChunks) ─────────────────────────────────
-/**
- * Load all pre-embedded vector JSON files from:
- *   meta/<clientId>/vectors/<stem>.json
- *
- * Each file is an array of records:
- *   { text, embedding: float[], source_file, chunk_index, doc_id,
- *     chunk_id, page, char_count, uploaded_at }
- *
- * Returns { chunks, invertedIndex }
- *
- * This replaces the old _doLoadChunks() which:
- *  - downloaded raw blobs
- *  - extracted text with pdf-parse / mammoth / xlsx etc.
- *  - re-chunked on every request
- *  - re-embedded with Azure ada (wrong model)
- *
- * Now chunks arrive pre-embedded, pre-chunked, ready for cosine search.
- */
 async function _doLoadVectors(clientId) {
   if (!blobServiceClient) throw new Error('AZURE_CONNECTION_STRING not set')
 
   const containerClient = blobServiceClient.getContainerClient(AZURE_CONTAINER_NAME)
-  const prefix          = VECTORS_PREFIX(clientId)
-
-  // List all .json files under meta/<clientId>/vectors/
+  const prefix = VECTORS_PREFIX(clientId)
   const blobNames = []
   for await (const blob of containerClient.listBlobsFlat({ prefix })) {
     if (blob.name.endsWith('.json')) blobNames.push(blob.name)
@@ -569,6 +499,8 @@ async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
   }
   const kwTopK      = intent === 'definition' ? Math.min(300, chunks.length) : Math.min(200, chunks.length)
   const kwCandidates = keywordSearch(query, chunks, kwTopK, intent, invertedIndex)
+
+  // Strong keyword short-circuit (very specific term match — no embedding needed)
   if (kwCandidates.length > 0 && kwCandidates[0]._kwScore >= KEYWORD_SHORTCIRCUIT_SCORE && intent === 'definition') {
     console.log(`[retrieve] keyword short-circuit score=${kwCandidates[0]._kwScore}`)
     return kwCandidates.slice(0, Math.min(topK, 10)).map(c => ({ ...c, _score: c._kwScore || 0 }))
@@ -594,10 +526,6 @@ async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
       const blended = cosine * COSINE_WEIGHT + kwNorm * KEYWORD_WEIGHT
       return { ...c, _score: blended, _cosine: cosine, _kwNorm: kwNorm }
     })
-
-    // For chunks NOT in working set (when working set = kwCandidates): also score
-    // the rest of the corpus lightly so we don't miss semantically related chunks
-    // that keyword filter missed.
     let fullScored = scored
     if (kwCandidates.length > 0 && kwCandidates.length < chunks.length) {
       const kwSet = new Set(kwCandidates.map(c => c.chunk_id || c.text?.slice(0,40)))
@@ -1193,8 +1121,6 @@ app.use((err, req, res, next) => {
   console.error('[global error handler]', err)
   if (!res.headersSent) res.status(500).json({ error: 'An unexpected error occurred. Please try again.' })
 })
-
-// ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => {
   console.log(`rag-client-auth running on port ${PORT}`)
@@ -1209,5 +1135,4 @@ app.listen(PORT, () => {
   startApiKeyHealthChecker()
   warmupChunkCaches()
 })
-
 module.exports = app
