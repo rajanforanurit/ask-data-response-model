@@ -98,7 +98,6 @@ const DOC_TYPE = {
   UNKNOWN:      'unknown',
 }
 
-// ─── Response Cache ───────────────────────────────────────────────────────────
 const RESPONSE_CACHE     = new Map()
 const RESPONSE_CACHE_TTL = 10 * 60 * 1000
 const RESPONSE_CACHE_MAX = 1000
@@ -168,7 +167,7 @@ function phiRecordFailure() {
   phiFailures++
   if (phiFailures >= 3) {
     phiBlockedUntil = Date.now() + 30000
-    console.error(`🚨 [phi4] Circuit breaker OPEN for 30s after ${phiFailures} failures`)
+    console.error(`[phi4] Circuit breaker OPEN for 30s after ${phiFailures} failures`)
   }
 }
 async function fetchWithTimeout(url, options, timeoutMs) {
@@ -206,7 +205,6 @@ function withRequestTimeout(fn, timeoutMs = REQUEST_TIMEOUT_MS) {
   }
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 function classifyExtension(fileName) {
   const ext = ('.' + fileName.split('.').pop()).toLowerCase()
   if (['.xlsx', '.xls', '.ods'].includes(ext))                               return DOC_TYPE.SPREADSHEET
@@ -298,7 +296,6 @@ function buildInvertedIndex(chunks) {
   return index
 }
 
-// ─── Phi-4 call ───────────────────────────────────────────────────────────────
 async function callPhi4(systemPrompt, userMessage) {
   if (!PHI4_ENDPOINT || !PHI4_API_KEY) throw new Error('PHI4_ENDPOINT and PHI4_API_KEY environment variables are required')
   if (phiCircuitOpen()) throw new Error('Model temporarily unavailable (circuit breaker open)')
@@ -377,7 +374,6 @@ async function embedBatch(texts) {
   }
 }
 
-// ─── Keyword search ───────────────────────────────────────────────────────────
 function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = null) {
   const subject      = intent === 'definition' ? extractSubject(query) : query.toLowerCase()
   const queryLower   = query.toLowerCase()
@@ -386,6 +382,11 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
   const queryWords   = queryLower.replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1)
 
   const urlKeywords = intent === 'url_lookup' ? extractUrlKeywords(query) : []
+
+  const useWordBoundary = subjectWords.length === 1 && subjectLower.length <= 10
+  const subjectBoundaryPattern = useWordBoundary
+    ? new RegExp(`\\b${escapeRegex(subjectLower)}\\b`, 'i')
+    : null
 
   let candidateIndices
   if (invertedIndex && subjectWords.length > 0) {
@@ -420,13 +421,24 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
         const topicPhrase = urlKeywords.join(' ')
         if (text.includes(topicPhrase)) score += 15
       } else {
-        if (text.includes(subjectLower)) {
+        const subjectFound = subjectBoundaryPattern
+          ? subjectBoundaryPattern.test(c.text || '')
+          : text.includes(subjectLower)
+
+        if (subjectFound) {
           score += subjectWords.length * 4
           const defPattern = new RegExp(`${escapeRegex(subjectLower)}\\s*(is|are)\\s*(defined|described|calculated|measured|computed)`, 'i')
           if (defPattern.test(c.text || '')) score += subjectWords.length * 6
         }
 
-        score += subjectWords.filter(w => text.includes(w)).length * 2
+        if (subjectWords.length > 1 && text.includes(subjectLower)) {
+          score += subjectWords.length * 3
+        }
+
+        score += subjectWords.filter(w => {
+          const wPattern = new RegExp(`\\b${escapeRegex(w)}\\b`, 'i')
+          return wPattern.test(c.text || '')
+        }).length * 2
 
         if ((docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) && intent === 'definition') {
           const descPattern = new RegExp(`${escapeRegex(subjectLower)}\\s*(is described as|is defined as):`, 'i')
@@ -434,6 +446,8 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
         }
 
         if (docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) {
+          if (text.includes(subjectLower)) score += subjectWords.length * 5
+
           for (const w of subjectWords) {
             const kvPattern = new RegExp(`:\\s*${escapeRegex(w)}\\b|\\|\\s*${escapeRegex(w)}\\b`, 'i')
             if (kvPattern.test(c.text || '')) score += 2
@@ -526,30 +540,23 @@ function buildContext(hits) {
   }).join('\n\n')
 }
 
-// ─── System Prompt Cache ──────────────────────────────────────────────────────
 const SYSTEM_PROMPT_CACHE     = new Map()
 const SYSTEM_PROMPT_CACHE_MAX = 100
 
-/**
- * Builds a rich, intent-aware and doc-type-aware system prompt.
- * Integrates per-document-type rules and intent-specific answer strategies.
- */
 function buildDynamicSystemPrompt(hits, intent = 'general') {
-  // Classify which doc types are present in the retrieved hits
   const schemas = hits.map(h => ({ type: classifyExtension(h.source_file || '') }))
   const uniqueTypes = [...new Set(schemas.map(s => s.type))]
 
-  const spreadsheets = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.SPREADSHEET)
-  const pdfDocs      = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.PDF)
-  const wordDocs     = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.WORD)
+  const spreadsheets  = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.SPREADSHEET)
+  const pdfDocs       = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.PDF)
+  const wordDocs      = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.WORD)
   const presentations = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.PRESENTATION)
-  const codeFiles    = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.CODE)
-  const dataFiles    = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.DATA)
-  const textFiles    = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.TEXT)
-  const emailFiles   = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.EMAIL)
-  const webFiles     = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.WEB)
+  const codeFiles     = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.CODE)
+  const dataFiles     = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.DATA)
+  const textFiles     = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.TEXT)
+  const emailFiles    = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.EMAIL)
+  const webFiles      = hits.filter(h => classifyExtension(h.source_file || '') === DOC_TYPE.WEB)
 
-  // Build a cache key from intent + doc type presence flags
   const cacheKey = [
     intent,
     spreadsheets.length > 0 ? 'ss' : '',
@@ -566,7 +573,6 @@ function buildDynamicSystemPrompt(hits, intent = 'general') {
   const cached = SYSTEM_PROMPT_CACHE.get(cacheKey)
   if (cached) return cached
 
-  // ── Intent-specific answer strategy ──────────────────────────────────────
   const intentInstructions = {
     definition: `ANSWER STRATEGY — DEFINITION QUERY:
 The user is asking for the definition or meaning of a specific term or metric.
@@ -602,7 +608,6 @@ Scan all excerpts carefully. Find information that directly answers the question
   }[intent] || `ANSWER STRATEGY — GENERAL QUERY:
 Scan all excerpts carefully and synthesise a clear, complete answer.`
 
-  // ── Base rules ────────────────────────────────────────────────────────────
   const base = `You are a knowledgeable document assistant. Answer questions ONLY using the document context provided.
 
 UNIVERSAL RULES:
@@ -621,7 +626,6 @@ UNIVERSAL RULES:
 
 ${intentInstructions}`
 
-  // ── Per-doc-type rules ────────────────────────────────────────────────────
   const typeBlocks = []
 
   if (spreadsheets.length > 0) {
@@ -682,14 +686,12 @@ ${intentInstructions}`
 - Include URLs exactly if mentioned.`)
   }
 
-  // ── Mixed-doc note ────────────────────────────────────────────────────────
   const mixedNote = uniqueTypes.length > 1
     ? `\nMIXED DOCUMENT SET: Context contains ${uniqueTypes.length} document types (${uniqueTypes.join(', ')}). Apply the relevant rules above for each excerpt.`
     : ''
 
   const prompt = [base, ...typeBlocks, mixedNote].filter(Boolean).join('\n\n')
 
-  // Cache with LRU eviction
   if (SYSTEM_PROMPT_CACHE.size >= SYSTEM_PROMPT_CACHE_MAX) {
     SYSTEM_PROMPT_CACHE.delete(SYSTEM_PROMPT_CACHE.keys().next().value)
   }
@@ -697,7 +699,6 @@ ${intentInstructions}`
   return prompt
 }
 
-// ─── Mongo helpers ────────────────────────────────────────────────────────────
 let db = null
 async function getDb() {
   if (db) return db
@@ -779,7 +780,6 @@ function generateApiKey() {
   return `rak_${crypto.randomBytes(32).toString('hex')}`
 }
 
-// ─── Document extraction ──────────────────────────────────────────────────────
 async function extractPdf(buffer)  { const r = await pdfParse(buffer); return r.text || '' }
 async function extractWord(buffer) { const r = await mammoth.extractRawText({ buffer }); return r.value || '' }
 
@@ -1031,12 +1031,11 @@ function warmupChunkCaches() {
   console.log(`[warmup] Pre-loading chunks for ${WARMUP_CLIENT_IDS.length} client(s): ${WARMUP_CLIENT_IDS.join(', ')}`)
   for (const clientId of WARMUP_CLIENT_IDS) {
     loadChunksForClient(clientId)
-      .then(({ chunks }) => console.log(`[warmup] ✓ ${clientId} — ${chunks.length} chunks ready`))
-      .catch(err => console.warn(`[warmup] ✗ ${clientId} — ${err.message}`))
+      .then(({ chunks }) => console.log(`[warmup] ${clientId} — ${chunks.length} chunks ready`))
+      .catch(err => console.warn(`[warmup] ${clientId} — ${err.message}`))
   }
 }
 
-// ─── Answer builder ────────────────────────────────────────────────────────────
 async function answerWithPhi4(originalQuery, hits, intent = 'general') {
   const systemPrompt = buildDynamicSystemPrompt(hits, intent)
   const context      = buildContext(hits)
@@ -1092,8 +1091,22 @@ function buildFallbackAnswer(query, hits) {
     }
   }
 
-  const best = hits.find(h => (h.text || '').toLowerCase().includes(subject)) || hits[0]
+  const allMatchingLines = []
+  for (const h of hits) {
+    const lines = (h.text || '').split('\n')
+    for (const line of lines) {
+      if (line.toLowerCase().includes(subject) && line.trim().length > 20) {
+        allMatchingLines.push(line.trim())
+      }
+    }
+  }
 
+  if (allMatchingLines.length > 0) {
+    const unique = [...new Set(allMatchingLines)].slice(0, 5)
+    return unique.join('\n').slice(0, 500)
+  }
+
+  const best = hits[0]
   const snippet = (best.text || '')
     .replace(/Field\d+:\s*/gi, '')
     .replace(/\|\s*Field\d+\b/gi, '')
@@ -1111,7 +1124,6 @@ function generateTitle(query) {
   return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned
 }
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({
   ok:               true,
   service:          'ask-data',
@@ -1328,7 +1340,6 @@ app.post('/chat/conversations/delete', requireClientKey, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
-// ─── MAIN CHAT ENDPOINT ───────────────────────────────────────────────────────
 app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) => {
   try {
     const { query, topK = 6, conversationId } = req.body
@@ -1388,11 +1399,11 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         rawAnswer = await Promise.race([
           answerWithPhi4(query.trim(), hits, intent),
           new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Model response timeout (8s)')), 8000)
+            setTimeout(() => reject(new Error('Model response timeout (15s)')), 15000)
           ),
         ])
       } catch (err) {
-        console.warn(`⚠️ [phi4] Using fallback answer: ${err.message}`)
+        console.warn(`[phi4] Using fallback answer: ${err.message}`)
         rawAnswer = buildFallbackAnswer(query.trim(), hits)
       }
 
