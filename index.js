@@ -248,6 +248,7 @@ function extractSubject(query) {
     /^meaning\s+of\s+(?:an?\s+|the\s+)?(.+)$/,
     /^describe\s+(?:an?\s+|the\s+)?(.+)$/,
     /^how\s+is\s+(.+?)\s+(calculated|defined|measured|computed)$/,
+    /^what\s+is\s+the\s+formula\s+for\s+(?:calculating\s+)?(?:an?\s+|the\s+)?(.+)$/,
   ]
   for (const p of patterns) {
     const m = q.match(p)
@@ -575,72 +576,68 @@ function buildDynamicSystemPrompt(hits, intent = 'general') {
 
   const intentInstructions = {
     definition: `ANSWER STRATEGY — DEFINITION QUERY:
-The user is asking for the definition or meaning of a specific term or metric.
-1. Scan ALL excerpts for: the EXACT term, "is defined as", "is described as", "is calculated as", or any sentence that explains what the term IS.
-2. If found, state the definition clearly and completely. Include calculation logic, filters, or conditions if mentioned.
-3. If the term appears as a column name or value in structured data, explain its role in that context.
-4. Do NOT describe tangentially related metrics — focus on the EXACT term asked about.
-5. If multiple excerpts define the same term differently, reconcile them or present both definitions.`,
+The user wants the definition or meaning of a specific term or metric.
+1. Scan ALL excerpts for the EXACT term. Look for sentences like "X is defined as", "X is described as", "X is calculated as", or any sentence that directly explains what the term IS.
+2. Write a clean, complete answer in plain English. Use 1–3 sentences. Do NOT copy or paste raw data rows.
+3. If the term has a formula, state it naturally: e.g. "It is calculated by dividing X by Y."
+4. If multiple excerpts define the same term, combine them into one coherent answer.
+5. NEVER output pipe-delimited rows, "is described as:" lines, or raw serialized data as your answer.`,
 
     lookup: `ANSWER STRATEGY — LOOKUP QUERY:
 The user wants a specific value, count, or list from the data.
-1. Find the exact records, rows, or values that match the query.
-2. Report the precise values — do not approximate.
-3. For spreadsheet data, scan all rows; the answer may span multiple records.
-4. State clearly where the data comes from (metric name, column name, etc.).`,
+1. Find the exact records or values that match the query.
+2. Report precise values in plain English. Do NOT output raw data rows verbatim.
+3. State clearly what the value represents.`,
 
     comparison: `ANSWER STRATEGY — COMPARISON QUERY:
 The user wants to compare two or more items.
-1. Find all relevant information for EACH item being compared.
-2. Structure the answer as a clear comparison — similarities and differences.
-3. Use parallel structure so the comparison is easy to follow.
-4. If one side has more data than the other, note the gap explicitly.`,
+1. Find all relevant information for EACH item.
+2. Write a clear, structured comparison in plain English — similarities and differences.
+3. Do NOT output raw data rows. Synthesise into readable prose or a short list.`,
 
     url_lookup: `ANSWER STRATEGY — URL LOOKUP QUERY:
 The user is asking for a URL or link.
-1. Find and return the full URL that matches the topic exactly as it appears — no truncation.
-2. Return the URL on its own line, unbroken, with no spaces.
-3. If multiple URLs match, list each on its own line.
-4. If none match, say not found.`,
+1. Find and return the FULL URL that matches the topic exactly as it appears — no truncation, no spaces.
+2. If none match, say "I couldn't find a URL for that report in your documents."`,
 
     general: `ANSWER STRATEGY — GENERAL QUERY:
-Scan all excerpts carefully. Find information that directly answers the question. Synthesise a clear, complete answer. If the information spans multiple excerpts, combine it coherently.`,
+Scan all excerpts carefully. Find information that directly answers the question. Write a clear, complete answer in plain English. Do NOT output raw data rows or pipe-delimited text. Synthesise the information naturally.`,
   }[intent] || `ANSWER STRATEGY — GENERAL QUERY:
-Scan all excerpts carefully and synthesise a clear, complete answer.`
+Scan all excerpts carefully. Write a clear, complete answer in plain English. Do NOT copy raw data rows.`
 
   const base = `You are a knowledgeable document assistant. Answer questions ONLY using the document context provided.
 
-UNIVERSAL RULES:
-1. Answer ONLY from the context. Never invent or assume information.
-2. Search the ENTIRE context — every excerpt — before concluding something is absent.
-3. Case-insensitive matching: "applicant count", "Applicant Count", "APPLICANT COUNT" are identical.
-4. If a term appears ANYWHERE in the context — as a label, value, heading, or inline text — treat it as present.
-5. If information is truly absent after thorough search, say: "I couldn't find specific information about that in your documents."
-6. Do NOT add citation markers like [1], [2], [3].
-7. Do NOT mention file names or source document names in your answer.
-8. Write clearly, concisely, and directly — like a knowledgeable colleague.
-9. Answer only what was asked. No padding or filler.
-10. NEVER say "the context does not define" or "not mentioned" if the term appears anywhere.
-11. If a URL is present, ALWAYS return the FULL URL exactly as-is. Never truncate or shorten URLs.
-12. URLs must be returned in one continuous line with no line breaks or spaces.
+CRITICAL OUTPUT RULES — APPLY TO EVERY RESPONSE:
+1. NEVER copy or paste raw serialized data into your answer. This includes pipe-delimited rows (e.g. "Field1: X | Field2: Y"), "is described as:" lines, truncated data rows, or any chunk of raw structured data.
+2. ALWAYS write your answer in clean, natural English sentences — like a knowledgeable colleague explaining something.
+3. Answer ONLY from the context. Never invent or assume information not present.
+4. Search the ENTIRE context before concluding something is absent.
+5. Case-insensitive matching: "applicant count", "Applicant Count", "APPLICANT COUNT" are identical.
+6. If information is truly absent after thorough search, say: "I couldn't find specific information about that in your documents."
+7. Do NOT add citation markers like [1], [2], [3].
+8. Answer only what was asked. No padding or unnecessary caveats.
+9. If a URL is present, return the FULL URL exactly as-is on its own line with no line breaks or spaces inserted.
+10. Keep answers concise — typically 1–4 sentences unless a list or formula is required.
 
 ${intentInstructions}`
 
   const typeBlocks = []
 
   if (spreadsheets.length > 0) {
-    typeBlocks.push(`SPREADSHEET RULES:
-- Data is serialised as pipe-delimited key:value rows. Each line = one record.
-- Lines like "X is described as: ..." are definition summaries — prioritise them for definition queries.
-- For definition queries: a field name matching the subject IS a definition. Explain it from surrounding values.
-- Scan ALL rows — the answer may not be in the first matching row.
-- When answering, write a natural sentence from this data — never output raw pipe-delimited rows verbatim.`)
+    typeBlocks.push(`SPREADSHEET DATA INTERPRETATION:
+The context contains spreadsheet data serialized as pipe-delimited key:value rows and "X is described as: ..." summary lines. These are internal data representations — do NOT reproduce them in your answer.
+Instead:
+- Read these rows to understand what the data says.
+- Extract the meaning and write it out in plain English.
+- For definition queries: find the term, read its description/formula, then explain it naturally in a sentence or two.
+- For formula queries: state the formula in plain English (e.g. "calculated by dividing A by B") or as a simple equation.
+- Never output "X is described as: ..." verbatim. Rewrite it as a natural sentence.`)
   }
 
   if (dataFiles.length > 0) {
     typeBlocks.push(`STRUCTURED DATA RULES (JSON/YAML/CSV):
 - Fields and values may be nested. Treat "parent.child: value" as a nested attribute.
-- Every key and every value is meaningful data — no prose definition required.`)
+- Read the data to understand meaning. Write answers in plain English — never dump raw key:value pairs.`)
   }
 
   if (pdfDocs.length > 0) {
@@ -1041,9 +1038,9 @@ async function answerWithPhi4(originalQuery, hits, intent = 'general') {
   const context      = buildContext(hits)
 
   const subjectHint  = intent === 'definition'
-    ? `\nDefine ONLY this exact term: "${extractSubject(originalQuery)}". Do not define any other term.`
+    ? `\nYou must define ONLY this exact term: "${extractSubject(originalQuery)}". Write 1–3 clean sentences in plain English. Do NOT copy raw data rows or "is described as:" lines into your answer.`
     : intent === 'url_lookup'
-    ? `\nReturn URL(s) for: "${extractUrlKeywords(originalQuery).join(' ')}".`
+    ? `\nReturn the full URL for: "${extractUrlKeywords(originalQuery).join(' ')}". Put it on its own line. No disclaimers.`
     : ''
 
   const userMessage = `CONTEXT:\n${context}${subjectHint}\n\nQuestion: ${originalQuery}`
@@ -1086,7 +1083,19 @@ function buildFallbackAnswer(query, hits) {
     if (relevantLine) {
       const parts = relevantLine.split(/is described as:/i)
       if (parts[1]) {
-        return `${subject.charAt(0).toUpperCase() + subject.slice(1)} is ${parts[1].trim().slice(0, 300)}`
+        // Parse the pipe-delimited description into a natural sentence
+        const rawDesc = parts[1].trim().slice(0, 300)
+        const descParts = rawDesc.split('|').map(p => p.trim()).filter(Boolean)
+        if (descParts.length === 1) {
+          return `${subject.charAt(0).toUpperCase() + subject.slice(1)} is ${descParts[0]}.`
+        }
+        // Check if any part looks like a formula (contains "divided by", "/", etc.)
+        const formulaPart = descParts.find(p => /divided by|\/|\bper\b/i.test(p))
+        if (formulaPart) {
+          const desc = descParts.filter(p => p !== formulaPart).join('. ')
+          return `${subject.charAt(0).toUpperCase() + subject.slice(1)} is ${desc}. It is calculated as: ${formulaPart}.`
+        }
+        return `${subject.charAt(0).toUpperCase() + subject.slice(1)}: ${descParts.join('. ')}`
       }
     }
   }
@@ -1096,27 +1105,20 @@ function buildFallbackAnswer(query, hits) {
     const lines = (h.text || '').split('\n')
     for (const line of lines) {
       if (line.toLowerCase().includes(subject) && line.trim().length > 20) {
+        // Skip raw pipe-delimited data lines
+        if ((line.match(/\|/g) || []).length > 3) continue
+        if (/is described as:/i.test(line)) continue
         allMatchingLines.push(line.trim())
       }
     }
   }
 
   if (allMatchingLines.length > 0) {
-    const unique = [...new Set(allMatchingLines)].slice(0, 5)
-    return unique.join('\n').slice(0, 500)
+    const unique = [...new Set(allMatchingLines)].slice(0, 3)
+    return unique.join(' ').slice(0, 400)
   }
 
-  const best = hits[0]
-  const snippet = (best.text || '')
-    .replace(/Field\d+:\s*/gi, '')
-    .replace(/\|\s*Field\d+\b/gi, '')
-    .split('\n')
-    .filter(l => !/(copyright|all rights reserved|proprietary|confidential|redistribution)/i.test(l))
-    .join('\n')
-    .slice(0, 350)
-    .trim()
-
-  return snippet || "I couldn't find that specific information in your documents."
+  return "I couldn't find that specific information in your documents."
 }
 
 function generateTitle(query) {
@@ -1410,6 +1412,11 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       const cleanAnswer = fixBrokenUrls(rawAnswer)
         .replace(/\bField\d+\s*:\s*/gi, '')
         .replace(/\|\s*Field\d+\b/gi, '')
+        // Remove any leaked "is described as:" lines that may have slipped through
+        .replace(/^.+\s+is described as:\s*.+$/gmi, '')
+        // Remove lines that are clearly raw pipe-delimited data (4+ pipes)
+        .replace(/^[^\n]*\|[^\n]*\|[^\n]*\|[^\n]*\|[^\n]*$/gm, '')
+        .replace(/\n{3,}/g, '\n\n')
         .trim()
 
       const answer  = cleanAnswer
