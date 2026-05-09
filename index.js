@@ -12,7 +12,9 @@ const Papa = require('papaparse')
 const { simpleParser } = require('mailparser')
 const { parseOffice } = require('officeparser')
 const crypto = require('crypto')
+
 const app = express()
+
 const allowedOrigins = [
   'http://localhost:8080',
   'http://localhost:3000',
@@ -48,30 +50,30 @@ app.options('*', cors({
 
 app.use(express.json())
 
-const MONGODB_URI = process.env.MONGODB_URI
-const MONGODB_DB = process.env.MONGODB_DB || 'clientcreds'
-const CHAT_HISTORY_URI = process.env.CHAT_HISTORY_URI
-const CHAT_HISTORY_DB = process.env.CHAT_HISTORY_DB || 'chathistory'
-const AZURE_CONNECTION_STRING = process.env.AZURE_CONNECTION_STRING || ''
-const AZURE_CONTAINER_NAME = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
-const ADMIN_API_KEY = process.env.ADMIN_API_KEY
-const KEY_CHECK_INTERVAL_MS  = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10)
-const PHI4_ENDPOINT = process.env.PHI4_ENDPOINT
-const PHI4_API_KEY = process.env.PHI4_API_KEY
-const PHI4_MODEL = process.env.PHI4_MODEL || 'Phi-4-mini-instruct'
-const PHI4_TIMEOUT_MS = parseInt(process.env.PHI4_TIMEOUT_MS || '30000', 10)
-const AZURE_EMBED_ENDPOINT   = process.env.AZURE_EMBED_ENDPOINT || ''
-const AZURE_EMBED_KEY = process.env.AZURE_EMBED_KEY || ''
-const AZURE_EMBED_MODEL  = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
-const EMBED_TIMEOUT_MS = parseInt(process.env.EMBED_TIMEOUT_MS || '10000', 10)
-const EMBED_POOL_LIMIT = parseInt(process.env.EMBED_POOL_LIMIT || '20', 10)
-const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10)
-const KEYWORD_SHORTCIRCUIT_SCORE = parseInt(process.env.KEYWORD_SHORTCIRCUIT_SCORE || '6', 10)
-const WARMUP_CLIENT_IDS  = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
+const MONGODB_URI              = process.env.MONGODB_URI
+const MONGODB_DB               = process.env.MONGODB_DB || 'clientcreds'
+const CHAT_HISTORY_URI         = process.env.CHAT_HISTORY_URI
+const CHAT_HISTORY_DB          = process.env.CHAT_HISTORY_DB || 'chathistory'
+const AZURE_CONNECTION_STRING  = process.env.AZURE_CONNECTION_STRING || ''
+const AZURE_CONTAINER_NAME     = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
+const ADMIN_API_KEY            = process.env.ADMIN_API_KEY
+const KEY_CHECK_INTERVAL_MS    = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10)
+const PHI4_ENDPOINT            = process.env.PHI4_ENDPOINT
+const PHI4_API_KEY             = process.env.PHI4_API_KEY
+const PHI4_MODEL               = process.env.PHI4_MODEL || 'Phi-4-mini-instruct'
+const PHI4_TIMEOUT_MS          = parseInt(process.env.PHI4_TIMEOUT_MS || '30000', 10)
+const AZURE_EMBED_ENDPOINT     = process.env.AZURE_EMBED_ENDPOINT || ''
+const AZURE_EMBED_KEY          = process.env.AZURE_EMBED_KEY || ''
+const AZURE_EMBED_MODEL        = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
+const EMBED_TIMEOUT_MS         = parseInt(process.env.EMBED_TIMEOUT_MS || '10000', 10)
+const EMBED_POOL_LIMIT         = parseInt(process.env.EMBED_POOL_LIMIT || '20', 10)
+const REQUEST_TIMEOUT_MS       = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10)
+const KEYWORD_SHORTCIRCUIT_SCORE = parseInt(process.env.KEYWORD_SHORTCIRCUIT_SCORE || '4', 10)  // FIX: lowered from 6 → 4
+const WARMUP_CLIENT_IDS        = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
 
 const RAW_PREFIX    = 'raw'
 const CHUNK_SIZE    = 500
-const CHUNK_OVERLAP = 2
+const CHUNK_OVERLAP = 5   // FIX: increased from 2 → 5 to preserve enumerated lists across boundaries
 
 const blobServiceClient = AZURE_CONNECTION_STRING
   ? BlobServiceClient.fromConnectionString(AZURE_CONNECTION_STRING)
@@ -102,6 +104,9 @@ const DOC_TYPE = {
   WEB:          'web',
   UNKNOWN:      'unknown',
 }
+
+// ─── FIX: copyright / header lines to skip during chunking ───────────────────
+const SKIP_LINE_PATTERN = /copyright|all rights reserved|confidential|proprietary|may not be reproduced|redistributed without/i
 
 // ─── Response cache ───────────────────────────────────────────────────────────
 
@@ -159,7 +164,7 @@ function drainPhiQueue() {
   }
 }
 
-let phiFailures    = 0
+let phiFailures     = 0
 let phiBlockedUntil = 0
 
 function phiCircuitOpen() {
@@ -237,13 +242,15 @@ function classifyExtension(fileName) {
 
 function detectQueryIntent(query) {
   const q = query.toLowerCase().trim()
-  const DEFINITION_PATTERNS = [/^what\s+(is|are|does)\s+/,/^define\s+/,/^explain\s+/,/^meaning\s+of\s+/,/^tell\s+me\s+about\s+/,/^describe\s+/,/^how\s+is\s+.+\s+(calculated|defined|measured|computed)/,/\bmeaning\b/,/\bdefinition\b/,/\bwhat\s+does\b/]
-  const LOOKUP_PATTERNS     = [/^(show|list|find|get|fetch|give)\s+(me\s+)?/,/^how\s+many\s+/,/^what\s+(is\s+the\s+)?(value|number|count|total|sum|amount)/]
-  const COMPARISON_PATTERNS = [/\bvs\b|\bversus\b|\bdifference\b|\bcompare\b|\bbetween\b/]
-  const URL_PATTERNS        = [/\burl\b/,/\blink\b/,/\breport\b.*\burl\b/,/\burl\b.*\breport\b/,/\bpower\s*bi\b/,/\bdashboard\b/]
-  const GREETING_PATTERNS   = [/^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening)|how\s+are\s+you|what's\s+up|sup)\b/]
+  const DEFINITION_PATTERNS  = [/^what\s+(is|are|does)\s+/,/^define\s+/,/^explain\s+/,/^meaning\s+of\s+/,/^tell\s+me\s+about\s+/,/^describe\s+/,/^how\s+is\s+.+\s+(calculated|defined|measured|computed)/,/\bmeaning\b/,/\bdefinition\b/,/\bwhat\s+does\b/]
+  const LOOKUP_PATTERNS      = [/^(show|list|find|get|fetch|give)\s+(me\s+)?/,/^how\s+many\s+/,/^what\s+(is\s+the\s+)?(value|number|count|total|sum|amount)/]
+  const COMPARISON_PATTERNS  = [/\bvs\b|\bversus\b|\bdifference\b|\bcompare\b|\bbetween\b/]
+  const URL_PATTERNS         = [/\burl\b/,/\blink\b/,/\breport\b.*\burl\b/,/\burl\b.*\breport\b/,/\bpower\s*bi\b/,/\bdashboard\b/]
+  const FORMULA_PATTERNS     = [/\bhow\s+is\b.*\bcalculated\b/,/\bformula\s+for\b/,/\bhow\s+do\s+you\s+calculate\b/,/\bwhat\s+is\s+the\s+formula\b/]  // FIX: explicit formula intent
+  const GREETING_PATTERNS    = [/^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening)|how\s+are\s+you|what's\s+up|sup)\b/]
   if (GREETING_PATTERNS.some(p => p.test(q))) return 'greeting'
   if (URL_PATTERNS.some(p => p.test(q)))      return 'url_lookup'
+  if (FORMULA_PATTERNS.some(p => p.test(q)))  return 'formula'   // FIX: formula checked before definition
   if (DEFINITION_PATTERNS.some(p => p.test(q))) return 'definition'
   if (COMPARISON_PATTERNS.some(p => p.test(q))) return 'comparison'
   if (LOOKUP_PATTERNS.some(p => p.test(q)))     return 'lookup'
@@ -263,12 +270,37 @@ function extractSubject(query) {
     /^describe\s+(?:an?\s+|the\s+)?(.+)$/,
     /^how\s+is\s+(.+?)\s+(calculated|defined|measured|computed)$/,
     /^what\s+is\s+the\s+formula\s+for\s+(?:calculating\s+)?(?:an?\s+|the\s+)?(.+)$/,
+    /^how\s+do\s+you\s+calculate\s+(?:an?\s+|the\s+)?(.+)$/,  // FIX: added pattern
   ]
   for (const p of patterns) {
     const m = q.match(p)
     if (m) return m[1].trim()
   }
   return q
+}
+
+// FIX: stem simple plurals so 'milestones' finds 'milestone' chunks
+function stemWord(word) {
+  if (word.length > 4 && word.endsWith('s') && !word.endsWith('ss')) {
+    return word.slice(0, -1)
+  }
+  return word
+}
+
+// FIX: for comparison queries, extract each side of the comparison
+function extractComparisonTerms(query) {
+  const q = query.toLowerCase().replace(/[?!.]+$/, '').trim()
+  const patterns = [
+    /difference\s+between\s+(.+?)\s+and\s+(.+)/,
+    /(.+?)\s+vs\.?\s+(.+)/,
+    /compare\s+(.+?)\s+(?:and|to|with)\s+(.+)/,
+    /(.+?)\s+versus\s+(.+)/,
+  ]
+  for (const p of patterns) {
+    const m = q.match(p)
+    if (m) return [m[1].trim(), m[2].trim()]
+  }
+  return [q]
 }
 
 function extractUrlKeywords(query) {
@@ -304,16 +336,37 @@ function buildInvertedIndex(chunks) {
       .split(/\s+/)
     for (const w of words) {
       if (w.length < 3) continue
-      if (!index.has(w)) index.set(w, new Set())
-      index.get(w).add(i)
+      const stemmed = stemWord(w)   // FIX: index both original and stemmed
+      for (const form of new Set([w, stemmed])) {
+        if (!index.has(form)) index.set(form, new Set())
+        index.get(form).add(i)
+      }
     }
   }
   return index
 }
 
+// FIX: extract formula lines from a chunk for anchor injection
+function extractFormulaLines(text) {
+  const lines = (text || '').split('\n')
+  const formulaLines = lines.filter(line => {
+    const l = line.toLowerCase()
+    return (
+      l.includes('divided by') ||
+      l.includes('minus') ||
+      l.includes('plus') ||
+      l.includes('multiplied by') ||
+      l.includes('times') ||
+      /=\s*\w/.test(l) ||
+      /formula/i.test(l)
+    )
+  })
+  return formulaLines.map(l => l.trim()).filter(Boolean)
+}
+
 // ─── Phi-4 call ───────────────────────────────────────────────────────────────
 
-async function callPhi4(systemPrompt, userMessage) {
+async function callPhi4(systemPrompt, userMessage, maxTokens = 512) {
   if (!PHI4_ENDPOINT || !PHI4_API_KEY) throw new Error('PHI4_ENDPOINT and PHI4_API_KEY environment variables are required')
   if (phiCircuitOpen()) throw new Error('Model temporarily unavailable (circuit breaker open)')
 
@@ -328,7 +381,7 @@ async function callPhi4(systemPrompt, userMessage) {
             model:       PHI4_MODEL,
             messages:    [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
             temperature: 0.1,
-            max_tokens:  512,
+            max_tokens:  maxTokens,  // FIX: allow callers to control verbosity
           }),
         },
         PHI4_TIMEOUT_MS
@@ -371,6 +424,7 @@ async function embedQueryAzure(query) {
     return null
   }
 }
+
 async function embedBatch(texts) {
   if (!AZURE_EMBED_ENDPOINT || !AZURE_EMBED_KEY || !texts.length) return []
   try {
@@ -395,23 +449,29 @@ async function embedBatch(texts) {
 // ─── Retrieval ────────────────────────────────────────────────────────────────
 
 function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = null) {
-  const subject      = intent === 'definition' ? extractSubject(query) : query.toLowerCase()
+  const subject      = (intent === 'definition' || intent === 'formula') ? extractSubject(query) : query.toLowerCase()
   const queryLower   = query.toLowerCase()
   const subjectLower = subject.toLowerCase()
-  const subjectWords = subjectLower.split(/\s+/).filter(w => w.length > 1)
+
+  // FIX: stem subject words for better plural/variant matching
+  const subjectWords = subjectLower.split(/\s+/).filter(w => w.length > 1).map(w => stemWord(w))
   const queryWords   = queryLower.replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1)
 
   const urlKeywords = intent === 'url_lookup' ? extractUrlKeywords(query) : []
 
   const useWordBoundary = subjectWords.length === 1 && subjectLower.length <= 10
   const subjectBoundaryPattern = useWordBoundary
-    ? new RegExp(`\\b${escapeRegex(subjectLower)}\\b`, 'i')
+    ? new RegExp(`\\b${escapeRegex(stemWord(subjectLower))}\\b`, 'i')
     : null
 
   let candidateIndices
   if (invertedIndex && subjectWords.length > 0) {
     const wordsToIndex = intent === 'url_lookup' ? urlKeywords : subjectWords
-    const sets = wordsToIndex.map(w => invertedIndex.get(w) || new Set())
+    // FIX: also look up stemmed forms
+    const stemmedWords = wordsToIndex.map(stemWord)
+    const allForms     = [...new Set([...wordsToIndex, ...stemmedWords])]
+    const sets = allForms.map(w => invertedIndex.get(w) || new Set())
+
     if (intent === 'url_lookup') {
       const urlSet  = invertedIndex.get('url')  || new Set()
       const linkSet = invertedIndex.get('link') || new Set()
@@ -443,15 +503,18 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
       } else {
         const subjectFound = subjectBoundaryPattern
           ? subjectBoundaryPattern.test(c.text || '')
-          : text.includes(subjectLower)
+          : subjectWords.some(sw => text.includes(sw))  // FIX: any stemmed word matches
 
         if (subjectFound) {
           score += subjectWords.length * 4
-          const defPattern = new RegExp(`${escapeRegex(subjectLower)}\\s*(is|are)\\s*(defined|described|calculated|measured|computed)`, 'i')
+          const defPattern = new RegExp(
+            `(${subjectWords.map(escapeRegex).join('|')})\\s*(is|are)\\s*(defined|described|calculated|measured|computed)`,
+            'i'
+          )
           if (defPattern.test(c.text || '')) score += subjectWords.length * 6
         }
 
-        if (subjectWords.length > 1 && text.includes(subjectLower)) {
+        if (subjectWords.length > 1 && subjectWords.every(sw => text.includes(sw))) {
           score += subjectWords.length * 3
         }
 
@@ -460,13 +523,23 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
           return wPattern.test(c.text || '')
         }).length * 2
 
-        if ((docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) && intent === 'definition') {
-          const descPattern = new RegExp(`${escapeRegex(subjectLower)}\\s*(is described as|is defined as):`, 'i')
+        // FIX: boost formula intent hits
+        if (intent === 'formula') {
+          const formulaLines = extractFormulaLines(c.text || '')
+          if (formulaLines.length > 0) score += 8
+          if (subjectWords.some(sw => text.includes(sw)) && formulaLines.length > 0) score += 6
+        }
+
+        if ((docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) && (intent === 'definition' || intent === 'formula')) {
+          const descPattern = new RegExp(
+            `(${subjectWords.map(escapeRegex).join('|')})\\s*(is described as|is defined as):`,
+            'i'
+          )
           if (descPattern.test(c.text || '')) score += subjectWords.length * 8
         }
 
         if (docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) {
-          if (text.includes(subjectLower)) score += subjectWords.length * 5
+          if (subjectWords.some(sw => text.includes(sw))) score += subjectWords.length * 5
           for (const w of subjectWords) {
             const kvPattern = new RegExp(`:\\s*${escapeRegex(w)}\\b|\\|\\s*${escapeRegex(w)}\\b`, 'i')
             if (kvPattern.test(c.text || '')) score += 2
@@ -483,19 +556,45 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
     .slice(0, topK)
 }
 
+// FIX: separate keyword search per comparison term, merge results
+function keywordSearchComparison(query, chunks, topK, invertedIndex) {
+  const terms = extractComparisonTerms(query)
+  if (terms.length < 2) return keywordSearch(query, chunks, topK, 'general', invertedIndex)
+
+  const allHits = new Map()
+  for (const term of terms) {
+    const hits = keywordSearch(term, chunks, Math.ceil(topK / 2), 'definition', invertedIndex)
+    for (const hit of hits) {
+      const key = `${hit.source_file}:${hit.chunk_index}`
+      if (!allHits.has(key) || allHits.get(key)._score < hit._score) {
+        allHits.set(key, hit)
+      }
+    }
+  }
+  return [...allHits.values()].sort((a, b) => b._score - a._score).slice(0, topK)
+}
+
 async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
   const intent          = detectQueryIntent(query)
   const normalizedQuery = query.toLowerCase().trim().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
-  const keywordTopK     = intent === 'definition' ? Math.min(150, chunks.length) : Math.min(100, chunks.length)
-  const candidates      = keywordSearch(normalizedQuery, chunks, keywordTopK, intent, invertedIndex)
-  const pool            = candidates.length > 0 ? candidates : chunks.slice(0, 100)
+  const keywordTopK     = (intent === 'definition' || intent === 'formula') ? Math.min(150, chunks.length) : Math.min(100, chunks.length)
+
+  // FIX: use comparison-aware retrieval
+  let candidates
+  if (intent === 'comparison') {
+    candidates = keywordSearchComparison(normalizedQuery, chunks, keywordTopK, invertedIndex)
+  } else {
+    candidates = keywordSearch(normalizedQuery, chunks, keywordTopK, intent, invertedIndex)
+  }
+
+  const pool = candidates.length > 0 ? candidates : chunks.slice(0, 100)
 
   if (pool.length > 0 && pool[0]._score >= KEYWORD_SHORTCIRCUIT_SCORE) {
     console.log(`[retrieveChunks] keyword short-circuit (score=${pool[0]._score}) — skipping embed`)
     return pool.slice(0, Math.min(topK, 10))
   }
 
-  if (intent === 'definition' && pool.length > 0 && pool[0]._score >= 4) {
+  if ((intent === 'definition' || intent === 'formula') && pool.length > 0 && pool[0]._score >= 4) {
     return pool.slice(0, Math.min(topK, 10))
   }
 
@@ -512,7 +611,7 @@ async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
         const embeddings = await embedBatch(chunkTexts)
 
         const maxKeyword = pool[0]._score || 1
-        const weight     = intent === 'definition'
+        const weight = (intent === 'definition' || intent === 'formula')
           ? { semantic: 0.35, keyword: 0.65 }
           : { semantic: 0.70, keyword: 0.30 }
 
@@ -539,6 +638,7 @@ async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
 
   return pool.slice(0, Math.min(topK, 12))
 }
+
 function buildContext(hits) {
   const seen = new Set()
   const deduped = []
@@ -552,23 +652,28 @@ function buildContext(hits) {
   }
 
   return deduped.map((h, i) => {
-    const charLimit = i === 0 ? 600 : i <= 2 ? 450 : 350
+    const charLimit = i === 0 ? 800 : i <= 2 ? 600 : 400  // FIX: increased limits to preserve full enum lists
     const text = (h.text || '').trim().slice(0, charLimit)
     return `[${i + 1}] ${text}`
   }).join('\n\n')
 }
+
+// ─── System prompts ───────────────────────────────────────────────────────────
+
 const SYSTEM_PROMPT_CACHE     = new Map()
 const SYSTEM_PROMPT_CACHE_MAX = 100
+
 const INTENT_STRATEGY = {
-  definition: `TASK: Define the exact term asked. Write 1–3 natural English sentences. If there's a formula, state it plainly (e.g. "calculated by dividing X by Y"). Combine multiple excerpts if needed.`,
+  definition: `TASK: Define the exact term asked. Write 2–4 natural English sentences. Include all enumerated items if the definition contains a list. Combine multiple excerpts if needed. Never copy raw data rows.`,
+  formula:    `TASK: State the exact formula or calculation method for the term asked. Lead with the formula itself (e.g. "X is calculated as A divided by B"). Then add one sentence of context if helpful. If a formula line appears in the context, use it verbatim — do not paraphrase or invent.`,  // FIX: explicit formula intent strategy
   lookup:     `TASK: Find and report the exact value or list asked for. State clearly what it represents.`,
-  comparison: `TASK: Compare the items asked. Write a structured but natural summary — similarities and differences.`,
+  comparison: `TASK: Compare the two items asked. Write a structured but natural summary — define each term separately first, then state the key difference. Keep to 4–6 sentences total.`, 
   url_lookup: `TASK: Return the full URL that matches the topic, on its own line, unmodified. If none found, say so.`,
   general:    `TASK: Find information that directly answers the question and write a clear, complete summary.`,
 }
 
 const TYPE_NOTES = {
-  [DOC_TYPE.SPREADSHEET]:  `Spreadsheet data is serialized as pipe-delimited rows and "X is described as: …" lines — these are internal representations. Read them to understand meaning; never reproduce them verbatim.`,
+  [DOC_TYPE.SPREADSHEET]:  `Spreadsheet data is serialized as pipe-delimited rows and "X is described as: …" lines — these are internal representations. Read them to understand meaning; NEVER reproduce pipe-delimited rows or "is described as:" lines verbatim in your answer. Always rewrite in plain English sentences.`,
   [DOC_TYPE.DATA]:         `JSON/YAML/CSV fields may be nested ("parent.child: value"). Read for meaning; never dump raw key:value pairs.`,
   [DOC_TYPE.PDF]:          `PDF text may have minor extraction artefacts. Read numbers and dates exactly as shown; ignore headers, footers, and page numbers.`,
   [DOC_TYPE.WORD]:         `Word docs contain prose, lists, and tables. Headings show section structure. Quote policy/definition statements accurately.`,
@@ -579,16 +684,21 @@ const TYPE_NOTES = {
   [DOC_TYPE.WEB]:          `Focus on main body content; ignore repetitive navigation text. Include URLs exactly as written.`,
 }
 
-const BASE_SYSTEM_PROMPT = `You are a document assistant. Answer ONLY from the provided context.
+// FIX: comprehensive rewrite of base system prompt
+const BASE_SYSTEM_PROMPT = `You are a precise data dictionary assistant. Answer ONLY from the provided context excerpts.
 
-RULES (apply once, always):
-- Write in natural English sentences. Never output raw pipe-delimited rows, "is described as:" lines, or dumps of key:value pairs.
-- Use only information present in the context. Never invent or assume.
-- Match terms case-insensitively.
-- No citation markers ([1], [2]…). No padding or caveats.
-- If a URL appears, return it exactly as-is on its own line.
-- If the answer is genuinely absent: "I couldn't find that in your documents."
-- Keep answers concise — 1–4 sentences unless a list or formula is needed.`
+STRICT OUTPUT RULES — follow every rule on every response:
+1. Write in plain English prose. Maximum 4 sentences unless a list or formula is explicitly needed.
+2. NEVER output pipe-delimited rows (e.g. "Table | Measure | Description | Formula"). Always convert to prose.
+3. NEVER output lines containing "is described as:" — extract and rephrase the content instead.
+4. NEVER repeat the same fact twice in one answer.
+5. NEVER start your answer with "Based on the context" or similar meta-phrases.
+6. If the context contains a formula line (with "divided by", "minus", "plus", or "="), quote it exactly — do not paraphrase or invent a different formula.
+7. If a definition includes an enumerated list (e.g. date aspects, milestones), include ALL items from the list.
+8. Match terms case-insensitively. A plural query ("milestones") should match singular content ("milestone").
+9. If a URL appears in the context, return it exactly as-is on its own line.
+10. If the answer is genuinely absent from the context: respond with exactly "I couldn't find that in your documents." — nothing else.
+11. Never invent, assume, or extrapolate information not present in the context.`
 
 function buildDynamicSystemPrompt(hits, intent = 'general') {
   const types     = [...new Set(hits.map(h => classifyExtension(h.source_file || '')))]
@@ -600,10 +710,10 @@ function buildDynamicSystemPrompt(hits, intent = 'general') {
 
   const parts = [
     BASE_SYSTEM_PROMPT,
-    INTENT_STRATEGY[intent] || INTENT_STRATEGY.general,
+    `INTENT STRATEGY:\n${INTENT_STRATEGY[intent] || INTENT_STRATEGY.general}`,
   ]
-  if (typeNotes.length) parts.push('SOURCE NOTES:\n' + typeNotes.map((n, i) => `${i + 1}. ${n}`).join('\n'))
-  if (types.length > 1) parts.push(`Context spans ${types.length} source types — apply the relevant note per excerpt.`)
+  if (typeNotes.length) parts.push('SOURCE FORMAT NOTES:\n' + typeNotes.map((n, i) => `${i + 1}. ${n}`).join('\n'))
+  if (types.length > 1) parts.push(`The context spans ${types.length} source types — apply the relevant format note per excerpt.`)
 
   const prompt = parts.join('\n\n')
 
@@ -697,6 +807,9 @@ function requireAdminKey(req, res, next) {
 function generateApiKey() {
   return `rak_${crypto.randomBytes(32).toString('hex')}`
 }
+
+// ─── Text extraction ──────────────────────────────────────────────────────────
+
 async function extractPdf(buffer)  { const r = await pdfParse(buffer); return r.text || '' }
 async function extractWord(buffer) { const r = await mammoth.extractRawText({ buffer }); return r.value || '' }
 
@@ -824,8 +937,15 @@ async function extractTextFromBuffer(buffer, fileName) {
 function chunkText(text, sourceFile) {
   const chunks = []
   let index    = 0
-  const lines  = text.replace(/\r\n/g, '\n').split('\n').map(l => l.trim()).filter(l => l.length > 0)
-  let buffer   = []
+  const lines  = text.replace(/\r\n/g, '\n').split('\n')
+    .map(l => l.trim())
+    .filter(l => {
+      if (l.length === 0) return false
+      if (SKIP_LINE_PATTERN.test(l)) return false   // FIX: drop copyright/header lines
+      return true
+    })
+
+  let buffer = []
   for (const line of lines) {
     const projectedLength = buffer.join('\n').length + (buffer.length ? 1 : 0) + line.length
     if (buffer.length > 0 && projectedLength > CHUNK_SIZE) {
@@ -956,26 +1076,53 @@ function warmupChunkCaches() {
       .catch(err => console.warn(`[warmup] ${clientId} — ${err.message}`))
   }
 }
+
+// ─── Answer generation ────────────────────────────────────────────────────────
+
 async function answerWithPhi4(originalQuery, hits, intent = 'general') {
   const systemPrompt = buildDynamicSystemPrompt(hits, intent)
   const context      = buildContext(hits)
 
-  const subjectHint  = intent === 'definition'
-    ? `\nYou must define ONLY this exact term: "${extractSubject(originalQuery)}". Write 1–3 clean sentences in plain English. Do NOT copy raw data rows or "is described as:" lines into your answer.`
-    : intent === 'url_lookup'
-    ? `\nReturn the full URL for: "${extractUrlKeywords(originalQuery).join(' ')}". Put it on its own line. No disclaimers.`
-    : ''
+  // FIX: extract formula lines from top hits to anchor the model
+  const topFormulaLines = hits.slice(0, 3)
+    .flatMap(h => extractFormulaLines(h.text || ''))
+    .filter(Boolean)
+    .slice(0, 3)
+
+  let subjectHint = ''
+  if (intent === 'formula') {
+    const subject = extractSubject(originalQuery)
+    subjectHint = `\nYou must state the EXACT formula for: "${subject}".`
+    if (topFormulaLines.length > 0) {
+      subjectHint += `\nThe context contains these formula lines — use them exactly:\n${topFormulaLines.map(l => `  • ${l}`).join('\n')}`
+    }
+    subjectHint += `\nDo NOT invent a formula. If none is found, say so.`
+  } else if (intent === 'definition') {
+    const subject = extractSubject(originalQuery)
+    subjectHint = `\nDefine ONLY this exact term: "${subject}". Include any enumerated lists completely. Do NOT copy pipe-delimited rows.`
+  } else if (intent === 'comparison') {
+    const terms = extractComparisonTerms(originalQuery)
+    subjectHint = `\nCompare these two specific terms: ${terms.map(t => `"${t}"`).join(' vs ')}. Define each separately, then state the key difference.`
+  } else if (intent === 'url_lookup') {
+    subjectHint = `\nReturn the full URL for: "${extractUrlKeywords(originalQuery).join(' ')}". Put it on its own line. No disclaimers.`
+  }
+
+  // FIX: use lower max_tokens for focused intents to reduce verbosity
+  const maxTokens = (intent === 'definition' || intent === 'formula') ? 300 : 512
 
   const userMessage = `CONTEXT:\n${context}${subjectHint}\n\nQuestion: ${originalQuery}`
-  return callPhi4(systemPrompt, userMessage)
+  return callPhi4(systemPrompt, userMessage, maxTokens)
 }
 
+// FIX: improved fallback — always tries to return formula/description lines from hits
 function buildFallbackAnswer(query, hits) {
   if (!hits || hits.length === 0) {
     return "I couldn't find relevant information in your documents for this query."
   }
-  const intent = detectQueryIntent(query)
+  const intent  = detectQueryIntent(query)
+  const subject = extractSubject(query).toLowerCase()
 
+  // URL fallback
   if (intent === 'url_lookup') {
     const urlKeywords = extractUrlKeywords(query)
     for (const h of hits) {
@@ -992,22 +1139,41 @@ function buildFallbackAnswer(query, hits) {
     }
   }
 
-  const subject = extractSubject(query).toLowerCase()
+  // FIX: formula fallback — return exact formula lines from hits
+  if (intent === 'formula') {
+    for (const h of hits) {
+      const lines = (h.text || '').split('\n')
+      for (const line of lines) {
+        const l = line.toLowerCase()
+        if (
+          (l.includes(subject) || subject.split(' ').some(w => l.includes(w))) &&
+          (l.includes('divided by') || l.includes('minus') || l.includes('plus') || /=\s*\w/.test(l))
+        ) {
+          return line.trim()
+        }
+      }
+    }
+    // Secondary: any formula line from top hit
+    const formulaLines = extractFormulaLines(hits[0]?.text || '')
+    if (formulaLines.length > 0) return formulaLines[0]
+  }
 
+  // "is described as" fallback for definitions
   const descLine = hits.find(h => {
     const t = (h.text || '').toLowerCase()
-    return t.includes('is described as') && t.includes(subject)
+    return t.includes('is described as') && subject.split(' ').some(w => t.includes(w))
   })
   if (descLine) {
     const lines = (descLine.text || '').split('\n')
     const relevantLine = lines.find(l =>
-      l.toLowerCase().includes(subject) && l.toLowerCase().includes('is described as')
+      subject.split(' ').some(w => l.toLowerCase().includes(w)) &&
+      l.toLowerCase().includes('is described as')
     )
     if (relevantLine) {
       const parts = relevantLine.split(/is described as:/i)
       if (parts[1]) {
-        const rawDesc = parts[1].trim().slice(0, 300)
-        const descParts = rawDesc.split('|').map(p => p.trim()).filter(Boolean)
+        const rawDesc    = parts[1].trim().slice(0, 300)
+        const descParts  = rawDesc.split('|').map(p => p.trim()).filter(Boolean)
         if (descParts.length === 1) {
           return `${subject.charAt(0).toUpperCase() + subject.slice(1)} is ${descParts[0]}.`
         }
@@ -1021,12 +1187,14 @@ function buildFallbackAnswer(query, hits) {
     }
   }
 
+  // General matching lines fallback
   const allMatchingLines = []
   for (const h of hits) {
     const lines = (h.text || '').split('\n')
     for (const line of lines) {
-      if (line.toLowerCase().includes(subject) && line.trim().length > 20) {
-        if ((line.match(/\|/g) || []).length > 3) continue
+      const ll = line.toLowerCase()
+      if (subject.split(' ').some(w => ll.includes(w)) && line.trim().length > 20) {
+        if ((line.match(/\|/g) || []).length > 2) continue   // FIX: skip lines with 3+ pipes (was 3 in original)
         if (/is described as:/i.test(line)) continue
         allMatchingLines.push(line.trim())
       }
@@ -1041,6 +1209,30 @@ function buildFallbackAnswer(query, hits) {
   return "I couldn't find that specific information in your documents."
 }
 
+// FIX: stronger cleanAnswer pipeline
+function cleanAnswer(rawAnswer) {
+  return fixBrokenUrls(rawAnswer)
+    // Remove Field placeholders
+    .replace(/\bField\d+\s*:\s*/gi, '')
+    .replace(/\|\s*Field\d+\b/gi, '')
+    // FIX: remove "is described as:" lines
+    .replace(/^.+\s+is described as:\s*.+$/gmi, '')
+    // FIX: remove any line with 3 or more pipe characters (was 4+ before)
+    .replace(/^[^\n]*\|[^\n]*\|[^\n]*[^\n]*$/gm, (match) => {
+      const pipeCount = (match.match(/\|/g) || []).length
+      return pipeCount >= 3 ? '' : match
+    })
+    // Remove lines that start with Table/sheet names followed by pipe
+    .replace(/^(Application|Household|Lease|Resident|Competitor|CapEx|Unit)[^\n]*\|[^\n]*/gmi, '')
+    // Remove meta-phrases
+    .replace(/^(based on (the )?context[,:]?\s*|according to (the )?context[,:]?\s*)/gim, '')
+    // FIX: remove copyright lines that leaked through
+    .replace(/^.*?(copyright|all rights reserved|confidential|proprietary).*$/gmi, '')
+    // Collapse blank lines
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
 function generateTitle(query) {
   const cleaned = query.trim().replace(/[?!.]+$/, '')
   return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned
@@ -1051,8 +1243,8 @@ function generateTitle(query) {
 app.get('/health', (req, res) => res.json({
   ok:                true,
   service:           'ask-data',
-  model:             'ask-data-response-model',
-  embeddings:        AZURE_EMBED_ENDPOINT ? 'azure-anurit' : 'keyword-only',
+  model:             PHI4_MODEL,
+  embeddings:        AZURE_EMBED_ENDPOINT ? 'azure' : 'keyword-only',
   chunkCacheSize:    CHUNK_CACHE.size,
   promptCacheSize:   SYSTEM_PROMPT_CACHE.size,
   responseCacheSize: RESPONSE_CACHE.size,
@@ -1323,7 +1515,8 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         rawAnswer = await Promise.race([
           answerWithPhi4(query.trim(), hits, intent),
           new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Model response timeout (15s)')), 15000)
+            // FIX: raised from 15s → 25s to reduce circuit-breaker false positives
+            setTimeout(() => reject(new Error('Model response timeout (25s)')), 25000)
           ),
         ])
       } catch (err) {
@@ -1331,15 +1524,9 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         rawAnswer = buildFallbackAnswer(query.trim(), hits)
       }
 
-      const cleanAnswer = fixBrokenUrls(rawAnswer)
-        .replace(/\bField\d+\s*:\s*/gi, '')
-        .replace(/\|\s*Field\d+\b/gi, '')
-        .replace(/^.+\s+is described as:\s*.+$/gmi, '')
-        .replace(/^[^\n]*\|[^\n]*\|[^\n]*\|[^\n]*\|[^\n]*$/gm, '')
-        .replace(/\n{3,}/g, '\n\n')
-        .trim()
+      // FIX: use the dedicated cleanAnswer function
+      const answer = cleanAnswer(rawAnswer || buildFallbackAnswer(query.trim(), hits))
 
-      const answer  = cleanAnswer
       const sources = hits.map(h => ({
         source_file: h.source_file  || 'unknown',
         chunk_index: h.chunk_index  ?? 0,
@@ -1392,6 +1579,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
     } finally {
       IN_FLIGHT.delete(cacheKey)
     }
+
     if (result.answer && result.answer.length > 10) {
       responseCacheSet(cacheKey, result)
     }
@@ -1401,10 +1589,12 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
     if (!res.headersSent) res.status(500).json({ error: err.message })
   }
 }))
+
 app.use((err, req, res, next) => {
   console.error('[global error handler]', err)
   if (!res.headersSent) res.status(500).json({ error: 'An unexpected error occurred. Please try again.' })
 })
+
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => {
   console.log(`rag-client-auth running on port ${PORT}`)
@@ -1412,7 +1602,7 @@ app.listen(PORT, () => {
   console.log(`Phi-4 timeout: ${PHI4_TIMEOUT_MS}ms | Embed timeout: ${EMBED_TIMEOUT_MS}ms`)
   console.log(`Chunk cache TTL: ${CHUNK_CACHE_TTL}ms | Embed pool limit: ${EMBED_POOL_LIMIT}`)
   console.log(`Request timeout: ${REQUEST_TIMEOUT_MS}ms | Keyword short-circuit score: ${KEYWORD_SHORTCIRCUIT_SCORE}`)
-  console.log(`Blob concurrency: ${BLOB_CONCURRENCY}`)
+  console.log(`Chunk overlap: ${CHUNK_OVERLAP} lines | Blob concurrency: ${BLOB_CONCURRENCY}`)
   console.log(`Azure blob client: ${blobServiceClient ? 'singleton ready' : 'MISSING connection string'}`)
   startApiKeyHealthChecker()
   warmupChunkCaches()
