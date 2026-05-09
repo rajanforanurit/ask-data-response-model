@@ -61,19 +61,19 @@ const KEY_CHECK_INTERVAL_MS    = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '
 const PHI4_ENDPOINT            = process.env.PHI4_ENDPOINT
 const PHI4_API_KEY             = process.env.PHI4_API_KEY
 const PHI4_MODEL               = process.env.PHI4_MODEL || 'Phi-4-mini-instruct'
-const PHI4_TIMEOUT_MS          = parseInt(process.env.PHI4_TIMEOUT_MS || '30000', 10)
+const PHI4_TIMEOUT_MS          = parseInt(process.env.PHI4_TIMEOUT_MS || '45000', 10)
 const AZURE_EMBED_ENDPOINT     = process.env.AZURE_EMBED_ENDPOINT || ''
 const AZURE_EMBED_KEY          = process.env.AZURE_EMBED_KEY || ''
 const AZURE_EMBED_MODEL        = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
 const EMBED_TIMEOUT_MS         = parseInt(process.env.EMBED_TIMEOUT_MS || '10000', 10)
 const EMBED_POOL_LIMIT         = parseInt(process.env.EMBED_POOL_LIMIT || '20', 10)
 const REQUEST_TIMEOUT_MS       = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10)
-const KEYWORD_SHORTCIRCUIT_SCORE = parseInt(process.env.KEYWORD_SHORTCIRCUIT_SCORE || '4', 10)  // FIX: lowered from 6 → 4
+const KEYWORD_SHORTCIRCUIT_SCORE = parseInt(process.env.KEYWORD_SHORTCIRCUIT_SCORE || '4', 10)
 const WARMUP_CLIENT_IDS        = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
 
 const RAW_PREFIX    = 'raw'
 const CHUNK_SIZE    = 500
-const CHUNK_OVERLAP = 5   // FIX: increased from 2 → 5 to preserve enumerated lists across boundaries
+const CHUNK_OVERLAP = 5
 
 const blobServiceClient = AZURE_CONNECTION_STRING
   ? BlobServiceClient.fromConnectionString(AZURE_CONNECTION_STRING)
@@ -105,10 +105,7 @@ const DOC_TYPE = {
   UNKNOWN:      'unknown',
 }
 
-// ─── FIX: copyright / header lines to skip during chunking ───────────────────
 const SKIP_LINE_PATTERN = /copyright|all rights reserved|confidential|proprietary|may not be reproduced|redistributed without/i
-
-// ─── Response cache ───────────────────────────────────────────────────────────
 
 const RESPONSE_CACHE     = new Map()
 const RESPONSE_CACHE_TTL = 10 * 60 * 1000
@@ -132,8 +129,6 @@ function responseCacheSet(key, value) {
 function getCacheKey(clientId, query) {
   return `${clientId}:${query.toLowerCase().trim()}`
 }
-
-// ─── Phi-4 concurrency / circuit breaker ─────────────────────────────────────
 
 const IN_FLIGHT = new Map()
 let phiActiveCount = 0
@@ -166,13 +161,15 @@ function drainPhiQueue() {
 
 let phiFailures     = 0
 let phiBlockedUntil = 0
+const PHI_FAILURE_THRESHOLD = 5
+const PHI_CIRCUIT_OPEN_MS   = 20000
 
 function phiCircuitOpen() {
   if (Date.now() < phiBlockedUntil) return true
   if (phiBlockedUntil > 0) {
     phiBlockedUntil = 0
     phiFailures     = 0
-    console.log('[phi4] Circuit breaker reset (timeout elapsed)')
+    console.log('[phi4] Circuit breaker reset')
   }
   return false
 }
@@ -181,13 +178,11 @@ function phiRecordSuccess() { phiFailures = 0; phiBlockedUntil = 0 }
 
 function phiRecordFailure() {
   phiFailures++
-  if (phiFailures >= 3) {
-    phiBlockedUntil = Date.now() + 30000
-    console.error(`[phi4] Circuit breaker OPEN for 30s after ${phiFailures} failures`)
+  if (phiFailures >= PHI_FAILURE_THRESHOLD) {
+    phiBlockedUntil = Date.now() + PHI_CIRCUIT_OPEN_MS
+    console.error(`[phi4] Circuit breaker OPEN for ${PHI_CIRCUIT_OPEN_MS}ms after ${phiFailures} failures`)
   }
 }
-
-// ─── Utilities ────────────────────────────────────────────────────────────────
 
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController()
@@ -246,11 +241,11 @@ function detectQueryIntent(query) {
   const LOOKUP_PATTERNS      = [/^(show|list|find|get|fetch|give)\s+(me\s+)?/,/^how\s+many\s+/,/^what\s+(is\s+the\s+)?(value|number|count|total|sum|amount)/]
   const COMPARISON_PATTERNS  = [/\bvs\b|\bversus\b|\bdifference\b|\bcompare\b|\bbetween\b/]
   const URL_PATTERNS         = [/\burl\b/,/\blink\b/,/\breport\b.*\burl\b/,/\burl\b.*\breport\b/,/\bpower\s*bi\b/,/\bdashboard\b/]
-  const FORMULA_PATTERNS     = [/\bhow\s+is\b.*\bcalculated\b/,/\bformula\s+for\b/,/\bhow\s+do\s+you\s+calculate\b/,/\bwhat\s+is\s+the\s+formula\b/]  // FIX: explicit formula intent
+  const FORMULA_PATTERNS     = [/\bhow\s+is\b.*\bcalculated\b/,/\bformula\s+for\b/,/\bhow\s+do\s+you\s+calculate\b/,/\bwhat\s+is\s+the\s+formula\b/]
   const GREETING_PATTERNS    = [/^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening)|how\s+are\s+you|what's\s+up|sup)\b/]
   if (GREETING_PATTERNS.some(p => p.test(q))) return 'greeting'
   if (URL_PATTERNS.some(p => p.test(q)))      return 'url_lookup'
-  if (FORMULA_PATTERNS.some(p => p.test(q)))  return 'formula'   // FIX: formula checked before definition
+  if (FORMULA_PATTERNS.some(p => p.test(q)))  return 'formula'
   if (DEFINITION_PATTERNS.some(p => p.test(q))) return 'definition'
   if (COMPARISON_PATTERNS.some(p => p.test(q))) return 'comparison'
   if (LOOKUP_PATTERNS.some(p => p.test(q)))     return 'lookup'
@@ -270,7 +265,7 @@ function extractSubject(query) {
     /^describe\s+(?:an?\s+|the\s+)?(.+)$/,
     /^how\s+is\s+(.+?)\s+(calculated|defined|measured|computed)$/,
     /^what\s+is\s+the\s+formula\s+for\s+(?:calculating\s+)?(?:an?\s+|the\s+)?(.+)$/,
-    /^how\s+do\s+you\s+calculate\s+(?:an?\s+|the\s+)?(.+)$/,  // FIX: added pattern
+    /^how\s+do\s+you\s+calculate\s+(?:an?\s+|the\s+)?(.+)$/,
   ]
   for (const p of patterns) {
     const m = q.match(p)
@@ -279,7 +274,6 @@ function extractSubject(query) {
   return q
 }
 
-// FIX: stem simple plurals so 'milestones' finds 'milestone' chunks
 function stemWord(word) {
   if (word.length > 4 && word.endsWith('s') && !word.endsWith('ss')) {
     return word.slice(0, -1)
@@ -287,7 +281,6 @@ function stemWord(word) {
   return word
 }
 
-// FIX: for comparison queries, extract each side of the comparison
 function extractComparisonTerms(query) {
   const q = query.toLowerCase().replace(/[?!.]+$/, '').trim()
   const patterns = [
@@ -336,7 +329,7 @@ function buildInvertedIndex(chunks) {
       .split(/\s+/)
     for (const w of words) {
       if (w.length < 3) continue
-      const stemmed = stemWord(w)   // FIX: index both original and stemmed
+      const stemmed = stemWord(w)
       for (const form of new Set([w, stemmed])) {
         if (!index.has(form)) index.set(form, new Set())
         index.get(form).add(i)
@@ -346,10 +339,9 @@ function buildInvertedIndex(chunks) {
   return index
 }
 
-// FIX: extract formula lines from a chunk for anchor injection
 function extractFormulaLines(text) {
   const lines = (text || '').split('\n')
-  const formulaLines = lines.filter(line => {
+  return lines.filter(line => {
     const l = line.toLowerCase()
     return (
       l.includes('divided by') ||
@@ -360,49 +352,65 @@ function extractFormulaLines(text) {
       /=\s*\w/.test(l) ||
       /formula/i.test(l)
     )
-  })
-  return formulaLines.map(l => l.trim()).filter(Boolean)
+  }).map(l => l.trim()).filter(Boolean)
 }
 
-// ─── Phi-4 call ───────────────────────────────────────────────────────────────
+async function callPhi4WithRetry(systemPrompt, userMessage, maxTokens = 400) {
+  if (!PHI4_ENDPOINT || !PHI4_API_KEY) throw new Error('PHI4_ENDPOINT and PHI4_API_KEY are required')
 
-async function callPhi4(systemPrompt, userMessage, maxTokens = 512) {
-  if (!PHI4_ENDPOINT || !PHI4_API_KEY) throw new Error('PHI4_ENDPOINT and PHI4_API_KEY environment variables are required')
-  if (phiCircuitOpen()) throw new Error('Model temporarily unavailable (circuit breaker open)')
+  const MAX_RETRIES = 2
+  let lastErr
 
-  return runWithPhiLimit(async () => {
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    if (phiCircuitOpen()) throw new Error('Model temporarily unavailable (circuit breaker open)')
+
     try {
-      const response = await fetchWithTimeout(
-        PHI4_ENDPOINT,
-        {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${PHI4_API_KEY}` },
-          body: JSON.stringify({
-            model:       PHI4_MODEL,
-            messages:    [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
-            temperature: 0.1,
-            max_tokens:  maxTokens,  // FIX: allow callers to control verbosity
-          }),
-        },
-        PHI4_TIMEOUT_MS
-      )
+      const result = await runWithPhiLimit(async () => {
+        const response = await fetchWithTimeout(
+          PHI4_ENDPOINT,
+          {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${PHI4_API_KEY}` },
+            body: JSON.stringify({
+              model:       PHI4_MODEL,
+              messages:    [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
+              temperature: 0.1,
+              max_tokens:  maxTokens,
+            }),
+          },
+          PHI4_TIMEOUT_MS
+        )
 
-      if (!response.ok) {
-        const errText = await response.text()
-        throw new Error(`Phi-4 API error ${response.status}: ${errText}`)
+        if (!response.ok) {
+          const errText = await response.text()
+          throw new Error(`Phi-4 API error ${response.status}: ${errText}`)
+        }
+
+        const data = await response.json()
+        return data.choices?.[0]?.message?.content || ''
+      })
+
+      phiRecordSuccess()
+      return result
+    } catch (err) {
+      lastErr = err
+      const isTimeout = err.message.includes('timed out') || err.message.includes('AbortError')
+      const isRetryable = isTimeout || err.message.includes('429') || err.message.includes('503')
+
+      if (!isRetryable || attempt === MAX_RETRIES) {
+        phiRecordFailure()
+        throw err
       }
 
-      const data = await response.json()
-      phiRecordSuccess()
-      return data.choices?.[0]?.message?.content || ''
-    } catch (err) {
-      phiRecordFailure()
-      throw err
+      const delay = 1000 * (attempt + 1)
+      console.warn(`[phi4] Attempt ${attempt + 1} failed (${err.message}), retrying in ${delay}ms...`)
+      await new Promise(r => setTimeout(r, delay))
     }
-  })
-}
+  }
 
-// ─── Embeddings ───────────────────────────────────────────────────────────────
+  phiRecordFailure()
+  throw lastErr
+}
 
 async function embedQueryAzure(query) {
   if (!AZURE_EMBED_ENDPOINT || !AZURE_EMBED_KEY) return null
@@ -446,18 +454,14 @@ async function embedBatch(texts) {
   }
 }
 
-// ─── Retrieval ────────────────────────────────────────────────────────────────
-
 function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = null) {
   const subject      = (intent === 'definition' || intent === 'formula') ? extractSubject(query) : query.toLowerCase()
   const queryLower   = query.toLowerCase()
   const subjectLower = subject.toLowerCase()
 
-  // FIX: stem subject words for better plural/variant matching
   const subjectWords = subjectLower.split(/\s+/).filter(w => w.length > 1).map(w => stemWord(w))
   const queryWords   = queryLower.replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1)
-
-  const urlKeywords = intent === 'url_lookup' ? extractUrlKeywords(query) : []
+  const urlKeywords  = intent === 'url_lookup' ? extractUrlKeywords(query) : []
 
   const useWordBoundary = subjectWords.length === 1 && subjectLower.length <= 10
   const subjectBoundaryPattern = useWordBoundary
@@ -467,7 +471,6 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
   let candidateIndices
   if (invertedIndex && subjectWords.length > 0) {
     const wordsToIndex = intent === 'url_lookup' ? urlKeywords : subjectWords
-    // FIX: also look up stemmed forms
     const stemmedWords = wordsToIndex.map(stemWord)
     const allForms     = [...new Set([...wordsToIndex, ...stemmedWords])]
     const sets = allForms.map(w => invertedIndex.get(w) || new Set())
@@ -503,7 +506,7 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
       } else {
         const subjectFound = subjectBoundaryPattern
           ? subjectBoundaryPattern.test(c.text || '')
-          : subjectWords.some(sw => text.includes(sw))  // FIX: any stemmed word matches
+          : subjectWords.some(sw => text.includes(sw))
 
         if (subjectFound) {
           score += subjectWords.length * 4
@@ -523,7 +526,6 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
           return wPattern.test(c.text || '')
         }).length * 2
 
-        // FIX: boost formula intent hits
         if (intent === 'formula') {
           const formulaLines = extractFormulaLines(c.text || '')
           if (formulaLines.length > 0) score += 8
@@ -556,7 +558,6 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
     .slice(0, topK)
 }
 
-// FIX: separate keyword search per comparison term, merge results
 function keywordSearchComparison(query, chunks, topK, invertedIndex) {
   const terms = extractComparisonTerms(query)
   if (terms.length < 2) return keywordSearch(query, chunks, topK, 'general', invertedIndex)
@@ -579,7 +580,6 @@ async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
   const normalizedQuery = query.toLowerCase().trim().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
   const keywordTopK     = (intent === 'definition' || intent === 'formula') ? Math.min(150, chunks.length) : Math.min(100, chunks.length)
 
-  // FIX: use comparison-aware retrieval
   let candidates
   if (intent === 'comparison') {
     candidates = keywordSearchComparison(normalizedQuery, chunks, keywordTopK, invertedIndex)
@@ -590,7 +590,7 @@ async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
   const pool = candidates.length > 0 ? candidates : chunks.slice(0, 100)
 
   if (pool.length > 0 && pool[0]._score >= KEYWORD_SHORTCIRCUIT_SCORE) {
-    console.log(`[retrieveChunks] keyword short-circuit (score=${pool[0]._score}) — skipping embed`)
+    console.log(`[retrieveChunks] keyword short-circuit (score=${pool[0]._score})`)
     return pool.slice(0, Math.min(topK, 10))
   }
 
@@ -652,53 +652,50 @@ function buildContext(hits) {
   }
 
   return deduped.map((h, i) => {
-    const charLimit = i === 0 ? 800 : i <= 2 ? 600 : 400  // FIX: increased limits to preserve full enum lists
+    const charLimit = i === 0 ? 800 : i <= 2 ? 600 : 400
     const text = (h.text || '').trim().slice(0, charLimit)
     return `[${i + 1}] ${text}`
   }).join('\n\n')
 }
 
-// ─── System prompts ───────────────────────────────────────────────────────────
-
 const SYSTEM_PROMPT_CACHE     = new Map()
 const SYSTEM_PROMPT_CACHE_MAX = 100
 
 const INTENT_STRATEGY = {
-  definition: `TASK: Define the exact term asked. Write 2–4 natural English sentences. Include all enumerated items if the definition contains a list. Combine multiple excerpts if needed. Never copy raw data rows.`,
-  formula:    `TASK: State the exact formula or calculation method for the term asked. Lead with the formula itself (e.g. "X is calculated as A divided by B"). Then add one sentence of context if helpful. If a formula line appears in the context, use it verbatim — do not paraphrase or invent.`,  // FIX: explicit formula intent strategy
-  lookup:     `TASK: Find and report the exact value or list asked for. State clearly what it represents.`,
-  comparison: `TASK: Compare the two items asked. Write a structured but natural summary — define each term separately first, then state the key difference. Keep to 4–6 sentences total.`, 
-  url_lookup: `TASK: Return the full URL that matches the topic, on its own line, unmodified. If none found, say so.`,
-  general:    `TASK: Find information that directly answers the question and write a clear, complete summary.`,
+  definition: `Define the exact term asked. Write 2-4 plain English sentences. Include all list items if present.`,
+  formula:    `State the exact formula first (e.g. "X = A / B"). Add one context sentence if helpful. Use formula lines from context verbatim.`,
+  lookup:     `Report the exact value or list asked for. State what it represents.`,
+  comparison: `Define each term separately in 1-2 sentences each, then state the key difference. 4-6 sentences total.`,
+  url_lookup: `Return the full matching URL on its own line, unmodified. If none found, say so.`,
+  general:    `Write a clear, complete answer from the context. 2-4 sentences.`,
 }
 
 const TYPE_NOTES = {
-  [DOC_TYPE.SPREADSHEET]:  `Spreadsheet data is serialized as pipe-delimited rows and "X is described as: …" lines — these are internal representations. Read them to understand meaning; NEVER reproduce pipe-delimited rows or "is described as:" lines verbatim in your answer. Always rewrite in plain English sentences.`,
-  [DOC_TYPE.DATA]:         `JSON/YAML/CSV fields may be nested ("parent.child: value"). Read for meaning; never dump raw key:value pairs.`,
-  [DOC_TYPE.PDF]:          `PDF text may have minor extraction artefacts. Read numbers and dates exactly as shown; ignore headers, footers, and page numbers.`,
-  [DOC_TYPE.WORD]:         `Word docs contain prose, lists, and tables. Headings show section structure. Quote policy/definition statements accurately.`,
-  [DOC_TYPE.PRESENTATION]: `Slide titles are section headers; bullets are detail. Do not infer beyond what the slide states.`,
-  [DOC_TYPE.CODE]:         `Read code literally — function/variable names and comments all matter. Describe what code does in plain English unless code output is requested.`,
-  [DOC_TYPE.TEXT]:         `Markdown formatting (##, **, -) indicates structure. Lists represent discrete facts or steps.`,
-  [DOC_TYPE.EMAIL]:        `Attribute statements to their sender. Dates and times are as stated in the email header.`,
-  [DOC_TYPE.WEB]:          `Focus on main body content; ignore repetitive navigation text. Include URLs exactly as written.`,
+  [DOC_TYPE.SPREADSHEET]: `Spreadsheet: rows are pipe-delimited or "X is described as: …". Extract meaning; never output raw pipes or "is described as:" lines.`,
+  [DOC_TYPE.DATA]:        `JSON/YAML/CSV: nested "parent.child: value" fields. Extract meaning; never dump raw key:value pairs.`,
+  [DOC_TYPE.PDF]:         `PDF: read numbers/dates exactly; ignore headers, footers, page numbers.`,
+  [DOC_TYPE.WORD]:        `Word doc: headings show structure. Quote definitions accurately.`,
+  [DOC_TYPE.PRESENTATION]:`Slides: titles are headers, bullets are detail. Do not infer beyond slide content.`,
+  [DOC_TYPE.CODE]:        `Code: function/variable names and comments matter. Describe in plain English unless code output is requested.`,
+  [DOC_TYPE.TEXT]:        `Markdown: ## and - indicate structure. Lists are discrete facts or steps.`,
+  [DOC_TYPE.EMAIL]:       `Email: attribute statements to sender. Dates/times are from the header.`,
+  [DOC_TYPE.WEB]:         `Web: focus on body content; ignore nav. Include URLs exactly as written.`,
 }
 
-// FIX: comprehensive rewrite of base system prompt
-const BASE_SYSTEM_PROMPT = `You are a precise data dictionary assistant. Answer ONLY from the provided context excerpts.
+const BASE_SYSTEM_PROMPT = `You are a data dictionary assistant. Answer ONLY from the provided context.
 
-STRICT OUTPUT RULES — follow every rule on every response:
-1. Write in plain English prose. Maximum 4 sentences unless a list or formula is explicitly needed.
-2. NEVER output pipe-delimited rows (e.g. "Table | Measure | Description | Formula"). Always convert to prose.
-3. NEVER output lines containing "is described as:" — extract and rephrase the content instead.
-4. NEVER repeat the same fact twice in one answer.
-5. NEVER start your answer with "Based on the context" or similar meta-phrases.
-6. If the context contains a formula line (with "divided by", "minus", "plus", or "="), quote it exactly — do not paraphrase or invent a different formula.
-7. If a definition includes an enumerated list (e.g. date aspects, milestones), include ALL items from the list.
-8. Match terms case-insensitively. A plural query ("milestones") should match singular content ("milestone").
-9. If a URL appears in the context, return it exactly as-is on its own line.
-10. If the answer is genuinely absent from the context: respond with exactly "I couldn't find that in your documents." — nothing else.
-11. Never invent, assume, or extrapolate information not present in the context.`
+Rules:
+1. Plain English prose, max 4 sentences unless a list or formula is needed.
+2. Never output pipe-delimited rows. Always convert to prose.
+3. Never output "is described as:" lines — rephrase the content.
+4. Never repeat the same fact twice.
+5. Never start with "Based on the context" or similar.
+6. If context has a formula line (divided by/minus/plus/=), quote it exactly.
+7. If a definition has an enumerated list, include ALL items.
+8. Match terms case-insensitively. Plural query matches singular content.
+9. Return URLs exactly as-is on their own line.
+10. If answer is absent: respond "I couldn't find that in your documents." only.
+11. Never invent or extrapolate information.`
 
 function buildDynamicSystemPrompt(hits, intent = 'general') {
   const types     = [...new Set(hits.map(h => classifyExtension(h.source_file || '')))]
@@ -710,10 +707,9 @@ function buildDynamicSystemPrompt(hits, intent = 'general') {
 
   const parts = [
     BASE_SYSTEM_PROMPT,
-    `INTENT STRATEGY:\n${INTENT_STRATEGY[intent] || INTENT_STRATEGY.general}`,
+    `Intent: ${INTENT_STRATEGY[intent] || INTENT_STRATEGY.general}`,
   ]
-  if (typeNotes.length) parts.push('SOURCE FORMAT NOTES:\n' + typeNotes.map((n, i) => `${i + 1}. ${n}`).join('\n'))
-  if (types.length > 1) parts.push(`The context spans ${types.length} source types — apply the relevant format note per excerpt.`)
+  if (typeNotes.length) parts.push('Source notes:\n' + typeNotes.map((n, i) => `${i + 1}. ${n}`).join('\n'))
 
   const prompt = parts.join('\n\n')
 
@@ -722,8 +718,6 @@ function buildDynamicSystemPrompt(hits, intent = 'general') {
   SYSTEM_PROMPT_CACHE.set(cacheKey, prompt)
   return prompt
 }
-
-// ─── MongoDB helpers ──────────────────────────────────────────────────────────
 
 let db = null
 async function getDb() {
@@ -744,8 +738,6 @@ async function getChatDb() {
   chatDb = client.db(CHAT_HISTORY_DB)
   return chatDb
 }
-
-// ─── Client cache / auth ──────────────────────────────────────────────────────
 
 const CLIENT_CACHE = new Map()
 const CACHE_TTL_MS = 5 * 60 * 1000
@@ -807,8 +799,6 @@ function requireAdminKey(req, res, next) {
 function generateApiKey() {
   return `rak_${crypto.randomBytes(32).toString('hex')}`
 }
-
-// ─── Text extraction ──────────────────────────────────────────────────────────
 
 async function extractPdf(buffer)  { const r = await pdfParse(buffer); return r.text || '' }
 async function extractWord(buffer) { const r = await mammoth.extractRawText({ buffer }); return r.value || '' }
@@ -932,8 +922,6 @@ async function extractTextFromBuffer(buffer, fileName) {
   return ''
 }
 
-// ─── Chunking ─────────────────────────────────────────────────────────────────
-
 function chunkText(text, sourceFile) {
   const chunks = []
   let index    = 0
@@ -941,7 +929,7 @@ function chunkText(text, sourceFile) {
     .map(l => l.trim())
     .filter(l => {
       if (l.length === 0) return false
-      if (SKIP_LINE_PATTERN.test(l)) return false   // FIX: drop copyright/header lines
+      if (SKIP_LINE_PATTERN.test(l)) return false
       return true
     })
 
@@ -961,8 +949,6 @@ function chunkText(text, sourceFile) {
   }
   return chunks
 }
-
-// ─── Blob / chunk loading ─────────────────────────────────────────────────────
 
 async function downloadBlobAsBuffer(containerClient, blobName) {
   const download = await containerClient.getBlobClient(blobName).download()
@@ -1077,13 +1063,10 @@ function warmupChunkCaches() {
   }
 }
 
-// ─── Answer generation ────────────────────────────────────────────────────────
-
 async function answerWithPhi4(originalQuery, hits, intent = 'general') {
   const systemPrompt = buildDynamicSystemPrompt(hits, intent)
   const context      = buildContext(hits)
 
-  // FIX: extract formula lines from top hits to anchor the model
   const topFormulaLines = hits.slice(0, 3)
     .flatMap(h => extractFormulaLines(h.text || ''))
     .filter(Boolean)
@@ -1092,29 +1075,27 @@ async function answerWithPhi4(originalQuery, hits, intent = 'general') {
   let subjectHint = ''
   if (intent === 'formula') {
     const subject = extractSubject(originalQuery)
-    subjectHint = `\nYou must state the EXACT formula for: "${subject}".`
+    subjectHint = `\nState the EXACT formula for: "${subject}".`
     if (topFormulaLines.length > 0) {
-      subjectHint += `\nThe context contains these formula lines — use them exactly:\n${topFormulaLines.map(l => `  • ${l}`).join('\n')}`
+      subjectHint += `\nUse these formula lines exactly:\n${topFormulaLines.map(l => `  • ${l}`).join('\n')}`
     }
-    subjectHint += `\nDo NOT invent a formula. If none is found, say so.`
+    subjectHint += `\nIf no formula found, say so.`
   } else if (intent === 'definition') {
     const subject = extractSubject(originalQuery)
-    subjectHint = `\nDefine ONLY this exact term: "${subject}". Include any enumerated lists completely. Do NOT copy pipe-delimited rows.`
+    subjectHint = `\nDefine ONLY: "${subject}". Include all list items. No pipe-delimited rows.`
   } else if (intent === 'comparison') {
     const terms = extractComparisonTerms(originalQuery)
-    subjectHint = `\nCompare these two specific terms: ${terms.map(t => `"${t}"`).join(' vs ')}. Define each separately, then state the key difference.`
+    subjectHint = `\nCompare: ${terms.map(t => `"${t}"`).join(' vs ')}. Define each, then state the key difference.`
   } else if (intent === 'url_lookup') {
-    subjectHint = `\nReturn the full URL for: "${extractUrlKeywords(originalQuery).join(' ')}". Put it on its own line. No disclaimers.`
+    subjectHint = `\nReturn the full URL for: "${extractUrlKeywords(originalQuery).join(' ')}". One line, no disclaimers.`
   }
 
-  // FIX: use lower max_tokens for focused intents to reduce verbosity
-  const maxTokens = (intent === 'definition' || intent === 'formula') ? 300 : 512
+  const maxTokens = (intent === 'definition' || intent === 'formula') ? 250 : 400
 
   const userMessage = `CONTEXT:\n${context}${subjectHint}\n\nQuestion: ${originalQuery}`
-  return callPhi4(systemPrompt, userMessage, maxTokens)
+  return callPhi4WithRetry(systemPrompt, userMessage, maxTokens)
 }
 
-// FIX: improved fallback — always tries to return formula/description lines from hits
 function buildFallbackAnswer(query, hits) {
   if (!hits || hits.length === 0) {
     return "I couldn't find relevant information in your documents for this query."
@@ -1122,7 +1103,6 @@ function buildFallbackAnswer(query, hits) {
   const intent  = detectQueryIntent(query)
   const subject = extractSubject(query).toLowerCase()
 
-  // URL fallback
   if (intent === 'url_lookup') {
     const urlKeywords = extractUrlKeywords(query)
     for (const h of hits) {
@@ -1139,7 +1119,6 @@ function buildFallbackAnswer(query, hits) {
     }
   }
 
-  // FIX: formula fallback — return exact formula lines from hits
   if (intent === 'formula') {
     for (const h of hits) {
       const lines = (h.text || '').split('\n')
@@ -1153,12 +1132,10 @@ function buildFallbackAnswer(query, hits) {
         }
       }
     }
-    // Secondary: any formula line from top hit
     const formulaLines = extractFormulaLines(hits[0]?.text || '')
     if (formulaLines.length > 0) return formulaLines[0]
   }
 
-  // "is described as" fallback for definitions
   const descLine = hits.find(h => {
     const t = (h.text || '').toLowerCase()
     return t.includes('is described as') && subject.split(' ').some(w => t.includes(w))
@@ -1187,14 +1164,13 @@ function buildFallbackAnswer(query, hits) {
     }
   }
 
-  // General matching lines fallback
   const allMatchingLines = []
   for (const h of hits) {
     const lines = (h.text || '').split('\n')
     for (const line of lines) {
       const ll = line.toLowerCase()
       if (subject.split(' ').some(w => ll.includes(w)) && line.trim().length > 20) {
-        if ((line.match(/\|/g) || []).length > 2) continue   // FIX: skip lines with 3+ pipes (was 3 in original)
+        if ((line.match(/\|/g) || []).length > 2) continue
         if (/is described as:/i.test(line)) continue
         allMatchingLines.push(line.trim())
       }
@@ -1209,26 +1185,18 @@ function buildFallbackAnswer(query, hits) {
   return "I couldn't find that specific information in your documents."
 }
 
-// FIX: stronger cleanAnswer pipeline
 function cleanAnswer(rawAnswer) {
   return fixBrokenUrls(rawAnswer)
-    // Remove Field placeholders
     .replace(/\bField\d+\s*:\s*/gi, '')
     .replace(/\|\s*Field\d+\b/gi, '')
-    // FIX: remove "is described as:" lines
     .replace(/^.+\s+is described as:\s*.+$/gmi, '')
-    // FIX: remove any line with 3 or more pipe characters (was 4+ before)
     .replace(/^[^\n]*\|[^\n]*\|[^\n]*[^\n]*$/gm, (match) => {
       const pipeCount = (match.match(/\|/g) || []).length
       return pipeCount >= 3 ? '' : match
     })
-    // Remove lines that start with Table/sheet names followed by pipe
     .replace(/^(Application|Household|Lease|Resident|Competitor|CapEx|Unit)[^\n]*\|[^\n]*/gmi, '')
-    // Remove meta-phrases
     .replace(/^(based on (the )?context[,:]?\s*|according to (the )?context[,:]?\s*)/gim, '')
-    // FIX: remove copyright lines that leaked through
     .replace(/^.*?(copyright|all rights reserved|confidential|proprietary).*$/gmi, '')
-    // Collapse blank lines
     .replace(/\n{3,}/g, '\n\n')
     .trim()
 }
@@ -1237,8 +1205,6 @@ function generateTitle(query) {
   const cleaned = query.trim().replace(/[?!.]+$/, '')
   return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned
 }
-
-// ─── Routes ───────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => res.json({
   ok:                true,
@@ -1515,8 +1481,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         rawAnswer = await Promise.race([
           answerWithPhi4(query.trim(), hits, intent),
           new Promise((_, reject) =>
-            // FIX: raised from 15s → 25s to reduce circuit-breaker false positives
-            setTimeout(() => reject(new Error('Model response timeout (25s)')), 25000)
+            setTimeout(() => reject(new Error('Model response timeout (40s)')), 40000)
           ),
         ])
       } catch (err) {
@@ -1524,7 +1489,6 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         rawAnswer = buildFallbackAnswer(query.trim(), hits)
       }
 
-      // FIX: use the dedicated cleanAnswer function
       const answer = cleanAnswer(rawAnswer || buildFallbackAnswer(query.trim(), hits))
 
       const sources = hits.map(h => ({
@@ -1594,7 +1558,6 @@ app.use((err, req, res, next) => {
   console.error('[global error handler]', err)
   if (!res.headersSent) res.status(500).json({ error: 'An unexpected error occurred. Please try again.' })
 })
-
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => {
   console.log(`rag-client-auth running on port ${PORT}`)
@@ -1603,6 +1566,7 @@ app.listen(PORT, () => {
   console.log(`Chunk cache TTL: ${CHUNK_CACHE_TTL}ms | Embed pool limit: ${EMBED_POOL_LIMIT}`)
   console.log(`Request timeout: ${REQUEST_TIMEOUT_MS}ms | Keyword short-circuit score: ${KEYWORD_SHORTCIRCUIT_SCORE}`)
   console.log(`Chunk overlap: ${CHUNK_OVERLAP} lines | Blob concurrency: ${BLOB_CONCURRENCY}`)
+  console.log(`Circuit breaker: threshold=${PHI_FAILURE_THRESHOLD} failures, cooldown=${PHI_CIRCUIT_OPEN_MS}ms`)
   console.log(`Azure blob client: ${blobServiceClient ? 'singleton ready' : 'MISSING connection string'}`)
   startApiKeyHealthChecker()
   warmupChunkCaches()
