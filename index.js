@@ -474,6 +474,15 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
         }
 
         if (text.includes(queryLower)) score += queryWords.length * 2
+
+        // ── EXACT FIELD BOOSTING (spreadsheet glossary precision) ──────────
+        const normalizedQuery = query.toLowerCase().trim().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
+
+        const exactMeasureMatch = new RegExp(`measure\\s*=\\s*${escapeRegex(normalizedQuery)}`, 'i').test(c.text || '')
+        if (exactMeasureMatch) score += 25
+
+        const exactAttributeMatch = new RegExp(`attribute\\s*=\\s*${escapeRegex(normalizedQuery)}`, 'i').test(c.text || '')
+        if (exactAttributeMatch) score += 25
       }
 
       return { ...c, _score: score }
@@ -483,6 +492,29 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
     .slice(0, topK)
 }
 
+// ─── Reranker ─────────────────────────────────────────────────────────────────
+
+function rerankHits(query, hits) {
+  const q = query.toLowerCase()
+
+  return hits
+    .map(h => {
+      let boost = 0
+      const text = (h.text || '').toLowerCase()
+
+      if (text.includes(q)) boost += 20
+
+      const words = q.split(/\s+/)
+      const overlap = words.filter(w => text.includes(w)).length
+      boost += overlap * 3
+
+      if (/measure\s*=/.test(text)) boost += 5
+      if (/attribute\s*=/.test(text)) boost += 5
+
+      return { ...h, _score: (h._score || 0) + boost }
+    })
+    .sort((a, b) => b._score - a._score)
+}
 async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
   const intent          = detectQueryIntent(query)
   const normalizedQuery = query.toLowerCase().trim().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
@@ -490,19 +522,24 @@ async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
   const candidates      = keywordSearch(normalizedQuery, chunks, keywordTopK, intent, invertedIndex)
   const pool            = candidates.length > 0 ? candidates : chunks.slice(0, 100)
 
+  // ── Low confidence rejection ───────────────────────────────────────────────
+  if (pool[0]?._score < 3) {
+    console.log(`[retrieveChunks] Low confidence (score=${pool[0]?._score}) — returning empty`)
+    return []
+  }
+
   if (pool.length > 0 && pool[0]._score >= KEYWORD_SHORTCIRCUIT_SCORE) {
     console.log(`[retrieveChunks] keyword short-circuit (score=${pool[0]._score}) — skipping embed`)
-    return pool.slice(0, Math.min(topK, 10))
+    const reranked = rerankHits(query, pool.slice(0, Math.min(topK, 10)))
+    return reranked
   }
-
   if (intent === 'definition' && pool.length > 0 && pool[0]._score >= 4) {
-    return pool.slice(0, Math.min(topK, 10))
+    const reranked = rerankHits(query, pool.slice(0, Math.min(topK, 10)))
+    return reranked
   }
-
   if (intent === 'url_lookup' && pool.length > 0) {
     return pool.slice(0, Math.min(topK, 6))
   }
-
   if (AZURE_EMBED_ENDPOINT && AZURE_EMBED_KEY) {
     try {
       const queryVec = await embedQueryAzure(normalizedQuery)
@@ -528,17 +565,17 @@ async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
           _score: (typeof c._score === 'number' ? c._score / maxKeyword : 0) * weight.keyword,
         }))
 
-        return [...scored, ...remainder]
-          .sort((a, b) => b._score - a._score)
-          .slice(0, Math.min(topK, 12))
+        const merged = [...scored, ...remainder].sort((a, b) => b._score - a._score).slice(0, Math.min(topK, 12))
+        return rerankHits(query, merged)
       }
     } catch (err) {
       console.warn('[retrieveChunks] Azure embed failed, keyword fallback:', err.message)
     }
   }
 
-  return pool.slice(0, Math.min(topK, 12))
+  return rerankHits(query, pool.slice(0, Math.min(topK, 12)))
 }
+
 function buildContext(hits) {
   const seen = new Set()
   const deduped = []
@@ -548,7 +585,8 @@ function buildContext(hits) {
       seen.add(fingerprint)
       deduped.push(h)
     }
-    if (deduped.length >= 6) break
+    // ── Reduced to 4 (from 6) to cut context noise for Phi-4-mini ──────────
+    if (deduped.length >= 4) break
   }
 
   return deduped.map((h, i) => {
@@ -557,55 +595,47 @@ function buildContext(hits) {
     return `[${i + 1}] ${text}`
   }).join('\n\n')
 }
+
+// ─── System prompt (lean for Phi-4-mini) ─────────────────────────────────────
+//
+// Design principles:
+//   1. One clear instruction per rule — no duplication.
+//   2. Positive framing first ("do X") — small models respond better.
+//   3. No repeated "never" lists — consolidated into a single short block.
+//   4. Intent-specific guidance injected at call time, not baked into base prompt.
+
+const BASE_SYSTEM_PROMPT = `You are a document QA assistant. Answer ONLY from the provided context.
+
+RULES:
+- Use only what is in the context. Never guess or invent.
+- If the answer is absent, say: "I couldn't find that in your documents."
+- For spreadsheet rows: each ROW_START...ROW_END block is one independent record. Never merge fields from different rows.
+- For definitions: return the exact business meaning from the matching row. No textbook explanations.
+- For formulas: state them exactly as written. Do not derive or invent.
+- For URLs: return the exact URL on its own line. Do not modify it.
+- For analytical questions (trends, totals, comparisons): answer only if actual data exists in context. If only definitions/metadata are present, say: "The documents contain definitions, not the analytical data needed."
+- Write 1-4 plain English sentences. No markdown, no bullet points, no citations, no pipe-delimited output.`
+
+const INTENT_HINT = {
+  definition: (subject) =>
+    `Answer ONLY from the single best-matching row for: "${subject}". State the business meaning in 1-3 sentences. If a formula exists, include it exactly as written.`,
+  url_lookup: (keywords) =>
+    `Return the exact URL matching: "${keywords}". Put it on its own line. Nothing else.`,
+  lookup:     () => `Find and state the exact value or list asked for.`,
+  comparison: () => `Compare the items. Write a brief structured summary of similarities and differences.`,
+  general:    () => `Answer directly from the highest-ranked context.`,
+}
+
 const SYSTEM_PROMPT_CACHE     = new Map()
 const SYSTEM_PROMPT_CACHE_MAX = 100
-const INTENT_STRATEGY = {
-  definition: `TASK: Define the exact term asked. Write 1–3 natural English sentences. If there's a formula, state it plainly (e.g. "calculated by dividing X by Y"). Combine multiple excerpts if needed.`,
-  lookup:     `TASK: Find and report the exact value or list asked for. State clearly what it represents.`,
-  comparison: `TASK: Compare the items asked. Write a structured but natural summary — similarities and differences.`,
-  url_lookup: `TASK: Return the full URL that matches the topic, on its own line, unmodified. If none found, say so.`,
-  general:    `TASK: Find information that directly answers the question and write a clear, complete summary.`,
-}
-
-const TYPE_NOTES = {
-  [DOC_TYPE.SPREADSHEET]:  `Spreadsheet data is serialized as pipe-delimited rows and "X is described as: …" lines — these are internal representations. Read them to understand meaning; never reproduce them verbatim.`,
-  [DOC_TYPE.DATA]:         `JSON/YAML/CSV fields may be nested ("parent.child: value"). Read for meaning; never dump raw key:value pairs.`,
-  [DOC_TYPE.PDF]:          `PDF text may have minor extraction artefacts. Read numbers and dates exactly as shown; ignore headers, footers, and page numbers.`,
-  [DOC_TYPE.WORD]:         `Word docs contain prose, lists, and tables. Headings show section structure. Quote policy/definition statements accurately.`,
-  [DOC_TYPE.PRESENTATION]: `Slide titles are section headers; bullets are detail. Do not infer beyond what the slide states.`,
-  [DOC_TYPE.CODE]:         `Read code literally — function/variable names and comments all matter. Describe what code does in plain English unless code output is requested.`,
-  [DOC_TYPE.TEXT]:         `Markdown formatting (##, **, -) indicates structure. Lists represent discrete facts or steps.`,
-  [DOC_TYPE.EMAIL]:        `Attribute statements to their sender. Dates and times are as stated in the email header.`,
-  [DOC_TYPE.WEB]:          `Focus on main body content; ignore repetitive navigation text. Include URLs exactly as written.`,
-}
-
-const BASE_SYSTEM_PROMPT = `You are a document assistant. Answer ONLY from the provided context.
-
-RULES (apply once, always):
-- Write in natural English sentences. Never output raw pipe-delimited rows, "is described as:" lines, or dumps of key:value pairs.
-- Use only information present in the context. Never invent or assume.
-- Match terms case-insensitively.
-- No citation markers ([1], [2]…). No padding or caveats.
-- If a URL appears, return it exactly as-is on its own line.
-- If the answer is genuinely absent: "I couldn't find that in your documents."
-- Keep answers concise — 1–4 sentences unless a list or formula is needed.`
 
 function buildDynamicSystemPrompt(hits, intent = 'general') {
-  const types     = [...new Set(hits.map(h => classifyExtension(h.source_file || '')))]
-  const typeNotes = types.map(t => TYPE_NOTES[t]).filter(Boolean)
-
+  const types    = [...new Set(hits.map(h => classifyExtension(h.source_file || '')))]
   const cacheKey = `${intent}::${types.sort().join(',')}`
   const cached   = SYSTEM_PROMPT_CACHE.get(cacheKey)
   if (cached) return cached
 
-  const parts = [
-    BASE_SYSTEM_PROMPT,
-    INTENT_STRATEGY[intent] || INTENT_STRATEGY.general,
-  ]
-  if (typeNotes.length) parts.push('SOURCE NOTES:\n' + typeNotes.map((n, i) => `${i + 1}. ${n}`).join('\n'))
-  if (types.length > 1) parts.push(`Context spans ${types.length} source types — apply the relevant note per excerpt.`)
-
-  const prompt = parts.join('\n\n')
+  const prompt = BASE_SYSTEM_PROMPT
 
   if (SYSTEM_PROMPT_CACHE.size >= SYSTEM_PROMPT_CACHE_MAX)
     SYSTEM_PROMPT_CACHE.delete(SYSTEM_PROMPT_CACHE.keys().next().value)
@@ -697,6 +727,7 @@ function requireAdminKey(req, res, next) {
 function generateApiKey() {
   return `rak_${crypto.randomBytes(32).toString('hex')}`
 }
+
 async function extractPdf(buffer)  { const r = await pdfParse(buffer); return r.text || '' }
 async function extractWord(buffer) { const r = await mammoth.extractRawText({ buffer }); return r.value || '' }
 
@@ -716,30 +747,22 @@ function extractSpreadsheet(buffer) {
     for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
       const row = rawRows[i]
       if (!row.some(cell => String(cell).trim() !== '')) continue
-      const pairs = [], values = []
+      const pairs = []
       for (let j = 0; j < Math.max(headers.length, row.length); j++) {
         const val = String(row[j] || '').trim()
         if (!val) continue
         const key = headers[j] && headers[j] !== '' ? headers[j] : `Field${j + 1}`
-        pairs.push(`${key}: ${val}`)
-        values.push(val)
+        // Use = separator for cleaner key=value structured records
+        pairs.push(`${key.trim()} = ${val.trim()}`)
       }
       if (pairs.length > 0) {
-        parts.push(pairs.join(' | '))
-        if (values.length >= 2) parts.push(`${values[0]} is described as: ${pairs.slice(1).join(', ')}`)
+        // Each row is a self-contained semantic unit delimited by ROW_START/ROW_END
+        parts.push(`
+ROW_START
+${pairs.join('\n')}
+ROW_END
+`)
       }
-    }
-    parts.push('')
-    parts.push('[All values in this sheet:]')
-    for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
-      const row = rawRows[i]
-      const rowValues = row.map((cell, j) => {
-        const val = String(cell || '').trim()
-        if (!val) return ''
-        const key = headers[j] && headers[j] !== '' ? headers[j] : `Field${j + 1}`
-        return `${val} (${key})`
-      }).filter(Boolean)
-      if (rowValues.length) parts.push(rowValues.join(', '))
     }
   }
   return parts.join('\n')
@@ -822,6 +845,21 @@ async function extractTextFromBuffer(buffer, fileName) {
 // ─── Chunking ─────────────────────────────────────────────────────────────────
 
 function chunkText(text, sourceFile) {
+  // ── Spreadsheet-aware chunking: each ROW_START...ROW_END = one chunk ───────
+  if (text.includes('ROW_START')) {
+    return text
+      .split('ROW_START')
+      .map(t => t.replace('ROW_END', '').trim())
+      .filter(Boolean)
+      .map((row, i) => ({
+        text: row,
+        source_file: sourceFile,
+        chunk_index: i,
+        embedding: [],
+      }))
+  }
+
+  // ── Default line-based chunking for all other document types ───────────────
   const chunks = []
   let index    = 0
   const lines  = text.replace(/\r\n/g, '\n').split('\n').map(l => l.trim()).filter(l => l.length > 0)
@@ -956,17 +994,25 @@ function warmupChunkCaches() {
       .catch(err => console.warn(`[warmup] ${clientId} — ${err.message}`))
   }
 }
+
 async function answerWithPhi4(originalQuery, hits, intent = 'general') {
   const systemPrompt = buildDynamicSystemPrompt(hits, intent)
   const context      = buildContext(hits)
 
-  const subjectHint  = intent === 'definition'
-    ? `\nYou must define ONLY this exact term: "${extractSubject(originalQuery)}". Write 1–3 clean sentences in plain English. Do NOT copy raw data rows or "is described as:" lines into your answer.`
-    : intent === 'url_lookup'
-    ? `\nReturn the full URL for: "${extractUrlKeywords(originalQuery).join(' ')}". Put it on its own line. No disclaimers.`
-    : ''
+  // Build a concise, intent-specific hint injected into the user message
+  // (not the system prompt) so Phi-4-mini isn't overloaded with rules
+  let intentHint = ''
+  if (intent === 'definition') {
+    const subject = extractSubject(originalQuery)
+    intentHint = `\nTask: ${INTENT_HINT.definition(subject)}`
+  } else if (intent === 'url_lookup') {
+    const keywords = extractUrlKeywords(originalQuery).join(' ')
+    intentHint = `\nTask: ${INTENT_HINT.url_lookup(keywords)}`
+  } else if (INTENT_HINT[intent]) {
+    intentHint = `\nTask: ${INTENT_HINT[intent]()}`
+  }
 
-  const userMessage = `CONTEXT:\n${context}${subjectHint}\n\nQuestion: ${originalQuery}`
+  const userMessage = `CONTEXT:\n${context}${intentHint}\n\nQuestion: ${originalQuery}`
   return callPhi4(systemPrompt, userMessage)
 }
 
@@ -994,40 +1040,12 @@ function buildFallbackAnswer(query, hits) {
 
   const subject = extractSubject(query).toLowerCase()
 
-  const descLine = hits.find(h => {
-    const t = (h.text || '').toLowerCase()
-    return t.includes('is described as') && t.includes(subject)
-  })
-  if (descLine) {
-    const lines = (descLine.text || '').split('\n')
-    const relevantLine = lines.find(l =>
-      l.toLowerCase().includes(subject) && l.toLowerCase().includes('is described as')
-    )
-    if (relevantLine) {
-      const parts = relevantLine.split(/is described as:/i)
-      if (parts[1]) {
-        const rawDesc = parts[1].trim().slice(0, 300)
-        const descParts = rawDesc.split('|').map(p => p.trim()).filter(Boolean)
-        if (descParts.length === 1) {
-          return `${subject.charAt(0).toUpperCase() + subject.slice(1)} is ${descParts[0]}.`
-        }
-        const formulaPart = descParts.find(p => /divided by|\/|\bper\b/i.test(p))
-        if (formulaPart) {
-          const desc = descParts.filter(p => p !== formulaPart).join('. ')
-          return `${subject.charAt(0).toUpperCase() + subject.slice(1)} is ${desc}. It is calculated as: ${formulaPart}.`
-        }
-        return `${subject.charAt(0).toUpperCase() + subject.slice(1)}: ${descParts.join('. ')}`
-      }
-    }
-  }
-
   const allMatchingLines = []
   for (const h of hits) {
     const lines = (h.text || '').split('\n')
     for (const line of lines) {
       if (line.toLowerCase().includes(subject) && line.trim().length > 20) {
         if ((line.match(/\|/g) || []).length > 3) continue
-        if (/is described as:/i.test(line)) continue
         allMatchingLines.push(line.trim())
       }
     }
@@ -1309,9 +1327,10 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
 
       const hits = await retrieveChunks(query.trim(), chunks, Math.min(topK, 20), invertedIndex)
 
+      // ── Low confidence guard: retrieveChunks returns [] when score < 3 ─────
       if (hits.length === 0) {
         return {
-          answer: "I couldn't find that in your documents. Try rephrasing your question.",
+          answer: "I couldn't find that in your documents.",
           sources: [],
           conversationId: conversationId || null,
           client: { clientId, name },
@@ -1332,9 +1351,8 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       }
 
       const cleanAnswer = fixBrokenUrls(rawAnswer)
-        .replace(/\bField\d+\s*:\s*/gi, '')
-        .replace(/\|\s*Field\d+\b/gi, '')
-        .replace(/^.+\s+is described as:\s*.+$/gmi, '')
+        .replace(/\bField\d+\s*=\s*/gi, '')
+        .replace(/ROW_START|ROW_END/g, '')
         .replace(/^[^\n]*\|[^\n]*\|[^\n]*\|[^\n]*\|[^\n]*$/gm, '')
         .replace(/\n{3,}/g, '\n\n')
         .trim()
@@ -1417,5 +1435,4 @@ app.listen(PORT, () => {
   startApiKeyHealthChecker()
   warmupChunkCaches()
 })
-
 module.exports = app
