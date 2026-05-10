@@ -55,23 +55,24 @@ const CHAT_HISTORY_DB = process.env.CHAT_HISTORY_DB || 'chathistory'
 const AZURE_CONNECTION_STRING = process.env.AZURE_CONNECTION_STRING || ''
 const AZURE_CONTAINER_NAME = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY
-const KEY_CHECK_INTERVAL_MS  = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10)
+const KEY_CHECK_INTERVAL_MS = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10)
 const PHI4_ENDPOINT = process.env.PHI4_ENDPOINT
 const PHI4_API_KEY = process.env.PHI4_API_KEY
-const PHI4_MODEL = process.env.PHI4_MODEL || 'Phi-4-mini-instruct'
+const PHI4_MODEL = process.env.PHI4_MODEL || 'Phi-4'
 const PHI4_TIMEOUT_MS = parseInt(process.env.PHI4_TIMEOUT_MS || '30000', 10)
-const AZURE_EMBED_ENDPOINT   = process.env.AZURE_EMBED_ENDPOINT || ''
+const AZURE_EMBED_ENDPOINT = process.env.AZURE_EMBED_ENDPOINT || ''
 const AZURE_EMBED_KEY = process.env.AZURE_EMBED_KEY || ''
-const AZURE_EMBED_MODEL  = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
+const AZURE_EMBED_MODEL = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
 const EMBED_TIMEOUT_MS = parseInt(process.env.EMBED_TIMEOUT_MS || '10000', 10)
 const EMBED_POOL_LIMIT = parseInt(process.env.EMBED_POOL_LIMIT || '20', 10)
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10)
 const KEYWORD_SHORTCIRCUIT_SCORE = parseInt(process.env.KEYWORD_SHORTCIRCUIT_SCORE || '6', 10)
-const WARMUP_CLIENT_IDS  = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
+const WARMUP_CLIENT_IDS = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
 
+// ─── OPTIMIZATION 1: Larger chunks to preserve multi-line formulas ─────────────
 const RAW_PREFIX    = 'raw'
-const CHUNK_SIZE    = 500
-const CHUNK_OVERLAP = 2
+const CHUNK_SIZE    = 900   // increased from 500 — prevents formula/description splits
+const CHUNK_OVERLAP = 3     // slightly more overlap for context continuity
 
 const blobServiceClient = AZURE_CONNECTION_STRING
   ? BlobServiceClient.fromConnectionString(AZURE_CONNECTION_STRING)
@@ -104,7 +105,6 @@ const DOC_TYPE = {
 }
 
 // ─── Response cache ───────────────────────────────────────────────────────────
-
 const RESPONSE_CACHE     = new Map()
 const RESPONSE_CACHE_TTL = 10 * 60 * 1000
 const RESPONSE_CACHE_MAX = 1000
@@ -129,7 +129,6 @@ function getCacheKey(clientId, query) {
 }
 
 // ─── Phi-4 concurrency / circuit breaker ─────────────────────────────────────
-
 const IN_FLIGHT = new Map()
 let phiActiveCount = 0
 const PHI_MAX_CONCURRENT = 3
@@ -159,7 +158,7 @@ function drainPhiQueue() {
   }
 }
 
-let phiFailures    = 0
+let phiFailures     = 0
 let phiBlockedUntil = 0
 
 function phiCircuitOpen() {
@@ -183,7 +182,6 @@ function phiRecordFailure() {
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
-
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
@@ -237,16 +235,18 @@ function classifyExtension(fileName) {
 
 function detectQueryIntent(query) {
   const q = query.toLowerCase().trim()
-  const DEFINITION_PATTERNS = [/^what\s+(is|are|does)\s+/,/^define\s+/,/^explain\s+/,/^meaning\s+of\s+/,/^tell\s+me\s+about\s+/,/^describe\s+/,/^how\s+is\s+.+\s+(calculated|defined|measured|computed)/,/\bmeaning\b/,/\bdefinition\b/,/\bwhat\s+does\b/]
-  const LOOKUP_PATTERNS     = [/^(show|list|find|get|fetch|give)\s+(me\s+)?/,/^how\s+many\s+/,/^what\s+(is\s+the\s+)?(value|number|count|total|sum|amount)/]
-  const COMPARISON_PATTERNS = [/\bvs\b|\bversus\b|\bdifference\b|\bcompare\b|\bbetween\b/]
-  const URL_PATTERNS        = [/\burl\b/,/\blink\b/,/\breport\b.*\burl\b/,/\burl\b.*\breport\b/,/\bpower\s*bi\b/,/\bdashboard\b/]
-  const GREETING_PATTERNS   = [/^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening)|how\s+are\s+you|what's\s+up|sup)\b/]
-  if (GREETING_PATTERNS.some(p => p.test(q))) return 'greeting'
-  if (URL_PATTERNS.some(p => p.test(q)))      return 'url_lookup'
-  if (DEFINITION_PATTERNS.some(p => p.test(q))) return 'definition'
-  if (COMPARISON_PATTERNS.some(p => p.test(q))) return 'comparison'
-  if (LOOKUP_PATTERNS.some(p => p.test(q)))     return 'lookup'
+  const DEFINITION_PATTERNS  = [/^what\s+(is|are|does)\s+/,/^define\s+/,/^explain\s+/,/^meaning\s+of\s+/,/^tell\s+me\s+about\s+/,/^describe\s+/,/^how\s+is\s+.+\s+(calculated|defined|measured|computed)/,/\bmeaning\b/,/\bdefinition\b/,/\bwhat\s+does\b/]
+  const CALCULATION_PATTERNS = [/how\s+(is|are|was|were)\s+.+\s+(calculated|computed|determined|derived)/,/what\s+is\s+the\s+(formula|calculation|computation)\s+for/,/how\s+do\s+you\s+(calculate|compute|determine)/]
+  const LOOKUP_PATTERNS      = [/^(show|list|find|get|fetch|give)\s+(me\s+)?/,/^how\s+many\s+/,/^what\s+(is\s+the\s+)?(value|number|count|total|sum|amount)/]
+  const COMPARISON_PATTERNS  = [/\bvs\b|\bversus\b|\bdifference\b|\bcompare\b|\bbetween\b/]
+  const URL_PATTERNS         = [/\burl\b/,/\blink\b/,/\breport\b.*\burl\b/,/\burl\b.*\breport\b/,/\bpower\s*bi\b/,/\bdashboard\b/]
+  const GREETING_PATTERNS    = [/^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening)|how\s+are\s+you|what's\s+up|sup)\b/]
+  if (GREETING_PATTERNS.some(p => p.test(q)))    return 'greeting'
+  if (URL_PATTERNS.some(p => p.test(q)))         return 'url_lookup'
+  if (CALCULATION_PATTERNS.some(p => p.test(q))) return 'calculation'
+  if (DEFINITION_PATTERNS.some(p => p.test(q)))  return 'definition'
+  if (COMPARISON_PATTERNS.some(p => p.test(q)))  return 'comparison'
+  if (LOOKUP_PATTERNS.some(p => p.test(q)))      return 'lookup'
   return 'general'
 }
 
@@ -257,12 +257,15 @@ function extractSubject(query) {
     /^what\s+are\s+(.+)$/,
     /^what\s+does\s+(.+?)\s+mean$/,
     /^define\s+(?:an?\s+|the\s+)?(.+)$/,
+    /^explain\s+(?:an?\s+|the\s+)?how\s+(.+?)\s+(?:is\s+)?calculated$/,
     /^explain\s+(?:an?\s+|the\s+)?(.+)$/,
     /^tell\s+me\s+about\s+(?:an?\s+|the\s+)?(.+)$/,
     /^meaning\s+of\s+(?:an?\s+|the\s+)?(.+)$/,
     /^describe\s+(?:an?\s+|the\s+)?(.+)$/,
     /^how\s+is\s+(.+?)\s+(calculated|defined|measured|computed)$/,
+    /^how\s+are\s+(.+?)\s+(calculated|defined|measured|computed)$/,
     /^what\s+is\s+the\s+formula\s+for\s+(?:calculating\s+)?(?:an?\s+|the\s+)?(.+)$/,
+    /^how\s+(?:do\s+you\s+)?calculate\s+(?:an?\s+|the\s+)?(.+)$/,
   ]
   for (const p of patterns) {
     const m = q.match(p)
@@ -303,7 +306,7 @@ function buildInvertedIndex(chunks) {
       .replace(/[^\w\s]/g, ' ')
       .split(/\s+/)
     for (const w of words) {
-      if (w.length < 3) continue
+      if (w.length < 2) continue
       if (!index.has(w)) index.set(w, new Set())
       index.get(w).add(i)
     }
@@ -311,9 +314,41 @@ function buildInvertedIndex(chunks) {
   return index
 }
 
-// ─── Phi-4 call ───────────────────────────────────────────────────────────────
+// ─── OPTIMIZATION 2: Query rewriting for multi-word and synonym expansion ─────
+function generateQueryVariants(query) {
+  const q = query.toLowerCase().trim()
+  const subject = extractSubject(q)
+  const variants = new Set([q, subject])
 
-async function callPhi4(systemPrompt, userMessage) {
+  // Add common abbreviations / synonyms relevant to real estate analytics
+  const synonymMap = {
+    'net applications': ['net apps', 'net application count', 'applications net'],
+    'gross applications': ['gross apps', 'total applications'],
+    'effective rent': ['eff rent', 'net rent', 'effective rental rate'],
+    'competitor asking rent': ['comp asking rent', 'competitor rent', 'competitive asking rent'],
+    'occupancy': ['occupancy rate', 'occ rate', 'occupancy status', 'occupied'],
+    'psf': ['per square foot', 'per sq ft'],
+    'lease application': ['application lease', 'leasing application'],
+    'sort order': ['sort sequence', 'ordering', 'gl sort'],
+    'gl activity': ['gl account', 'general ledger activity', 'gl account code'],
+  }
+
+  for (const [key, synonyms] of Object.entries(synonymMap)) {
+    if (subject.includes(key) || q.includes(key)) {
+      synonyms.forEach(s => variants.add(s))
+    }
+  }
+
+  // Also add subject without stop words
+  const stopWords = new Set(['the', 'a', 'an', 'is', 'are', 'how', 'what', 'does', 'do', 'calculated', 'defined', 'determine'])
+  const strippedSubject = subject.split(/\s+/).filter(w => !stopWords.has(w)).join(' ')
+  if (strippedSubject && strippedSubject !== subject) variants.add(strippedSubject)
+
+  return [...variants].filter(v => v.length > 1)
+}
+
+// ─── Phi-4 call ───────────────────────────────────────────────────────────────
+async function callPhi4(systemPrompt, userMessage, maxTokens = 768) {
   if (!PHI4_ENDPOINT || !PHI4_API_KEY) throw new Error('PHI4_ENDPOINT and PHI4_API_KEY environment variables are required')
   if (phiCircuitOpen()) throw new Error('Model temporarily unavailable (circuit breaker open)')
 
@@ -328,7 +363,7 @@ async function callPhi4(systemPrompt, userMessage) {
             model:       PHI4_MODEL,
             messages:    [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
             temperature: 0.1,
-            max_tokens:  512,
+            max_tokens:  maxTokens,
           }),
         },
         PHI4_TIMEOUT_MS
@@ -350,7 +385,6 @@ async function callPhi4(systemPrompt, userMessage) {
 }
 
 // ─── Embeddings ───────────────────────────────────────────────────────────────
-
 async function embedQueryAzure(query) {
   if (!AZURE_EMBED_ENDPOINT || !AZURE_EMBED_KEY) return null
   try {
@@ -371,6 +405,7 @@ async function embedQueryAzure(query) {
     return null
   }
 }
+
 async function embedBatch(texts) {
   if (!AZURE_EMBED_ENDPOINT || !AZURE_EMBED_KEY || !texts.length) return []
   try {
@@ -392,10 +427,9 @@ async function embedBatch(texts) {
   }
 }
 
-// ─── Retrieval ────────────────────────────────────────────────────────────────
-
+// ─── OPTIMIZATION 3: Improved keyword search with multi-word phrase scoring ───
 function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = null) {
-  const subject      = intent === 'definition' ? extractSubject(query) : query.toLowerCase()
+  const subject      = (intent === 'definition' || intent === 'calculation') ? extractSubject(query) : query.toLowerCase()
   const queryLower   = query.toLowerCase()
   const subjectLower = subject.toLowerCase()
   const subjectWords = subjectLower.split(/\s+/).filter(w => w.length > 1)
@@ -403,11 +437,13 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
 
   const urlKeywords = intent === 'url_lookup' ? extractUrlKeywords(query) : []
 
-  const useWordBoundary = subjectWords.length === 1 && subjectLower.length <= 10
-  const subjectBoundaryPattern = useWordBoundary
-    ? new RegExp(`\\b${escapeRegex(subjectLower)}\\b`, 'i')
-    : null
+  // FIXED: for multi-word subjects, prefer phrase match over word-boundary-only match
+  const isMultiWord       = subjectWords.length > 1
+  const subjectPhraseRegex = isMultiWord
+    ? new RegExp(escapeRegex(subjectLower), 'i')
+    : new RegExp(`\\b${escapeRegex(subjectLower)}\\b`, 'i')
 
+  // Gather candidate chunk indices using inverted index
   let candidateIndices
   if (invertedIndex && subjectWords.length > 0) {
     const wordsToIndex = intent === 'url_lookup' ? urlKeywords : subjectWords
@@ -425,7 +461,7 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
 
   const source = candidateIndices
     ? [...candidateIndices].map(i => chunks[i]).filter(Boolean)
-    : chunks.slice(0, 100)
+    : chunks.slice(0, 200)
 
   return source
     .map(c => {
@@ -441,32 +477,33 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
         const topicPhrase = urlKeywords.join(' ')
         if (text.includes(topicPhrase)) score += 15
       } else {
-        const subjectFound = subjectBoundaryPattern
-          ? subjectBoundaryPattern.test(c.text || '')
-          : text.includes(subjectLower)
+        // OPTIMIZATION: phrase match scores highest — prevents false negatives on multi-word terms
+        const phraseFound = subjectPhraseRegex.test(c.text || '')
+        if (phraseFound) {
+          score += subjectWords.length * 5  // boosted from 4
+          // Extra boost if it appears in a "Measure Name" or "Attribute Name" position
+          const measurePattern = new RegExp(`\\|\\s*${escapeRegex(subjectLower)}\\s*\\|`, 'i')
+          if (measurePattern.test(c.text || '')) score += subjectWords.length * 4
 
-        if (subjectFound) {
-          score += subjectWords.length * 4
-          const defPattern = new RegExp(`${escapeRegex(subjectLower)}\\s*(is|are)\\s*(defined|described|calculated|measured|computed)`, 'i')
+          // Boost for definition/formula lines
+          const defPattern = new RegExp(`${escapeRegex(subjectLower)}\\s*(is|are)\\s*(defined|described|calculated|measured|computed|the|a)`, 'i')
           if (defPattern.test(c.text || '')) score += subjectWords.length * 6
         }
 
-        if (subjectWords.length > 1 && text.includes(subjectLower)) {
-          score += subjectWords.length * 3
-        }
-
-        score += subjectWords.filter(w => {
+        // Individual word coverage scoring
+        const wordCoverage = subjectWords.filter(w => {
           const wPattern = new RegExp(`\\b${escapeRegex(w)}\\b`, 'i')
           return wPattern.test(c.text || '')
-        }).length * 2
+        }).length
+        score += wordCoverage * 2
 
-        if ((docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) && intent === 'definition') {
-          const descPattern = new RegExp(`${escapeRegex(subjectLower)}\\s*(is described as|is defined as):`, 'i')
-          if (descPattern.test(c.text || '')) score += subjectWords.length * 8
-        }
-
+        // Spreadsheet-specific scoring
         if (docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) {
-          if (text.includes(subjectLower)) score += subjectWords.length * 5
+          if (phraseFound) score += subjectWords.length * 5  // spreadsheet bonus
+          // "is described as" or "Formula:" pattern
+          const descPattern = new RegExp(`${escapeRegex(subjectLower)}\\s*(is described as|formula):`, 'i')
+          if (descPattern.test(c.text || '')) score += subjectWords.length * 8
+
           for (const w of subjectWords) {
             const kvPattern = new RegExp(`:\\s*${escapeRegex(w)}\\b|\\|\\s*${escapeRegex(w)}\\b`, 'i')
             if (kvPattern.test(c.text || '')) score += 2
@@ -483,19 +520,48 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
     .slice(0, topK)
 }
 
+// ─── OPTIMIZATION 4: Multi-query retrieval with automatic fallback expansion ──
 async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
   const intent          = detectQueryIntent(query)
   const normalizedQuery = query.toLowerCase().trim().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
-  const keywordTopK     = intent === 'definition' ? Math.min(150, chunks.length) : Math.min(100, chunks.length)
-  const candidates      = keywordSearch(normalizedQuery, chunks, keywordTopK, intent, invertedIndex)
-  const pool            = candidates.length > 0 ? candidates : chunks.slice(0, 100)
+  const keywordTopK     = Math.min(200, chunks.length)
+
+  // Primary retrieval
+  let candidates = keywordSearch(normalizedQuery, chunks, keywordTopK, intent, invertedIndex)
+
+  // OPTIMIZATION: if top score is weak, try query variants before giving up
+  const topScore = candidates[0]?._score || 0
+  if (topScore < KEYWORD_SHORTCIRCUIT_SCORE) {
+    const variants = generateQueryVariants(query)
+    console.log(`[retrieveChunks] Weak primary score (${topScore}), trying ${variants.length} query variants`)
+
+    const variantResults = []
+    for (const variant of variants) {
+      if (variant === normalizedQuery) continue
+      const variantNorm = variant.toLowerCase().trim()
+      const variantHits = keywordSearch(variantNorm, chunks, Math.min(50, chunks.length), intent, invertedIndex)
+      variantResults.push(...variantHits)
+    }
+
+    // Merge and deduplicate by chunk fingerprint, keeping highest score
+    const byFingerprint = new Map()
+    for (const c of [...candidates, ...variantResults]) {
+      const fp = (c.text || '').trim().slice(0, 60)
+      const existing = byFingerprint.get(fp)
+      if (!existing || c._score > existing._score) byFingerprint.set(fp, c)
+    }
+    candidates = [...byFingerprint.values()].sort((a, b) => b._score - a._score)
+    console.log(`[retrieveChunks] After variant expansion: ${candidates.length} candidates, top score: ${candidates[0]?._score || 0}`)
+  }
+
+  const pool = candidates.length > 0 ? candidates : chunks.slice(0, 150)
 
   if (pool.length > 0 && pool[0]._score >= KEYWORD_SHORTCIRCUIT_SCORE) {
-    console.log(`[retrieveChunks] keyword short-circuit (score=${pool[0]._score}) — skipping embed`)
+    console.log(`[retrieveChunks] keyword short-circuit (score=${pool[0]._score})`)
     return pool.slice(0, Math.min(topK, 10))
   }
 
-  if (intent === 'definition' && pool.length > 0 && pool[0]._score >= 4) {
+  if ((intent === 'definition' || intent === 'calculation') && pool.length > 0 && pool[0]._score >= 3) {
     return pool.slice(0, Math.min(topK, 10))
   }
 
@@ -503,6 +569,7 @@ async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
     return pool.slice(0, Math.min(topK, 6))
   }
 
+  // Semantic (vector) retrieval
   if (AZURE_EMBED_ENDPOINT && AZURE_EMBED_KEY) {
     try {
       const queryVec = await embedQueryAzure(normalizedQuery)
@@ -512,7 +579,7 @@ async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
         const embeddings = await embedBatch(chunkTexts)
 
         const maxKeyword = pool[0]._score || 1
-        const weight     = intent === 'definition'
+        const weight     = (intent === 'definition' || intent === 'calculation')
           ? { semantic: 0.35, keyword: 0.65 }
           : { semantic: 0.70, keyword: 0.30 }
 
@@ -539,8 +606,10 @@ async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
 
   return pool.slice(0, Math.min(topK, 12))
 }
+
+// ─── OPTIMIZATION 5: Wider context window for answer generation ───────────────
 function buildContext(hits) {
-  const seen = new Set()
+  const seen    = new Set()
   const deduped = []
   for (const h of hits) {
     const fingerprint = (h.text || '').trim().slice(0, 80).toLowerCase()
@@ -548,27 +617,32 @@ function buildContext(hits) {
       seen.add(fingerprint)
       deduped.push(h)
     }
-    if (deduped.length >= 6) break
+    if (deduped.length >= 8) break  // increased from 6 — more context for 14B model
   }
 
   return deduped.map((h, i) => {
-    const charLimit = i === 0 ? 600 : i <= 2 ? 450 : 350
+    // Larger windows — Phi-4 14B can handle it
+    const charLimit = i === 0 ? 900 : i <= 2 ? 700 : 500
     const text = (h.text || '').trim().slice(0, charLimit)
     return `[${i + 1}] ${text}`
   }).join('\n\n')
 }
+
 const SYSTEM_PROMPT_CACHE     = new Map()
 const SYSTEM_PROMPT_CACHE_MAX = 100
+
+// ─── OPTIMIZATION 6: Improved intent strategy for calculation queries ──────────
 const INTENT_STRATEGY = {
-  definition: `TASK: Define the exact term asked. Write 1–3 natural English sentences. If there's a formula, state it plainly (e.g. "calculated by dividing X by Y"). Combine multiple excerpts if needed.`,
-  lookup:     `TASK: Find and report the exact value or list asked for. State clearly what it represents.`,
-  comparison: `TASK: Compare the items asked. Write a structured but natural summary — similarities and differences.`,
-  url_lookup: `TASK: Return the full URL that matches the topic, on its own line, unmodified. If none found, say so.`,
-  general:    `TASK: Find information that directly answers the question and write a clear, complete summary.`,
+  definition:  `TASK: Define the exact term asked. Write 2–4 natural English sentences. State what it measures or represents, then how it is calculated if a formula is present. Combine multiple excerpts if needed. Never copy raw pipe-delimited data.`,
+  calculation: `TASK: Explain exactly how the measure is calculated. State the formula clearly in plain English (e.g. "calculated by dividing X by Y"). Include all steps if the formula has multiple components. If multiple related formulas exist, describe each. Never say "not found" if a formula-like pattern exists in the context.`,
+  lookup:      `TASK: Find and report the exact value or list asked for. State clearly what it represents.`,
+  comparison:  `TASK: Compare the items asked. Write a structured but natural summary — similarities and differences.`,
+  url_lookup:  `TASK: Return the full URL that matches the topic, on its own line, unmodified. If none found, say so.`,
+  general:     `TASK: Find information that directly answers the question and write a clear, complete summary.`,
 }
 
 const TYPE_NOTES = {
-  [DOC_TYPE.SPREADSHEET]:  `Spreadsheet data is serialized as pipe-delimited rows and "X is described as: …" lines — these are internal representations. Read them to understand meaning; never reproduce them verbatim.`,
+  [DOC_TYPE.SPREADSHEET]:  `Spreadsheet data is serialized with headers like "Measure Name | Description | Formula". Read all columns — Description contains the definition, Formula contains the calculation. Never reproduce raw pipe-delimited rows verbatim; synthesize into natural prose.`,
   [DOC_TYPE.DATA]:         `JSON/YAML/CSV fields may be nested ("parent.child: value"). Read for meaning; never dump raw key:value pairs.`,
   [DOC_TYPE.PDF]:          `PDF text may have minor extraction artefacts. Read numbers and dates exactly as shown; ignore headers, footers, and page numbers.`,
   [DOC_TYPE.WORD]:         `Word docs contain prose, lists, and tables. Headings show section structure. Quote policy/definition statements accurately.`,
@@ -579,16 +653,18 @@ const TYPE_NOTES = {
   [DOC_TYPE.WEB]:          `Focus on main body content; ignore repetitive navigation text. Include URLs exactly as written.`,
 }
 
-const BASE_SYSTEM_PROMPT = `You are a document assistant. Answer ONLY from the provided context.
+const BASE_SYSTEM_PROMPT = `You are a document assistant for a real estate analytics platform. Answer ONLY from the provided context.
 
-RULES (apply once, always):
-- Write in natural English sentences. Never output raw pipe-delimited rows, "is described as:" lines, or dumps of key:value pairs.
+RULES:
+- Write in natural English sentences. Never output raw pipe-delimited rows or dump key:value pairs.
 - Use only information present in the context. Never invent or assume.
 - Match terms case-insensitively.
 - No citation markers ([1], [2]…). No padding or caveats.
 - If a URL appears, return it exactly as-is on its own line.
-- If the answer is genuinely absent: "I couldn't find that in your documents."
-- Keep answers concise — 1–4 sentences unless a list or formula is needed.`
+- If a formula or calculation is in the context, state it clearly in plain English.
+- Only say "I couldn't find that in your documents" if there is genuinely NO relevant information in the context after reading all excerpts carefully.
+- Prefer a partial answer with what IS known over refusing to answer.
+- Keep answers focused — 2–5 sentences for definitions, more if a formula has multiple steps.`
 
 function buildDynamicSystemPrompt(hits, intent = 'general') {
   const types     = [...new Set(hits.map(h => classifyExtension(h.source_file || '')))]
@@ -614,7 +690,6 @@ function buildDynamicSystemPrompt(hits, intent = 'general') {
 }
 
 // ─── MongoDB helpers ──────────────────────────────────────────────────────────
-
 let db = null
 async function getDb() {
   if (db) return db
@@ -636,7 +711,6 @@ async function getChatDb() {
 }
 
 // ─── Client cache / auth ──────────────────────────────────────────────────────
-
 const CLIENT_CACHE = new Map()
 const CACHE_TTL_MS = 5 * 60 * 1000
 
@@ -697,51 +771,110 @@ function requireAdminKey(req, res, next) {
 function generateApiKey() {
   return `rak_${crypto.randomBytes(32).toString('hex')}`
 }
+
+// ─── Document extractors ──────────────────────────────────────────────────────
 async function extractPdf(buffer)  { const r = await pdfParse(buffer); return r.text || '' }
 async function extractWord(buffer) { const r = await mammoth.extractRawText({ buffer }); return r.value || '' }
 
+// ─── OPTIMIZATION 7: Completely rewritten extractSpreadsheet ─────────────────
+//
+// Key improvements over original:
+//  1. Skips the copyright/header row (row 0) properly
+//  2. Handles blank column headers (previously labeled "Field1", "Field2"…)
+//     — now falls back to the nearest non-blank header to the left, which
+//     is what Excel merged-cell data usually represents.
+//  3. Each data row generates ONE rich semantic chunk line that contains:
+//     - Table (sheet name)
+//     - All field:value pairs with proper headers
+//     - A natural-language "X is defined as / formula:" synthesis line
+//  4. Generates a sheet-level summary at the top of each sheet block
+//     so that the sheet name itself is searchable context.
+//  5. Formula column is explicitly labelled and included in the synthesis
+//     so that "how is X calculated" queries can find the formula.
+//  6. Preserves multi-line cell content (newlines → spaces) without truncation.
+//
 function extractSpreadsheet(buffer) {
-  const workbook = XLSX.read(buffer, { type: 'buffer' })
+  const workbook = XLSX.read(buffer, { type: 'buffer', cellNF: true, cellFormula: true })
   const parts    = []
+
   for (const sheetName of workbook.SheetNames) {
     const sheet   = workbook.Sheets[sheetName]
-    const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: '', header: 1 })
+    const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: '', header: 1, raw: false })
     if (!rawRows.length) continue
-    parts.push(`=== Sheet: ${sheetName} ===`)
+
+    // Find the actual header row (first row where > 2 cells have content)
     let headerRowIdx = 0
-    for (let i = 0; i < Math.min(10, rawRows.length); i++) {
-      if (rawRows[i].some(cell => String(cell).trim() !== '')) { headerRowIdx = i; break }
+    for (let i = 0; i < Math.min(5, rawRows.length); i++) {
+      const nonEmpty = rawRows[i].filter(cell => String(cell).trim() !== '').length
+      if (nonEmpty >= 2) { headerRowIdx = i; break }
     }
-    const headers = rawRows[headerRowIdx].map(h => String(h).trim())
-    for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
-      const row = rawRows[i]
-      if (!row.some(cell => String(cell).trim() !== '')) continue
-      const pairs = [], values = []
-      for (let j = 0; j < Math.max(headers.length, row.length); j++) {
-        const val = String(row[j] || '').trim()
-        if (!val) continue
-        const key = headers[j] && headers[j] !== '' ? headers[j] : `Field${j + 1}`
-        pairs.push(`${key}: ${val}`)
-        values.push(val)
-      }
-      if (pairs.length > 0) {
-        parts.push(pairs.join(' | '))
-        if (values.length >= 2) parts.push(`${values[0]} is described as: ${pairs.slice(1).join(', ')}`)
-      }
+
+    // Build header array, resolving blank cells by carrying forward the last non-blank
+    const rawHeaders = rawRows[headerRowIdx].map(h => String(h).trim())
+    const headers    = []
+    let lastNonBlank = ''
+    for (const h of rawHeaders) {
+      if (h !== '') { lastNonBlank = h; headers.push(h) }
+      else          { headers.push(lastNonBlank || `Col${headers.length + 1}`) }
     }
+
+    // Identify key column indices by name pattern
+    const colIdx = {}
+    headers.forEach((h, i) => {
+      const hLower = h.toLowerCase()
+      if (/table|module|category/.test(hLower) && !colIdx.table)       colIdx.table       = i
+      if (/measure\s*name|attribute\s*name|name/.test(hLower) && !colIdx.name) colIdx.name = i
+      if (/description|desc/.test(hLower) && !colIdx.description)      colIdx.description = i
+      if (/formula|calculation|calc/.test(hLower) && !colIdx.formula)  colIdx.formula     = i
+    })
+
+    // Sheet-level summary header — makes the sheet name itself searchable
+    parts.push(`=== Sheet: ${sheetName} ===`)
+    parts.push(`This sheet contains ${rawRows.length - headerRowIdx - 1} entries from the "${sheetName}" data dictionary.`)
+    if (colIdx.name !== undefined)        parts.push(`Columns include: ${headers.filter(h => h).join(', ')}.`)
     parts.push('')
-    parts.push('[All values in this sheet:]')
+
+    // Process each data row
     for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
       const row = rawRows[i]
-      const rowValues = row.map((cell, j) => {
-        const val = String(cell || '').trim()
-        if (!val) return ''
-        const key = headers[j] && headers[j] !== '' ? headers[j] : `Field${j + 1}`
-        return `${val} (${key})`
-      }).filter(Boolean)
-      if (rowValues.length) parts.push(rowValues.join(', '))
+
+      // Skip completely blank rows
+      if (!row.some(cell => String(cell).trim() !== '')) continue
+
+      // Normalize each cell value (collapse internal newlines to spaces)
+      const cells = row.map(cell => String(cell || '').replace(/\r?\n/g, ' ').trim())
+
+      // Build key-value pairs using the resolved headers
+      const pairs = []
+      for (let j = 0; j < Math.max(headers.length, cells.length); j++) {
+        const val = cells[j] || ''
+        if (!val) continue
+        const key = headers[j] || `Col${j + 1}`
+        pairs.push({ key, val })
+      }
+      if (!pairs.length) continue
+
+      // ── Line 1: pipe-delimited record (for keyword search) ──────────────
+      parts.push(pairs.map(p => `${p.key}: ${p.val}`).join(' | '))
+
+      // ── Line 2: Natural-language synthesis ────────────────────────────────
+      const nameVal  = colIdx.name        !== undefined ? cells[colIdx.name]        : ''
+      const tableVal = colIdx.table       !== undefined ? cells[colIdx.table]       : sheetName
+      const descVal  = colIdx.description !== undefined ? cells[colIdx.description] : ''
+      const formulaVal = colIdx.formula   !== undefined ? cells[colIdx.formula]     : ''
+
+      if (nameVal && descVal) {
+        let synthesis = `${nameVal} (from ${tableVal}) is defined as: ${descVal}`
+        if (formulaVal) synthesis += ` Formula: ${formulaVal}`
+        parts.push(synthesis)
+      } else if (nameVal && formulaVal) {
+        parts.push(`${nameVal} formula: ${formulaVal}`)
+      }
+
+      parts.push('')
     }
   }
+
   return parts.join('\n')
 }
 
@@ -819,31 +952,73 @@ async function extractTextFromBuffer(buffer, fileName) {
   return ''
 }
 
-// ─── Chunking ─────────────────────────────────────────────────────────────────
-
+// ─── OPTIMIZATION 8: Smarter chunking that keeps semantic units together ──────
+//
+// Original: splits purely on character count, breaking multi-line formulas.
+// New: prefers splitting on blank lines (semantic boundaries in spreadsheet output)
+// and only hard-splits if a single block exceeds CHUNK_SIZE.
+//
 function chunkText(text, sourceFile) {
-  const chunks = []
-  let index    = 0
-  const lines  = text.replace(/\r\n/g, '\n').split('\n').map(l => l.trim()).filter(l => l.length > 0)
-  let buffer   = []
-  for (const line of lines) {
-    const projectedLength = buffer.join('\n').length + (buffer.length ? 1 : 0) + line.length
-    if (buffer.length > 0 && projectedLength > CHUNK_SIZE) {
-      const chunkTextStr = buffer.join('\n')
-      if (chunkTextStr.length > 30) chunks.push({ text: chunkTextStr, source_file: sourceFile, chunk_index: index++, embedding: [] })
-      buffer = buffer.slice(-CHUNK_OVERLAP)
+  const chunks   = []
+  let chunkIndex = 0
+
+  // Split text into "blocks" separated by blank lines
+  const blocks = text.replace(/\r\n/g, '\n').split(/\n{2,}/).map(b => b.trim()).filter(b => b.length > 0)
+
+  let buffer        = []
+  let bufferLength  = 0
+
+  function flush() {
+    const chunkStr = buffer.join('\n\n')
+    if (chunkStr.length >= 30) {
+      chunks.push({ text: chunkStr, source_file: sourceFile, chunk_index: chunkIndex++, embedding: [] })
     }
-    buffer.push(line)
+    buffer       = []
+    bufferLength = 0
   }
-  if (buffer.length > 0) {
-    const chunkTextStr = buffer.join('\n')
-    if (chunkTextStr.length > 30) chunks.push({ text: chunkTextStr, source_file: sourceFile, chunk_index: index++, embedding: [] })
+
+  for (const block of blocks) {
+    // If this single block is enormous, hard-split it on newlines
+    if (block.length > CHUNK_SIZE * 1.5) {
+      if (buffer.length > 0) flush()
+      const lines = block.split('\n').filter(l => l.trim())
+      let lineBuffer = []
+      let lineLength = 0
+      for (const line of lines) {
+        const projected = lineLength + (lineBuffer.length ? 1 : 0) + line.length
+        if (lineBuffer.length > 0 && projected > CHUNK_SIZE) {
+          const s = lineBuffer.join('\n')
+          if (s.length >= 30) chunks.push({ text: s, source_file: sourceFile, chunk_index: chunkIndex++, embedding: [] })
+          // Overlap: keep last CHUNK_OVERLAP lines
+          lineBuffer  = lineBuffer.slice(-CHUNK_OVERLAP)
+          lineLength  = lineBuffer.join('\n').length
+        }
+        lineBuffer.push(line)
+        lineLength += (lineLength ? 1 : 0) + line.length
+      }
+      if (lineBuffer.length) {
+        const s = lineBuffer.join('\n')
+        if (s.length >= 30) chunks.push({ text: s, source_file: sourceFile, chunk_index: chunkIndex++, embedding: [] })
+      }
+      continue
+    }
+
+    const projected = bufferLength + (bufferLength ? 2 : 0) + block.length
+    if (buffer.length > 0 && projected > CHUNK_SIZE) {
+      flush()
+      // Overlap: carry last block into next chunk
+      buffer.push(blocks[blocks.indexOf(block) - 1] || '')
+      bufferLength = buffer[0]?.length || 0
+    }
+    buffer.push(block)
+    bufferLength += (bufferLength ? 2 : 0) + block.length
   }
+
+  if (buffer.length > 0) flush()
   return chunks
 }
 
 // ─── Blob / chunk loading ─────────────────────────────────────────────────────
-
 async function downloadBlobAsBuffer(containerClient, blobName) {
   const download = await containerClient.getBlobClient(blobName).download()
   const parts    = []
@@ -956,25 +1131,34 @@ function warmupChunkCaches() {
       .catch(err => console.warn(`[warmup] ${clientId} — ${err.message}`))
   }
 }
+
+// ─── Answer generation ────────────────────────────────────────────────────────
 async function answerWithPhi4(originalQuery, hits, intent = 'general') {
   const systemPrompt = buildDynamicSystemPrompt(hits, intent)
   const context      = buildContext(hits)
 
-  const subjectHint  = intent === 'definition'
-    ? `\nYou must define ONLY this exact term: "${extractSubject(originalQuery)}". Write 1–3 clean sentences in plain English. Do NOT copy raw data rows or "is described as:" lines into your answer.`
-    : intent === 'url_lookup'
-    ? `\nReturn the full URL for: "${extractUrlKeywords(originalQuery).join(' ')}". Put it on its own line. No disclaimers.`
-    : ''
+  let taskHint = ''
+  if (intent === 'definition') {
+    taskHint = `\nYou must define ONLY this exact term: "${extractSubject(originalQuery)}". Write 2–4 clean sentences: what it measures, and how it is calculated if a formula exists. Do NOT copy raw data rows.`
+  } else if (intent === 'calculation') {
+    taskHint = `\nExplain exactly how "${extractSubject(originalQuery)}" is calculated. State the formula clearly. If multiple formula steps exist, describe each step. Never say "not found" if formula-like text exists.`
+  } else if (intent === 'url_lookup') {
+    taskHint = `\nReturn the full URL for: "${extractUrlKeywords(originalQuery).join(' ')}". Put it on its own line. No disclaimers.`
+  }
 
-  const userMessage = `CONTEXT:\n${context}${subjectHint}\n\nQuestion: ${originalQuery}`
-  return callPhi4(systemPrompt, userMessage)
+  const userMessage = `CONTEXT:\n${context}${taskHint}\n\nQuestion: ${originalQuery}`
+  // Use more tokens for calculation/definition since formulas can be long
+  const maxTokens = (intent === 'calculation' || intent === 'definition') ? 1024 : 768
+  return callPhi4(systemPrompt, userMessage, maxTokens)
 }
 
+// ─── OPTIMIZATION 9: Improved fallback answer — handles blank Phi-4 responses ─
 function buildFallbackAnswer(query, hits) {
   if (!hits || hits.length === 0) {
     return "I couldn't find relevant information in your documents for this query."
   }
-  const intent = detectQueryIntent(query)
+  const intent  = detectQueryIntent(query)
+  const subject = extractSubject(query).toLowerCase()
 
   if (intent === 'url_lookup') {
     const urlKeywords = extractUrlKeywords(query)
@@ -992,53 +1176,81 @@ function buildFallbackAnswer(query, hits) {
     }
   }
 
-  const subject = extractSubject(query).toLowerCase()
+  // Look for the natural-language synthesis lines generated by extractSpreadsheet
+  const synthesisPattern = new RegExp(`${escapeRegex(subject)}\\s*\\(from .+?\\)\\s*is defined as:\\s*(.+?)(?:\\s+Formula:\\s*(.+))?$`, 'im')
+  for (const h of hits) {
+    const m = (h.text || '').match(synthesisPattern)
+    if (m) {
+      const desc    = m[1]?.trim().slice(0, 400) || ''
+      const formula = m[2]?.trim().slice(0, 300) || ''
+      if (desc && formula) return `${subject.charAt(0).toUpperCase() + subject.slice(1)} is ${desc} It is calculated as: ${formula}`
+      if (desc)            return `${subject.charAt(0).toUpperCase() + subject.slice(1)} is ${desc}`
+    }
+  }
 
-  const descLine = hits.find(h => {
-    const t = (h.text || '').toLowerCase()
-    return t.includes('is described as') && t.includes(subject)
-  })
-  if (descLine) {
-    const lines = (descLine.text || '').split('\n')
-    const relevantLine = lines.find(l =>
-      l.toLowerCase().includes(subject) && l.toLowerCase().includes('is described as')
-    )
-    if (relevantLine) {
-      const parts = relevantLine.split(/is described as:/i)
-      if (parts[1]) {
-        const rawDesc = parts[1].trim().slice(0, 300)
-        const descParts = rawDesc.split('|').map(p => p.trim()).filter(Boolean)
-        if (descParts.length === 1) {
-          return `${subject.charAt(0).toUpperCase() + subject.slice(1)} is ${descParts[0]}.`
+  // Look for "Formula:" lines
+  if (intent === 'calculation') {
+    for (const h of hits) {
+      const lines = (h.text || '').split('\n')
+      for (const line of lines) {
+        const ll = line.toLowerCase()
+        if (ll.includes(subject) && /formula:/i.test(line)) {
+          const formulaPart = line.replace(/^.*formula:\s*/i, '').trim()
+          if (formulaPart.length > 5) return `${subject.charAt(0).toUpperCase() + subject.slice(1)} is calculated as: ${formulaPart.slice(0, 400)}`
         }
-        const formulaPart = descParts.find(p => /divided by|\/|\bper\b/i.test(p))
-        if (formulaPart) {
-          const desc = descParts.filter(p => p !== formulaPart).join('. ')
-          return `${subject.charAt(0).toUpperCase() + subject.slice(1)} is ${desc}. It is calculated as: ${formulaPart}.`
-        }
-        return `${subject.charAt(0).toUpperCase() + subject.slice(1)}: ${descParts.join('. ')}`
       }
     }
   }
 
-  const allMatchingLines = []
+  // Original "is described as" fallback
+  for (const h of hits) {
+    const lines = (h.text || '').split('\n')
+    for (const line of lines) {
+      if (line.toLowerCase().includes(subject) && /is described as:/i.test(line)) {
+        const parts = line.split(/is described as:/i)
+        if (parts[1]) {
+          const raw       = parts[1].trim().slice(0, 300)
+          const descParts = raw.split('|').map(p => p.trim()).filter(Boolean)
+          if (descParts.length === 1) return `${subject.charAt(0).toUpperCase() + subject.slice(1)} is ${descParts[0]}.`
+          return `${subject.charAt(0).toUpperCase() + subject.slice(1)}: ${descParts.join('. ')}`
+        }
+      }
+    }
+  }
+
+  // Generic matching lines
+  const matchingLines = []
   for (const h of hits) {
     const lines = (h.text || '').split('\n')
     for (const line of lines) {
       if (line.toLowerCase().includes(subject) && line.trim().length > 20) {
-        if ((line.match(/\|/g) || []).length > 3) continue
+        if ((line.match(/\|/g) || []).length > 4) continue  // skip over-pipe-y lines
         if (/is described as:/i.test(line)) continue
-        allMatchingLines.push(line.trim())
+        matchingLines.push(line.trim())
       }
     }
   }
 
-  if (allMatchingLines.length > 0) {
-    const unique = [...new Set(allMatchingLines)].slice(0, 3)
-    return unique.join(' ').slice(0, 400)
+  if (matchingLines.length > 0) {
+    return [...new Set(matchingLines)].slice(0, 3).join(' ').slice(0, 400)
   }
 
   return "I couldn't find that specific information in your documents."
+}
+
+// ─── OPTIMIZATION 10: Stricter answer cleanup — don't strip valid content ─────
+function cleanAnswer(rawAnswer) {
+  return fixBrokenUrls(rawAnswer)
+    // Remove raw "FieldN:" artifacts from old chunker
+    .replace(/\bField\d+\s*:\s*/gi, '')
+    .replace(/\|\s*Field\d+\b/gi, '')
+    // Remove raw "X is described as: pipe | pipe | pipe" dump lines
+    // ONLY if the line is purely a data dump (4+ pipe segments, no natural prose)
+    .replace(/^[^\n]*\|[^\n]*\|[^\n]*\|[^\n]*\|[^\n]*\|[^\n]*$/gm, '')
+    // Remove lines that are just "X is described as: …" verbatim copy (more than 3 pipe segments)
+    .replace(/^.+\s+is described as:\s*.+\|.+\|.+$/gmi, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
 }
 
 function generateTitle(query) {
@@ -1051,8 +1263,9 @@ function generateTitle(query) {
 app.get('/health', (req, res) => res.json({
   ok:                true,
   service:           'ask-data',
-  model:             'ask-data-response-model',
+  model:             PHI4_MODEL,
   embeddings:        AZURE_EMBED_ENDPOINT ? 'azure-anurit' : 'keyword-only',
+  chunkSize:         CHUNK_SIZE,
   chunkCacheSize:    CHUNK_CACHE.size,
   promptCacheSize:   SYSTEM_PROMPT_CACHE.size,
   responseCacheSize: RESPONSE_CACHE.size,
@@ -1266,7 +1479,7 @@ app.post('/chat/conversations/delete', requireClientKey, async (req, res) => {
 
 app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) => {
   try {
-    const { query, topK = 6, conversationId } = req.body
+    const { query, topK = 8, conversationId } = req.body  // default topK raised to 8
     if (!query?.trim()) return res.status(400).json({ error: 'query is required' })
     const { clientId, name } = req.client
 
@@ -1308,6 +1521,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       }
 
       const hits = await retrieveChunks(query.trim(), chunks, Math.min(topK, 20), invertedIndex)
+      console.log(`[chat/message] "${query.slice(0, 60)}" → intent=${intent}, hits=${hits.length}, topScore=${hits[0]?._score?.toFixed(2) || 0}`)
 
       if (hits.length === 0) {
         return {
@@ -1318,28 +1532,28 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         }
       }
 
-      let rawAnswer
+      let rawAnswer = ''
       try {
         rawAnswer = await Promise.race([
           answerWithPhi4(query.trim(), hits, intent),
           new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Model response timeout (15s)')), 15000)
+            setTimeout(() => reject(new Error('Model response timeout (25s)')), 25000)
           ),
         ])
       } catch (err) {
         console.warn(`[phi4] Using fallback answer: ${err.message}`)
-        rawAnswer = buildFallbackAnswer(query.trim(), hits)
       }
 
-      const cleanAnswer = fixBrokenUrls(rawAnswer)
-        .replace(/\bField\d+\s*:\s*/gi, '')
-        .replace(/\|\s*Field\d+\b/gi, '')
-        .replace(/^.+\s+is described as:\s*.+$/gmi, '')
-        .replace(/^[^\n]*\|[^\n]*\|[^\n]*\|[^\n]*\|[^\n]*$/gm, '')
-        .replace(/\n{3,}/g, '\n\n')
-        .trim()
+      // OPTIMIZATION: if Phi-4 returns blank/very short, use fallback
+      const isBlankAnswer = !rawAnswer || rawAnswer.trim().length < 10
+      const answer = isBlankAnswer
+        ? buildFallbackAnswer(query.trim(), hits)
+        : cleanAnswer(rawAnswer)
 
-      const answer  = cleanAnswer
+      if (isBlankAnswer) {
+        console.warn(`[phi4] Blank/short response detected, used fallback for: "${query.slice(0, 60)}"`)
+      }
+
       const sources = hits.map(h => ({
         source_file: h.source_file  || 'unknown',
         chunk_index: h.chunk_index  ?? 0,
@@ -1401,14 +1615,17 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
     if (!res.headersSent) res.status(500).json({ error: err.message })
   }
 }))
+
 app.use((err, req, res, next) => {
   console.error('[global error handler]', err)
   if (!res.headersSent) res.status(500).json({ error: 'An unexpected error occurred. Please try again.' })
 })
+
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => {
   console.log(`rag-client-auth running on port ${PORT}`)
   console.log(`Model: ${PHI4_MODEL} | Endpoint: ${PHI4_ENDPOINT ? 'configured' : 'MISSING'}`)
+  console.log(`Chunk size: ${CHUNK_SIZE} | Overlap: ${CHUNK_OVERLAP} lines`)
   console.log(`Phi-4 timeout: ${PHI4_TIMEOUT_MS}ms | Embed timeout: ${EMBED_TIMEOUT_MS}ms`)
   console.log(`Chunk cache TTL: ${CHUNK_CACHE_TTL}ms | Embed pool limit: ${EMBED_POOL_LIMIT}`)
   console.log(`Request timeout: ${REQUEST_TIMEOUT_MS}ms | Keyword short-circuit score: ${KEYWORD_SHORTCIRCUIT_SCORE}`)
