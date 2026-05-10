@@ -48,38 +48,32 @@ app.options('*', cors({
 
 app.use(express.json())
 
-const MONGODB_URI              = process.env.MONGODB_URI
-const MONGODB_DB               = process.env.MONGODB_DB || 'clientcreds'
-const CHAT_HISTORY_URI         = process.env.CHAT_HISTORY_URI
-const CHAT_HISTORY_DB          = process.env.CHAT_HISTORY_DB || 'chathistory'
+const MONGODB_URI  = process.env.MONGODB_URI
+const MONGODB_DB  = process.env.MONGODB_DB || 'clientcreds'
+const CHAT_HISTORY_URI = process.env.CHAT_HISTORY_URI
+const CHAT_HISTORY_DB = process.env.CHAT_HISTORY_DB || 'chathistory'
 const AZURE_CONNECTION_STRING  = process.env.AZURE_CONNECTION_STRING || ''
-const AZURE_CONTAINER_NAME     = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
-const ADMIN_API_KEY            = process.env.ADMIN_API_KEY
-const KEY_CHECK_INTERVAL_MS    = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10)
-const PHI4_ENDPOINT            = process.env.PHI4_ENDPOINT
-const PHI4_API_KEY             = process.env.PHI4_API_KEY
-const PHI4_MODEL               = process.env.PHI4_MODEL || 'Phi-4-mini-instruct'
-const PHI4_TIMEOUT_MS          = parseInt(process.env.PHI4_TIMEOUT_MS || '30000', 10)
-const AZURE_EMBED_ENDPOINT     = process.env.AZURE_EMBED_ENDPOINT || ''
-const AZURE_EMBED_KEY          = process.env.AZURE_EMBED_KEY || ''
-const AZURE_EMBED_MODEL        = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
-const EMBED_TIMEOUT_MS         = parseInt(process.env.EMBED_TIMEOUT_MS || '10000', 10)
-const EMBED_POOL_LIMIT         = parseInt(process.env.EMBED_POOL_LIMIT || '20', 10)
-const REQUEST_TIMEOUT_MS       = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10)
-// FIX: lowered short-circuit score so exact phrase hits fire faster
+const AZURE_CONTAINER_NAME = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY
+const KEY_CHECK_INTERVAL_MS = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10)
+const PHI4_ENDPOINT = process.env.PHI4_ENDPOINT
+const PHI4_API_KEY = process.env.PHI4_API_KEY
+const PHI4_MODEL = process.env.PHI4_MODEL || 'Phi-4-mini-instruct'
+const PHI4_TIMEOUT_MS = parseInt(process.env.PHI4_TIMEOUT_MS || '30000', 10)
+const AZURE_EMBED_ENDPOINT = process.env.AZURE_EMBED_ENDPOINT || ''
+const AZURE_EMBED_KEY = process.env.AZURE_EMBED_KEY || ''
+const AZURE_EMBED_MODEL = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
+const EMBED_TIMEOUT_MS = parseInt(process.env.EMBED_TIMEOUT_MS || '10000', 10)
+const EMBED_POOL_LIMIT = parseInt(process.env.EMBED_POOL_LIMIT || '20', 10)
+const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10)
 const KEYWORD_SHORTCIRCUIT_SCORE = parseInt(process.env.KEYWORD_SHORTCIRCUIT_SCORE || '3', 10)
-const WARMUP_CLIENT_IDS        = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
-
+const WARMUP_CLIENT_IDS = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
 const RAW_PREFIX    = 'raw'
-// FIX: larger chunk size preserves enumerated lists and formula rows intact
 const CHUNK_SIZE    = 750
-// FIX: more overlap so list tails survive chunk boundaries
 const CHUNK_OVERLAP = 8
-
 const blobServiceClient = AZURE_CONNECTION_STRING
   ? BlobServiceClient.fromConnectionString(AZURE_CONNECTION_STRING)
   : null
-
 const SUPPORTED_EXTENSIONS = new Set([
   '.pdf', '.docx', '.doc', '.txt', '.rtf', '.odt',
   '.xlsx', '.xls', '.ods', '.csv', '.tsv',
@@ -411,13 +405,9 @@ function extractCleanDescription(text, subjectWords) {
 
   return results
 }
-
-// ─── Phi-4 call ───────────────────────────────────────────────────────────────
-
 async function callPhi4(systemPrompt, userMessage, maxTokens = 512) {
   if (!PHI4_ENDPOINT || !PHI4_API_KEY) throw new Error('PHI4_ENDPOINT and PHI4_API_KEY environment variables are required')
   if (phiCircuitOpen()) throw new Error('Model temporarily unavailable (circuit breaker open)')
-
   return runWithPhiLimit(async () => {
     try {
       const response = await fetchWithTimeout(
@@ -449,9 +439,6 @@ async function callPhi4(systemPrompt, userMessage, maxTokens = 512) {
     }
   })
 }
-
-// ─── Embeddings ───────────────────────────────────────────────────────────────
-
 async function embedQueryAzure(query) {
   if (!AZURE_EMBED_ENDPOINT || !AZURE_EMBED_KEY) return null
   try {
@@ -564,53 +551,36 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
 
         if (subjectFound) {
           score += subjectWords.length * 4
-
-          // Definition pattern boost
           const defPattern = new RegExp(
             `(${subjectWords.map(escapeRegex).join('|')})\\s*(is|are)\\s*(defined|described|calculated|measured|computed)`,
             'i'
           )
           if (defPattern.test(rawText)) score += subjectWords.length * 6
         }
-
-        // All subject words present
         if (subjectWords.length > 1 && subjectWords.every(sw => text.includes(sw))) {
           score += subjectWords.length * 5
-
-          // FIX: ALL words in exact order = strong signal
           const orderedPattern = new RegExp(subjectWords.map(escapeRegex).join('.{0,10}'), 'i')
           if (orderedPattern.test(text)) score += 10
         }
-
-        // Word boundary matches
         score += subjectWords.filter(w => {
           const wPattern = new RegExp(`\\b${escapeRegex(w)}\\b`, 'i')
           return wPattern.test(rawText)
         }).length * 2
-
-        // Formula intent boosts
         if (intent === 'formula') {
           const formulaLines = extractFormulaLines(rawText)
           if (formulaLines.length > 0) score += 8
           if (subjectWords.some(sw => text.includes(sw)) && formulaLines.length > 0) score += 10
-
-          // FIX: boost "Formula:" label lines which appear in spreadsheet serialization
           if (/formula\s*:/i.test(rawText) && subjectWords.some(sw => text.includes(sw))) score += 12
         }
-
-        // Spreadsheet / data source boosts
         if ((docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) && (intent === 'definition' || intent === 'formula')) {
           const descPattern = new RegExp(
             `(${subjectWords.map(escapeRegex).join('|')})\\s*(is described as|is defined as):`,
             'i'
           )
           if (descPattern.test(rawText)) score += subjectWords.length * 10
-
-          // FIX: boost rows where measure name appears as first segment before pipe
           const firstSegPattern = new RegExp(`^${escapeRegex(exactPhrase)}\\s*(\\||:)`, 'im')
           if (firstSegPattern.test(rawText)) score += 20
         }
-
         if (docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) {
           if (subjectWords.some(sw => text.includes(sw))) score += subjectWords.length * 5
           for (const w of subjectWords) {
@@ -628,15 +598,10 @@ function keywordSearch(query, chunks, topK, intent = 'general', invertedIndex = 
     .sort((a, b) => b._score - a._score)
     .slice(0, topK)
 }
-
-// FIX: comparison search — boost chunks containing BOTH terms simultaneously
 function keywordSearchComparison(query, chunks, topK, invertedIndex) {
   const terms = extractComparisonTerms(query)
   if (terms.length < 2) return keywordSearch(query, chunks, topK, 'general', invertedIndex)
-
   const allHits = new Map()
-
-  // First pass: individual term searches
   for (const term of terms) {
     const hits = keywordSearch(term, chunks, Math.ceil(topK * 1.5), 'definition', invertedIndex)
     for (const hit of hits) {
@@ -646,8 +611,6 @@ function keywordSearchComparison(query, chunks, topK, invertedIndex) {
       }
     }
   }
-
-  // FIX: Second pass — boost chunks that contain BOTH terms (the direct comparison chunk)
   const term0 = terms[0].toLowerCase()
   const term1 = terms[1].toLowerCase()
   for (const [key, hit] of allHits.entries()) {
@@ -659,11 +622,9 @@ function keywordSearchComparison(query, chunks, topK, invertedIndex) {
 
   return [...allHits.values()].sort((a, b) => b._score - a._score).slice(0, topK)
 }
-
 async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
   const intent          = detectQueryIntent(query)
   const normalizedQuery = query.toLowerCase().trim().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
-  // FIX: higher candidate pool for all definition/formula/comparison queries
   const keywordTopK     = (intent === 'definition' || intent === 'formula' || intent === 'comparison')
     ? Math.min(200, chunks.length)
     : Math.min(100, chunks.length)
@@ -674,22 +635,17 @@ async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
   } else {
     candidates = keywordSearch(normalizedQuery, chunks, keywordTopK, intent, invertedIndex)
   }
-
   const pool = candidates.length > 0 ? candidates : chunks.slice(0, 200)
-
   if (pool.length > 0 && pool[0]._score >= KEYWORD_SHORTCIRCUIT_SCORE) {
     console.log(`[retrieveChunks] keyword short-circuit (score=${pool[0]._score}) — skipping embed`)
-    // FIX: return more chunks for definition/formula so full lists are captured
     const returnK = (intent === 'definition' || intent === 'formula' || intent === 'comparison' || intent === 'lookup')
       ? Math.min(12, pool.length)
       : Math.min(topK, 10)
     return pool.slice(0, returnK)
   }
-
   if (intent === 'url_lookup' && pool.length > 0) {
     return pool.slice(0, Math.min(topK, 6))
   }
-
   if (AZURE_EMBED_ENDPOINT && AZURE_EMBED_KEY) {
     try {
       const queryVec = await embedQueryAzure(normalizedQuery)
@@ -723,28 +679,18 @@ async function retrieveChunks(query, chunks, topK = 6, invertedIndex = null) {
       console.warn('[retrieveChunks] Azure embed failed, keyword fallback:', err.message)
     }
   }
-
   return pool.slice(0, Math.min(topK, 12))
 }
-
-// FIX: buildContext — convert pipe-delimited rows to readable prose BEFORE sending to Phi-4
-// This ensures Phi-4 never sees raw pipe rows and can't reproduce them
 function convertRowToProse(line) {
-  // Skip copyright/header lines
   if (SKIP_LINE_PATTERN.test(line)) return ''
-
   const pipeCount = (line.match(/\|/g) || []).length
   if (pipeCount < 2) return line
-
   const segs = line.split('|').map(s => s.trim()).filter(Boolean)
   if (segs.length < 2) return line
-
-  // segs[0] = measure/attribute name, segs[1] = description, segs[2] = formula (optional)
   const name    = segs[0]
   const desc    = segs[1]
   const formula = segs.slice(2).find(s => /divided by|minus|plus|multiplied|=/.test(s.toLowerCase()))
   const extra   = segs.slice(2).filter(s => s !== formula && s.length > 5)
-
   let prose = ''
   if (name && desc) {
     prose = `${name}: ${desc}`
@@ -836,7 +782,6 @@ const TYPE_NOTES = {
   [DOC_TYPE.WEB]:          `Focus on main body content; ignore repetitive navigation text. Include URLs exactly as written.`,
 }
 const BASE_SYSTEM_PROMPT = `You are a precise data dictionary assistant. Answer ONLY from the provided context excerpts.
-
 STRICT OUTPUT RULES — follow every rule on every response:
 1. Write in plain English prose. 2–5 sentences unless a list is explicitly needed.
 2. NEVER output pipe characters (|) in your answer under any circumstances.
@@ -851,31 +796,24 @@ STRICT OUTPUT RULES — follow every rule on every response:
 11. Never invent, assume, or extrapolate information not present in the context.
 12. When the context has a "Name: description. Formula: X" line, use it to write: "[Name] is [description]. It is calculated as [formula]."
 13. Do NOT copy the structure "X is described as:" — extract and rephrase the content instead.`
-
 function buildDynamicSystemPrompt(hits, intent = 'general') {
   const types     = [...new Set(hits.map(h => classifyExtension(h.source_file || '')))]
   const typeNotes = types.map(t => TYPE_NOTES[t]).filter(Boolean)
   const cacheKey = `${intent}::${types.sort().join(',')}`
   const cached   = SYSTEM_PROMPT_CACHE.get(cacheKey)
   if (cached) return cached
-
   const parts = [
     BASE_SYSTEM_PROMPT,
     `INTENT STRATEGY:\n${INTENT_STRATEGY[intent] || INTENT_STRATEGY.general}`,
   ]
   if (typeNotes.length) parts.push('SOURCE FORMAT NOTES:\n' + typeNotes.map((n, i) => `${i + 1}. ${n}`).join('\n'))
   if (types.length > 1) parts.push(`The context spans ${types.length} source types — apply the relevant format note per excerpt.`)
-
   const prompt = parts.join('\n\n')
-
   if (SYSTEM_PROMPT_CACHE.size >= SYSTEM_PROMPT_CACHE_MAX)
     SYSTEM_PROMPT_CACHE.delete(SYSTEM_PROMPT_CACHE.keys().next().value)
   SYSTEM_PROMPT_CACHE.set(cacheKey, prompt)
   return prompt
 }
-
-// ─── MongoDB helpers ──────────────────────────────────────────────────────────
-
 let db = null
 async function getDb() {
   if (db) return db
@@ -885,7 +823,6 @@ async function getDb() {
   await db.collection('clients').createIndex({ apiKey: 1 }, { unique: true, sparse: true })
   return db
 }
-
 let chatDb = null
 async function getChatDb() {
   if (chatDb) return chatDb
@@ -895,12 +832,8 @@ async function getChatDb() {
   chatDb = client.db(CHAT_HISTORY_DB)
   return chatDb
 }
-
-// ─── Client cache / auth ──────────────────────────────────────────────────────
-
 const CLIENT_CACHE = new Map()
 const CACHE_TTL_MS = 5 * 60 * 1000
-
 function getCached(apiKey) {
   const entry = CLIENT_CACHE.get(apiKey)
   if (!entry) return null
@@ -909,7 +842,6 @@ function getCached(apiKey) {
 }
 function setCache(apiKey, data) { CLIENT_CACHE.set(apiKey, { ...data, cachedAt: Date.now() }) }
 function evictCache(apiKey)     { if (apiKey) CLIENT_CACHE.delete(apiKey) }
-
 async function verifyApiKey(apiKey) {
   if (!apiKey || !apiKey.startsWith('rak_')) return null
   const cached = getCached(apiKey)
@@ -920,7 +852,6 @@ async function verifyApiKey(apiKey) {
   setCache(apiKey, { clientId: client.clientId, name: client.name })
   return { clientId: client.clientId, name: client.name }
 }
-
 function startApiKeyHealthChecker() {
   if (!MONGODB_URI) return
   setInterval(async () => {
@@ -934,12 +865,10 @@ function startApiKeyHealthChecker() {
     } catch {}
   }, KEY_CHECK_INTERVAL_MS)
 }
-
 function extractApiKey(req) {
   const header = req.headers['authorization'] || ''
   return header.startsWith('Bearer ') ? header.slice(7).trim() : null
 }
-
 async function requireClientKey(req, res, next) {
   const apiKey = extractApiKey(req) || req.body?.apiKey
   if (!apiKey) return res.status(401).json({ error: 'Missing API key' })
@@ -1280,6 +1209,9 @@ async function answerWithPhi4(originalQuery, hits, intent = 'general') {
   const userMessage = `CONTEXT:\n${context}${subjectHint}\n\nQuestion: ${originalQuery}`
   return callPhi4(systemPrompt, userMessage, maxTokens)
 }
+
+// FIX: completely rewritten fallback — extracts clean prose from hits so users
+// ALWAYS get an answer even when Phi-4 fails or returns empty
 function buildFallbackAnswer(query, hits) {
   if (!hits || hits.length === 0) {
     return "I couldn't find relevant information in your documents for this query."
@@ -1304,10 +1236,7 @@ function buildFallbackAnswer(query, hits) {
       }
     }
   }
-
-  // ── Formula fallback ──────────────────────────────────────────────────────
   if (intent === 'formula') {
-    // First: look for "Formula: X" prose line (from our new extractSpreadsheet)
     for (const h of hits) {
       for (const line of (h.text || '').split('\n')) {
         const ll = line.toLowerCase()
@@ -1318,7 +1247,6 @@ function buildFallbackAnswer(query, hits) {
         }
       }
     }
-    // Second: look for formula lines near subject words
     for (const h of hits) {
       for (const line of (h.text || '').split('\n')) {
         const ll = line.toLowerCase()
@@ -1336,12 +1264,9 @@ function buildFallbackAnswer(query, hits) {
       return `${subject.charAt(0).toUpperCase() + subject.slice(1)} formula: ${formulaLines[0]}`
     }
   }
-
-  // ── Prose line fallback (new "Name: Description. Formula: X" lines) ───────
   for (const h of hits) {
     for (const line of (h.text || '').split('\n')) {
       const ll = line.toLowerCase()
-      // Match clean prose lines: "Name: description. Formula: X"
       if (
         subjectWords.some(w => ll.startsWith(w) || ll.includes(`${w}:`)) &&
         line.includes(':') &&
@@ -1353,8 +1278,6 @@ function buildFallbackAnswer(query, hits) {
       }
     }
   }
-
-  // ── "is described as" fallback — extract and reformat ────────────────────
   for (const h of hits) {
     for (const line of (h.text || '').split('\n')) {
       if (!/is described as:/i.test(line)) continue
@@ -1646,7 +1569,6 @@ app.post('/chat/conversations/rename', requireClientKey, async (req, res) => {
     res.json(result)
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
-
 app.post('/chat/conversations/delete', requireClientKey, async (req, res) => {
   try {
     const { conversationId } = req.body
@@ -1657,13 +1579,11 @@ app.post('/chat/conversations/delete', requireClientKey, async (req, res) => {
     res.json({ ok: true, deleted: conversationId })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
-
 app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) => {
   try {
     const { query, topK = 8, conversationId } = req.body   // FIX: default topK 6→8
     if (!query?.trim()) return res.status(400).json({ error: 'query is required' })
     const { clientId, name } = req.client
-
     const intent = detectQueryIntent(query.trim())
     if (intent === 'greeting') {
       return res.json({
@@ -1673,14 +1593,12 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         client: { clientId, name },
       })
     }
-
     const cacheKey = getCacheKey(clientId, query)
     const cached   = responseCacheGet(cacheKey)
     if (cached) {
       console.log(`[cache] HIT for "${query.slice(0, 50)}"`)
       return res.json({ ...cached, cached: true, conversationId: conversationId || cached.conversationId })
     }
-
     if (IN_FLIGHT.has(cacheKey)) {
       console.log(`[dedup] Waiting for in-flight request: "${query.slice(0, 50)}"`)
       try {
@@ -1688,10 +1606,8 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         return res.json({ ...result, conversationId: conversationId || result.conversationId })
       } catch {}
     }
-
     const requestPromise = (async () => {
       const { chunks, invertedIndex } = await loadChunksForClient(clientId)
-
       if (chunks.length === 0) {
         return {
           answer: 'No documents found for your account. Please ensure your documents have been ingested first.',
@@ -1700,9 +1616,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
           client: { clientId, name },
         }
       }
-
       const hits = await retrieveChunks(query.trim(), chunks, Math.min(topK, 20), invertedIndex)
-
       if (hits.length === 0) {
         return {
           answer: "I couldn't find that in your documents. Try rephrasing your question.",
@@ -1723,11 +1637,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       } catch (err) {
         console.warn(`[phi4] Using fallback answer: ${err.message}`)
       }
-
-      // FIX: clean answer first, then check if it's empty/bad, then fallback
       let answer = cleanAnswer(rawAnswer || '')
-
-      // FIX: if Phi-4 returned empty, generic refusal, or still has pipes — use fallback
       const isBadAnswer = (
         !answer ||
         answer.length < 10 ||
@@ -1740,20 +1650,16 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         answer = buildFallbackAnswer(query.trim(), hits)
         answer = cleanAnswer(answer)
       }
-
-      // FIX: absolute last resort — always give something to the user
       if (!answer || answer.length < 10) {
         const topProcessed = preprocessChunkForContext(hits[0]?.text || '')
         answer = topProcessed.slice(0, 400) || "I couldn't find that in your documents."
       }
-
       const sources = hits.map(h => ({
         source_file: h.source_file  || 'unknown',
         chunk_index: h.chunk_index  ?? 0,
         score:       typeof h._score === 'number' ? parseFloat(h._score.toFixed(4)) : null,
         preview:     (h.text || '').slice(0, 300),
       }))
-
       let activeConversationId = conversationId || null
       try {
         const chatDatabase = await getChatDb()
@@ -1766,7 +1672,6 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
           sources:   sources.map(s => ({ source_file: s.source_file, score: s.score })),
           timestamp: now,
         }
-
         if (activeConversationId) {
           const updated = await col.findOneAndUpdate(
             { _id: new ObjectId(activeConversationId), clientId },
@@ -1778,7 +1683,6 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
             activeConversationId = null
           }
         }
-
         if (!activeConversationId) {
           const title  = generateTitle(query.trim())
           const result = await col.insertOne({ clientId, title, messages: [userMsg, assistantMsg], createdAt: now, updatedAt: now })
@@ -1787,19 +1691,15 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       } catch (saveErr) {
         console.warn('[chat/message] Failed to save conversation:', saveErr.message)
       }
-
       return { answer, sources, conversationId: activeConversationId, client: { clientId, name } }
     })()
-
     IN_FLIGHT.set(cacheKey, requestPromise)
-
     let result
     try {
       result = await requestPromise
     } finally {
       IN_FLIGHT.delete(cacheKey)
     }
-
     if (result.answer && result.answer.length > 10) {
       responseCacheSet(cacheKey, result)
     }
