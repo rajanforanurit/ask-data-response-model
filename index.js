@@ -206,7 +206,6 @@ function validateQuery(query) {
 function detectQueryIntent(query) {
   const q = query.toLowerCase().trim()
   if (/^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening)|how\s+are\s+you)\b/.test(q)) return 'greeting'
-  if (/\b(all\s+url|all\s+link|all\s+report|list\s+(all\s+)?(url|link|report|dashboard))\b/.test(q)) return 'all_urls'
   if (/\b(url|link|dashboard|power\s*bi|report\s+url)\b/.test(q)) return 'url_lookup'
   if (/how\s+(is|are|was|were)\s+.+\s+(calculated|computed|determined|derived)|what\s+is\s+the\s+(formula|calculation)\s+for|how\s+do\s+you\s+(calculate|compute)/.test(q)) return 'calculation'
   if (/^(what\s+(is|are|does)|define|explain|meaning\s+of|tell\s+me\s+about|describe)\s+/.test(q) || /\b(definition|meaning)\b/.test(q)) return 'definition'
@@ -242,7 +241,7 @@ function extractSubject(query) {
   return q
 }
 function extractUrlKeywords(query) {
-  const stopWords = new Set(['power', 'bi', 'report', 'url', 'link', 'for', 'the', 'a', 'an', 'of', 'in', 'get', 'me', 'show', 'give', 'find', 'fetch', 'all', 'list', 'dashboard', 'reports', 'links', 'urls'])
+  const stopWords = new Set(['power', 'bi', 'report', 'url', 'link', 'for', 'the', 'a', 'an', 'of', 'in', 'get', 'me', 'show', 'give', 'find', 'fetch'])
   return query.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1 && !stopWords.has(w))
 }
 function fixBrokenUrls(text) {
@@ -465,7 +464,7 @@ function keywordSearch(query, chunks, topK, intent, invertedIndex) {
     : new RegExp(`\\b${escapeRegex(subject.toLowerCase())}\\b`, 'i')
   let candidateIndices
   if (invertedIndex && subjectWords.length > 0) {
-    const wordsToIndex = (intent === 'url_lookup' || intent === 'all_urls') ? extractUrlKeywords(query) : subjectWords
+    const wordsToIndex = intent === 'url_lookup' ? extractUrlKeywords(query) : subjectWords
     const union = new Set()
     for (const w of wordsToIndex) {
       for (const idx of (invertedIndex.get(w) || new Set())) union.add(idx)
@@ -473,8 +472,8 @@ function keywordSearch(query, chunks, topK, intent, invertedIndex) {
         for (const idx of (invertedIndex.get(variant) || new Set())) union.add(idx)
       }
     }
-    if (intent === 'url_lookup' || intent === 'all_urls') {
-      for (const w of ['url', 'link', 'http', 'https', 'powerbi', 'app']) {
+    if (intent === 'url_lookup') {
+      for (const w of ['url', 'link', 'https', 'http', 'powerbi', 'app']) {
         for (const idx of (invertedIndex.get(w) || new Set())) union.add(idx)
       }
     }
