@@ -195,6 +195,14 @@ function buildInvertedIndex(chunks) {
   }
   return index
 }
+function validateQuery(query) {
+  if (!query || typeof query !== 'string') return { valid: false, message: 'Please enter a complete question to get an accurate answer.' }
+  const trimmed = query.trim()
+  if (trimmed.length <= 1) return { valid: false, message: 'Please enter a complete question to get an accurate answer.' }
+  const words = trimmed.split(/\s+/).filter(w => w.length > 0)
+  if (words.length <= 2) return { valid: false, message: 'Please enter a more detailed question so I can provide an accurate answer.' }
+  return { valid: true }
+}
 function detectQueryIntent(query) {
   const q = query.toLowerCase().trim()
   if (/^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening)|how\s+are\s+you)\b/.test(q)) return 'greeting'
@@ -234,6 +242,15 @@ function extractUrlKeywords(query) {
 }
 function fixBrokenUrls(text) {
   return text.replace(/https:\/\/[^\s]+(\s+[^\s]+)/g, (match) => match.replace(/\s/g, ''))
+}
+function normalizeTerms(term) {
+  const t = term.toLowerCase().trim()
+  const variants = new Set([t])
+  if (t.endsWith('s')) variants.add(t.slice(0, -1))
+  else variants.add(t + 's')
+  if (t.endsWith('ies')) variants.add(t.slice(0, -3) + 'y')
+  if (t.endsWith('y')) variants.add(t.slice(0, -1) + 'ies')
+  return [...variants]
 }
 async function callPhi4(systemPrompt, userMessage, maxTokens = 1024) {
   if (!PHI4_ENDPOINT || !PHI4_API_KEY) throw new Error('PHI4_ENDPOINT and PHI4_API_KEY are required')
@@ -318,6 +335,9 @@ function keywordSearch(query, chunks, topK, intent, invertedIndex) {
     const union = new Set()
     for (const w of wordsToIndex) {
       for (const idx of (invertedIndex.get(w) || new Set())) union.add(idx)
+      for (const variant of normalizeTerms(w)) {
+        for (const idx of (invertedIndex.get(variant) || new Set())) union.add(idx)
+      }
     }
     if (intent === 'url_lookup') {
       for (const w of ['url', 'link', 'http']) {
@@ -359,6 +379,30 @@ function keywordSearch(query, chunks, topK, intent, invertedIndex) {
     .sort((a, b) => b._score - a._score)
     .slice(0, topK)
 }
+function relaxedKeywordSearch(query, chunks, topK, invertedIndex) {
+  const allWords = query.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 2)
+  const union = new Set()
+  if (invertedIndex) {
+    for (const w of allWords) {
+      for (const idx of (invertedIndex.get(w) || new Set())) union.add(idx)
+      for (const variant of normalizeTerms(w)) {
+        for (const idx of (invertedIndex.get(variant) || new Set())) union.add(idx)
+      }
+    }
+  }
+  const source = union.size > 0
+    ? [...union].map(i => chunks[i]).filter(Boolean)
+    : chunks.slice(0, 300)
+  return source
+    .map(c => {
+      const text = (c.text || '').toLowerCase()
+      const matched = allWords.filter(w => text.includes(w)).length
+      return { ...c, _score: matched }
+    })
+    .filter(c => c._score > 0)
+    .sort((a, b) => b._score - a._score)
+    .slice(0, topK)
+}
 async function retrieveChunks(query, chunks, topK, invertedIndex) {
   const intent = detectQueryIntent(query)
   const normalizedQuery = query.toLowerCase().trim().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
@@ -394,13 +438,16 @@ async function retrieveChunks(query, chunks, topK, invertedIndex) {
           ...c,
           _score: (typeof c._score === 'number' ? c._score / maxKeyword : 0) * weight.keyword,
         }))
-        return [...scored, ...remainder].sort((a, b) => b._score - a._score).slice(0, Math.min(topK, 8))
+        const result = [...scored, ...remainder].sort((a, b) => b._score - a._score).slice(0, Math.min(topK, 8))
+        if (result.length > 0) return result
       }
     } catch (err) {
       console.warn('[retrieveChunks] embed failed, using keyword fallback:', err.message)
     }
   }
-  return pool.slice(0, Math.min(topK, 8))
+  if (pool.length > 0) return pool.slice(0, Math.min(topK, 8))
+  const relaxed = relaxedKeywordSearch(normalizedQuery, chunks, Math.min(topK * 2, 16), invertedIndex)
+  return relaxed.slice(0, Math.min(topK, 8))
 }
 function buildContext(hits) {
   const seen = new Set()
@@ -425,15 +472,16 @@ Your job is to answer questions using only the information provided in the conte
 STRICT RULES:
 1. Always write in clear, complete English sentences. Never output raw data like "Field: Value | Field: Value".
 2. Never copy pipe-separated lines from the source data. Always convert them into natural prose.
-3. Give a COMPLETE answer. Never cut off mid-sentence.
+3. Give a COMPLETE answer. Never cut off mid-sentence. Always end with a full stop.
 4. If the context contains a definition or formula, state it fully and clearly.
 5. If no relevant information exists in the context, say: "I could not find information about this in your documents."
 6. Keep answers concise: 2-5 sentences for definitions, slightly more for formulas with multiple steps.
 7. Do not add disclaimers, caveats, or source references like [1], [2].
-8. For URLs, return the full URL exactly on its own line.`
+8. For URLs, return the full URL exactly on its own line.
+9. Never include sheet names, chunk labels, or retrieval formatting in your answer.`
   const intentGuide = {
-    definition: `\nFOCUS: Define the term clearly. Start with what it represents or measures, then mention how it is calculated if a formula exists. Write in natural prose — never dump raw data rows.`,
-    calculation: `\nFOCUS: Explain exactly how this metric is calculated. State the formula clearly in plain English (e.g. "calculated by dividing X by Y"). Include all steps if multiple components exist. If you see a formula in the context, you MUST include it.`,
+    definition: `\nFOCUS: Define the term clearly in natural prose. Start with what it represents or measures, then mention how it is calculated if a formula exists.`,
+    calculation: `\nFOCUS: Explain exactly how this metric is calculated. State the formula clearly in plain English. Include all steps if multiple components exist.`,
     lookup: `\nFOCUS: Find and state the exact value or list requested.`,
     comparison: `\nFOCUS: Compare the items clearly, covering key similarities and differences.`,
     url_lookup: `\nFOCUS: Return the exact full URL on its own line. Nothing else.`,
@@ -446,25 +494,30 @@ function buildUserMessage(query, hits, intent) {
   const subject = extractSubject(query)
   let instruction = ''
   if (intent === 'definition') {
-    instruction = `\n\nUsing ONLY the context above, write 2-4 complete sentences defining "${subject}". State what it represents and how it is calculated if a formula is present. Do NOT copy raw data rows.`
+    instruction = `\n\nUsing ONLY the context above, write 2-4 complete sentences defining "${subject}". State what it represents and how it is calculated if a formula is present. Do NOT copy raw data rows. End with a full stop.`
   } else if (intent === 'calculation') {
-    instruction = `\n\nUsing ONLY the context above, explain exactly how "${subject}" is calculated. State the full formula clearly. If there are multiple steps, describe each one. Do NOT copy raw data rows.`
+    instruction = `\n\nUsing ONLY the context above, explain exactly how "${subject}" is calculated. State the full formula clearly. If there are multiple steps, describe each one. Do NOT copy raw data rows. End with a full stop.`
   } else if (intent === 'url_lookup') {
     instruction = `\n\nUsing ONLY the context above, return the full URL related to "${extractUrlKeywords(query).join(' ')}". Put it on its own line.`
   } else {
-    instruction = `\n\nUsing ONLY the context above, answer this question completely: ${query}`
+    instruction = `\n\nUsing ONLY the context above, answer this question completely: ${query} End with a full stop.`
   }
   return `CONTEXT:\n${context}${instruction}`
 }
 function cleanAnswer(rawAnswer) {
   if (!rawAnswer) return ''
-  return fixBrokenUrls(rawAnswer)
+  let cleaned = fixBrokenUrls(rawAnswer)
     .replace(/^\s*\[Source\s*\d+\]\s*/gm, '')
     .replace(/^[^\n]*\|[^\n]*\|[^\n]*\|[^\n]*\|[^\n]*$/gm, '')
     .replace(/\bField\d+\s*:\s*/gi, '')
     .replace(/\|\s*Field\d+\b/gi, '')
+    .replace(/^===\s*Sheet:.*===\s*$/gm, '')
+    .replace(/^=== .+ ===\s*$/gm, '')
+    .replace(/\(from\s+[A-Za-z\s]+\)\s*/g, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
+  if (cleaned.length > 0 && !/[.!?]$/.test(cleaned)) cleaned += '.'
+  return cleaned
 }
 function buildFallbackAnswer(query, hits) {
   if (!hits || hits.length === 0) {
@@ -493,8 +546,8 @@ function buildFallbackAnswer(query, hits) {
       const desc = (m[1] || '').trim().slice(0, 500)
       const formula = (m[2] || '').trim().slice(0, 400)
       const cap = subject.charAt(0).toUpperCase() + subject.slice(1)
-      if (desc && formula) return `${cap} is ${desc} It is calculated as: ${formula}`
-      if (desc) return `${cap} is ${desc}`
+      if (desc && formula) return `${cap} is ${desc} It is calculated as: ${formula}.`
+      if (desc) return `${cap} is ${desc}.`
     }
   }
   if (intent === 'calculation') {
@@ -504,7 +557,7 @@ function buildFallbackAnswer(query, hits) {
           const formulaPart = line.replace(/^.*formula:\s*/i, '').trim()
           if (formulaPart.length > 5) {
             const cap = subject.charAt(0).toUpperCase() + subject.slice(1)
-            return `${cap} is calculated as: ${formulaPart.slice(0, 500)}`
+            return `${cap} is calculated as: ${formulaPart.slice(0, 500)}.`
           }
         }
       }
@@ -515,12 +568,15 @@ function buildFallbackAnswer(query, hits) {
     for (const line of (h.text || '').split('\n')) {
       const ll = line.toLowerCase()
       if (ll.includes(subject) && line.trim().length > 20 && (line.match(/\|/g) || []).length <= 2) {
-        matchingLines.push(line.trim())
+        const cleaned = line.trim().replace(/^===\s*Sheet:.*===\s*$/, '').replace(/\(from\s+[A-Za-z\s]+\)/g, '').trim()
+        if (cleaned.length > 10) matchingLines.push(cleaned)
       }
     }
   }
   if (matchingLines.length > 0) {
-    return [...new Set(matchingLines)].slice(0, 2).join(' ').slice(0, 500)
+    let answer = [...new Set(matchingLines)].slice(0, 2).join(' ').slice(0, 500)
+    if (!/[.!?]$/.test(answer)) answer += '.'
+    return answer
   }
   return "I could not find that specific information in your documents."
 }
@@ -1079,6 +1135,15 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
   try {
     const { query, topK = 6, conversationId } = req.body
     if (!query?.trim()) return res.status(400).json({ error: 'query is required' })
+    const validation = validateQuery(query)
+    if (!validation.valid) {
+      return res.json({
+        answer: validation.message,
+        sources: [],
+        conversationId: conversationId || null,
+        client: req.client,
+      })
+    }
     const { clientId, name } = req.client
     const intent = detectQueryIntent(query.trim())
     if (intent === 'greeting') {
@@ -1110,7 +1175,10 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
           client: { clientId, name },
         }
       }
-      const hits = await retrieveChunks(query.trim(), chunks, Math.min(topK, 8), invertedIndex)
+      let hits = await retrieveChunks(query.trim(), chunks, Math.min(topK, 8), invertedIndex)
+      if (hits.length === 0) {
+        hits = relaxedKeywordSearch(query.trim(), chunks, 12, invertedIndex)
+      }
       console.log(`[chat/message] "${query.slice(0, 60)}" → intent=${intent}, hits=${hits.length}, topScore=${hits[0]?._score?.toFixed(2) || 0}`)
       if (hits.length === 0) {
         return {
