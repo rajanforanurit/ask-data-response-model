@@ -242,7 +242,7 @@ function extractSubject(query) {
   return q
 }
 function extractUrlKeywords(query) {
-  const stopWords = new Set(['power', 'bi', 'report', 'url', 'link', 'for', 'the', 'a', 'an', 'of', 'in', 'get', 'me', 'show', 'give', 'find', 'fetch', 'all', 'list'])
+  const stopWords = new Set(['power', 'bi', 'report', 'url', 'link', 'for', 'the', 'a', 'an', 'of', 'in', 'get', 'me', 'show', 'give', 'find', 'fetch', 'all', 'list', 'dashboard', 'reports', 'links', 'urls'])
   return query.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1 && !stopWords.has(w))
 }
 function fixBrokenUrls(text) {
@@ -474,7 +474,7 @@ function keywordSearch(query, chunks, topK, intent, invertedIndex) {
       }
     }
     if (intent === 'url_lookup' || intent === 'all_urls') {
-      for (const w of ['url', 'link', 'http']) {
+      for (const w of ['url', 'link', 'http', 'https', 'powerbi', 'app']) {
         for (const idx of (invertedIndex.get(w) || new Set())) union.add(idx)
       }
     }
@@ -547,7 +547,7 @@ async function retrieveChunks(query, chunks, topK, invertedIndex) {
   const normalizedQuery = query.toLowerCase().trim().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
   if (intent === 'all_urls') {
     const urlChunks = chunks.filter(c => /https?:\/\/\S+/.test(c.text || ''))
-    return urlChunks.slice(0, 50)
+    return urlChunks.slice(0, 100)
   }
   const candidates = keywordSearch(normalizedQuery, chunks, Math.min(150, chunks.length), intent, invertedIndex)
   const pool = candidates.length > 0 ? candidates : chunks.slice(0, 150)
@@ -660,11 +660,25 @@ function extractAllUrlsFromChunks(chunks) {
       const urls = line.match(urlRegex)
       if (!urls) continue
       for (const url of urls) {
-        const cleanUrl = url.replace(/[.,;]+$/, '')
+        const cleanUrl = url.replace(/[.,;)]+$/, '').trim()
+        if (!cleanUrl.startsWith('http')) continue
         if (seen.has(cleanUrl)) continue
         seen.add(cleanUrl)
-        const nameMatch = line.match(/^(.+?)[:\-]\s*https?:/)
-        const name = nameMatch ? nameMatch[1].trim() : 'Report'
+        let name = 'Report'
+        const reportUrlMatch = line.match(/^Report URL for (.+?):\s*https?:/i)
+        if (reportUrlMatch) {
+          name = reportUrlMatch[1].trim()
+        } else {
+          const beforeUrl = line.slice(0, line.indexOf('http')).trim()
+          if (beforeUrl) {
+            const cleaned = beforeUrl
+              .replace(/\.\s*URL\s*:?\s*$/i, '')
+              .replace(/\s*:\s*$/, '')
+              .replace(/^(URL|Link|Dashboard|Report)\s*:?\s*/i, '')
+              .trim()
+            if (cleaned.length > 1 && cleaned.length < 120) name = cleaned
+          }
+        }
         results.push({ name, url: cleanUrl })
       }
     }
@@ -683,14 +697,25 @@ function buildFallbackAnswer(query, hits) {
   }
   if (intent === 'url_lookup') {
     const urlKeywords = extractUrlKeywords(query)
+    const urlRegex = /https?:\/\/[^\s"'<>]+/
     for (const h of hits) {
-      for (const line of (h.text || '').split('\n')) {
-        if (!line.toLowerCase().includes('http')) continue
-        const matched = urlKeywords.filter(w => line.toLowerCase().includes(w)).length
+      const lines = (h.text || '').split('\n')
+      for (const line of lines) {
+        if (!urlRegex.test(line)) continue
+        const lineLower = line.toLowerCase()
+        const matched = urlKeywords.filter(w => lineLower.includes(w)).length
         if (matched > 0) {
-          const urlMatch = line.match(/https?:\/\/\S+/)
-          if (urlMatch) return urlMatch[0].replace(/\s/g, '')
+          const urlMatch = line.match(urlRegex)
+          if (urlMatch) return urlMatch[0].replace(/[.,;)]+$/, '').trim()
         }
+      }
+    }
+    for (const h of hits) {
+      const lines = (h.text || '').split('\n')
+      for (const line of lines) {
+        if (!urlRegex.test(line)) continue
+        const urlMatch = line.match(urlRegex)
+        if (urlMatch) return urlMatch[0].replace(/[.,;)]+$/, '').trim()
       }
     }
     return "I could not find a matching URL in your documents."
@@ -1367,13 +1392,15 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         }
       }
       let rawAnswer = ''
-      try {
-        rawAnswer = await Promise.race([
-          answerWithPhi4(query.trim(), hits, intent),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('Model timeout')), 25000)),
-        ])
-      } catch (err) {
-        console.warn(`[phi4] Using fallback: ${err.message}`)
+      if (intent !== 'url_lookup') {
+        try {
+          rawAnswer = await Promise.race([
+            answerWithPhi4(query.trim(), hits, intent),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Model timeout')), 25000)),
+          ])
+        } catch (err) {
+          console.warn(`[phi4] Using fallback: ${err.message}`)
+        }
       }
       const isBlank = !rawAnswer || rawAnswer.trim().length < 15
       const answer = isBlank
