@@ -206,6 +206,7 @@ function validateQuery(query) {
 function detectQueryIntent(query) {
   const q = query.toLowerCase().trim()
   if (/^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening)|how\s+are\s+you)\b/.test(q)) return 'greeting'
+  if (/\b(all\s+url|all\s+link|all\s+report|list\s+(all\s+)?(url|link|report|dashboard))\b/.test(q)) return 'all_urls'
   if (/\b(url|link|dashboard|power\s*bi|report\s+url)\b/.test(q)) return 'url_lookup'
   if (/how\s+(is|are|was|were)\s+.+\s+(calculated|computed|determined|derived)|what\s+is\s+the\s+(formula|calculation)\s+for|how\s+do\s+you\s+(calculate|compute)/.test(q)) return 'calculation'
   if (/^(what\s+(is|are|does)|define|explain|meaning\s+of|tell\s+me\s+about|describe)\s+/.test(q) || /\b(definition|meaning)\b/.test(q)) return 'definition'
@@ -241,7 +242,7 @@ function extractSubject(query) {
   return q
 }
 function extractUrlKeywords(query) {
-  const stopWords = new Set(['power', 'bi', 'report', 'url', 'link', 'for', 'the', 'a', 'an', 'of', 'in', 'get', 'me', 'show', 'give', 'find', 'fetch'])
+  const stopWords = new Set(['power', 'bi', 'report', 'url', 'link', 'for', 'the', 'a', 'an', 'of', 'in', 'get', 'me', 'show', 'give', 'find', 'fetch', 'all', 'list'])
   return query.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1 && !stopWords.has(w))
 }
 function fixBrokenUrls(text) {
@@ -255,6 +256,25 @@ function normalizeTerms(term) {
   if (t.endsWith('ies')) variants.add(t.slice(0, -3) + 'y')
   if (t.endsWith('y')) variants.add(t.slice(0, -1) + 'ies')
   return [...variants]
+}
+function trimToCompleteSentence(text, maxLen = 1200) {
+  if (!text || text.length <= maxLen) return text
+  const truncated = text.slice(0, maxLen)
+  const lastPeriod = Math.max(
+    truncated.lastIndexOf('. '),
+    truncated.lastIndexOf('.\n'),
+    truncated.lastIndexOf('.')
+  )
+  if (lastPeriod > maxLen * 0.5) return truncated.slice(0, lastPeriod + 1).trim()
+  return truncated.trim()
+}
+function ensureSinglePeriod(text) {
+  if (!text) return ''
+  return text.replace(/\.{2,}/g, '.').replace(/\.\s*\./g, '.').trim()
+}
+function capFirst(str) {
+  if (!str) return ''
+  return str.charAt(0).toUpperCase() + str.slice(1)
 }
 async function callPhi4(systemPrompt, userMessage, maxTokens = 1024) {
   if (!PHI4_ENDPOINT || !PHI4_API_KEY) throw new Error('PHI4_ENDPOINT and PHI4_API_KEY are required')
@@ -332,7 +352,6 @@ function scoreHeaderMatch(header, patterns) {
   }
   return 0
 }
-
 function detectColumns(headers) {
   const NAME_PATTERNS = [
     [/\b(measure|attribute|field|metric|kpi)\s*name\b/, 100],
@@ -358,7 +377,6 @@ function detectColumns(headers) {
   const ADDITIONAL_PATTERNS = [
     [/\b(additional|extra|notes?|info|configuration|config|mdm)\b/, 100],
   ]
-
   const colIdx = {}
   const scored = headers.map((h, i) => ({
     i,
@@ -369,18 +387,15 @@ function detectColumns(headers) {
     url: scoreHeaderMatch(h, URL_PATTERNS),
     additional: scoreHeaderMatch(h, ADDITIONAL_PATTERNS),
   }))
-
   for (const field of ['table', 'name', 'description', 'formula', 'url', 'additional']) {
     const best = scored.filter(c => c[field] > 0).sort((a, b) => b[field] - a[field])[0]
     if (best) colIdx[field] = best.i
   }
   return colIdx
 }
-
 function extractSpreadsheet(buffer) {
   const workbook = XLSX.read(buffer, { type: 'buffer', cellNF: true })
   const parts = []
-
   for (const sheetName of workbook.SheetNames) {
     const sheet = workbook.Sheets[sheetName]
     const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: '', header: 1, raw: false })
@@ -389,14 +404,9 @@ function extractSpreadsheet(buffer) {
     for (let i = 0; i < Math.min(15, rawRows.length); i++) {
       const cells = rawRows[i].map(c => String(c).trim()).filter(Boolean)
       if (cells.length < 2) continue
-      // Skip rows that are clearly copyright/title blurbs (single long string)
       if (cells.length === 1 && cells[0].length > 60) continue
-      // A good header row has short cell values (column names are rarely > 50 chars)
       const shortCells = cells.filter(c => c.length <= 60)
-      if (shortCells.length >= 2) {
-        headerRowIdx = i
-        break
-      }
+      if (shortCells.length >= 2) { headerRowIdx = i; break }
     }
     if (headerRowIdx === -1) headerRowIdx = 0
     const rawHeaders = rawRows[headerRowIdx].map(h => String(h).trim())
@@ -413,13 +423,6 @@ function extractSpreadsheet(buffer) {
       const row = rawRows[i]
       if (!row.some(cell => String(cell).trim() !== '')) continue
       const cells = row.map(cell => String(cell || '').replace(/\r?\n/g, ' ').trim())
-      const pairs = []
-      for (let j = 0; j < Math.max(headers.length, cells.length); j++) {
-        const val = cells[j] || ''
-        if (!val) continue
-        pairs.push(`${headers[j] || `Col${j + 1}`}: ${val}`)
-      }
-      if (pairs.length) parts.push(pairs.join(' | '))
       const nameVal = colIdx.name !== undefined ? (cells[colIdx.name] || '').trim() : ''
       const tableVal = colIdx.table !== undefined ? (cells[colIdx.table] || '').trim() : sheetName
       const descVal = colIdx.description !== undefined ? (cells[colIdx.description] || '').trim() : ''
@@ -430,17 +433,15 @@ function extractSpreadsheet(buffer) {
         let synthesis = `${nameVal}`
         if (tableVal && tableVal !== sheetName) synthesis += ` (${tableVal})`
         if (descVal) synthesis += ` is defined as: ${descVal}`
-        if (formulaVal) synthesis += ` Formula: ${formulaVal}`
-        if (additionalVal) synthesis += ` Additional Info: ${additionalVal}`
-        if (urlVal) synthesis += ` URL: ${urlVal}`
+        if (formulaVal) synthesis += `. Formula: ${formulaVal}`
+        if (additionalVal) synthesis += `. Additional Info: ${additionalVal}`
+        if (urlVal) synthesis += `. URL: ${urlVal}`
         parts.push(synthesis)
+        if (formulaVal) parts.push(`How to calculate ${nameVal}: ${formulaVal}`)
+        if (urlVal) parts.push(`Report URL for ${nameVal}: ${urlVal}`)
       } else if (descVal) {
         parts.push(descVal)
       }
-      if (nameVal && formulaVal) {
-        parts.push(`How to calculate ${nameVal}: ${formulaVal}`)
-      }
-
       parts.push('')
       rowsEmitted++
     }
@@ -464,7 +465,7 @@ function keywordSearch(query, chunks, topK, intent, invertedIndex) {
     : new RegExp(`\\b${escapeRegex(subject.toLowerCase())}\\b`, 'i')
   let candidateIndices
   if (invertedIndex && subjectWords.length > 0) {
-    const wordsToIndex = intent === 'url_lookup' ? extractUrlKeywords(query) : subjectWords
+    const wordsToIndex = (intent === 'url_lookup' || intent === 'all_urls') ? extractUrlKeywords(query) : subjectWords
     const union = new Set()
     for (const w of wordsToIndex) {
       for (const idx of (invertedIndex.get(w) || new Set())) union.add(idx)
@@ -472,7 +473,7 @@ function keywordSearch(query, chunks, topK, intent, invertedIndex) {
         for (const idx of (invertedIndex.get(variant) || new Set())) union.add(idx)
       }
     }
-    if (intent === 'url_lookup') {
+    if (intent === 'url_lookup' || intent === 'all_urls') {
       for (const w of ['url', 'link', 'http']) {
         for (const idx of (invertedIndex.get(w) || new Set())) union.add(idx)
       }
@@ -486,6 +487,11 @@ function keywordSearch(query, chunks, topK, intent, invertedIndex) {
     .map(c => {
       const text = (c.text || '').toLowerCase()
       let score = 0
+      if (intent === 'all_urls') {
+        if (!text.includes('http')) return { ...c, _score: 0 }
+        score += 10
+        return { ...c, _score: score }
+      }
       if (intent === 'url_lookup') {
         if (!text.includes('http')) return { ...c, _score: 0 }
         const kws = extractUrlKeywords(query)
@@ -539,18 +545,16 @@ function relaxedKeywordSearch(query, chunks, topK, invertedIndex) {
 async function retrieveChunks(query, chunks, topK, invertedIndex) {
   const intent = detectQueryIntent(query)
   const normalizedQuery = query.toLowerCase().trim().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
+  if (intent === 'all_urls') {
+    const urlChunks = chunks.filter(c => /https?:\/\/\S+/.test(c.text || ''))
+    return urlChunks.slice(0, 50)
+  }
   const candidates = keywordSearch(normalizedQuery, chunks, Math.min(150, chunks.length), intent, invertedIndex)
   const pool = candidates.length > 0 ? candidates : chunks.slice(0, 150)
   const topScore = pool[0]?._score || 0
-  if (topScore >= 6) {
-    return pool.slice(0, Math.min(topK, 8))
-  }
-  if ((intent === 'definition' || intent === 'calculation') && topScore >= 3) {
-    return pool.slice(0, Math.min(topK, 8))
-  }
-  if (intent === 'url_lookup' && pool.length > 0) {
-    return pool.slice(0, Math.min(topK, 6))
-  }
+  if (topScore >= 6) return pool.slice(0, Math.min(topK, 8))
+  if ((intent === 'definition' || intent === 'calculation') && topScore >= 3) return pool.slice(0, Math.min(topK, 8))
+  if (intent === 'url_lookup' && pool.length > 0) return pool.slice(0, Math.min(topK, 6))
   if (AZURE_EMBED_ENDPOINT && AZURE_EMBED_KEY) {
     try {
       const queryVec = await embedQueryAzure(normalizedQuery)
@@ -600,74 +604,83 @@ function buildContext(hits) {
 }
 function buildSystemPrompt(intent) {
   const base = `You are a helpful data dictionary assistant for a real estate analytics platform.
-Answer ONLY using the provided context. Follow these STRICT formatting rules:
+Answer ONLY using the provided context. Follow these STRICT rules:
 
-FORMATTING RULES:
-1. Always use **bold** for field/measure names and labels like **Definition:** and **Formula:**.
-2. Never output raw pipe-separated data rows (like "Name: X | Description: Y"). Convert to prose.
-3. Write in complete English sentences. Never cut off mid-sentence. End with a period.
-4. For definitions: use the pattern — "**[Name]** is [description]. **Formula:** [formula]."
-5. For comparisons: use a small table or two bullet sections, one per item.
-6. For URL lookups: output the full URL on its own line, nothing before or after.
-7. For lists: use bullet points (- item).
-8. Keep answers concise: 3–6 sentences for definitions, more only if formula is complex.
-9. Do NOT include source references like [1], [2] or sheet names in your answer.
-10. If the context does not contain the answer, say exactly: "I could not find this in your documents."`
+CRITICAL FORMATTING RULES:
+1. Always bold the main subject/measure/attribute name using **Name**.
+2. Write in complete, natural English sentences only. Never output raw pipe-separated data (like "Field: X | Field: Y").
+3. Never end a sentence with double periods (..). Use only one period to end a sentence.
+4. Never cut off mid-word or mid-sentence. If you are near the token limit, finish the current sentence cleanly and stop.
+5. Remove all sheet references like "=== Sheet: X ===" from your output.
+6. Do NOT include source references like [1], [2] in your answer.
+7. Do NOT include raw table rows or pipe-delimited data in your answer.
+8. For definitions: bold the name, state the definition in one clear sentence, then state the formula if available.
+9. For formulas: bold the label "Formula:" and write the formula in plain English.
+10. For URL lookups: output only the full URL on its own line, nothing else.
+11. For listing all URLs: list each URL on its own line, prefixed with the report name followed by a colon.
+12. Keep answers concise: 2-5 sentences for definitions. Only go longer if the formula is complex.
+13. If the context does not contain the answer, say exactly: "I could not find this in your documents."
 
-  const intentGuide = {
-    definition: `
-RESPONSE FORMAT for definition:
-**[Measure/Attribute Name]** is [one sentence description].
-**Formula:** [formula in plain English, if available].
-[Optional: one sentence of additional context if present in source.]`,
-    calculation: `
-RESPONSE FORMAT for formula/calculation:
-**How [Name] is Calculated**
-[Step-by-step explanation in plain English.]
-**Formula:** [exact formula text].`,
-    comparison: `
-RESPONSE FORMAT for comparison:
-Compare the two items clearly. Use this structure:
-**[Item A]:** [description + formula if any]
-**[Item B]:** [description + formula if any]
-**Key Difference:** [one sentence summary].`,
-    lookup: `
-RESPONSE FORMAT for lookup:
-State the exact value or list. Use bullet points if multiple items.`,
-    url_lookup: `
-RESPONSE FORMAT for URL:
-Return ONLY the exact full URL. No other text.`,
-    general: `
-RESPONSE FORMAT: Answer directly in 2–5 complete sentences using bold labels where helpful.`,
-  }
-  return base + (intentGuide[intent] || intentGuide.general)
+RESPONSE PATTERNS:
+- Definition: "**[Name]** is [description]. **Formula:** [formula if available]."
+- Calculation: "**[Name]** is calculated as [explanation]. **Formula:** [formula]."
+- URL lookup: return only the URL.
+- All URLs: "**[Report Name]:** [URL]" — one per line.
+- Comparison: "**[A]:** [desc]. **[B]:** [desc]. **Key Difference:** [one sentence]."
+`
+  return base
 }
-
 function buildUserMessage(query, hits, intent) {
   const context = buildContext(hits)
   const subject = extractSubject(query)
   let instruction = ''
   if (intent === 'definition') {
-    instruction = `\n\nUsing ONLY the context above, write a well-formatted definition of "${subject}". Bold the name. Include definition and formula if present. Do NOT copy raw data rows. End with a period.`
+    instruction = `\n\nUsing ONLY the context above, write a clean, well-formatted definition of "${subject}". Bold the name. One sentence for definition, one for formula if present. No pipe characters. No double periods. End with exactly one period.`
   } else if (intent === 'calculation') {
-    instruction = `\n\nUsing ONLY the context above, explain exactly how "${subject}" is calculated. Bold the formula label. State all steps. Do NOT copy raw data rows. End with a period.`
+    instruction = `\n\nUsing ONLY the context above, explain how "${subject}" is calculated. Bold "Formula:". No pipe characters. No double periods. End with exactly one period.`
   } else if (intent === 'url_lookup') {
     instruction = `\n\nUsing ONLY the context above, return the full URL related to "${extractUrlKeywords(query).join(' ')}". Return ONLY the URL, nothing else.`
+  } else if (intent === 'all_urls') {
+    instruction = `\n\nUsing ONLY the context above, list ALL URLs you find. For each, output the report or measure name followed by a colon and then the URL. One entry per line. No extra commentary.`
   } else if (intent === 'comparison') {
-    instruction = `\n\nUsing ONLY the context above, compare these items clearly: ${query}. Use bold labels for each item. End with a period.`
+    instruction = `\n\nUsing ONLY the context above, compare: ${query}. Bold each item name. End with a key difference sentence. No pipe characters. End with exactly one period.`
   } else {
-    instruction = `\n\nUsing ONLY the context above, answer this question completely and in a well-formatted way: ${query} End with a period.`
+    instruction = `\n\nUsing ONLY the context above, answer this question in clear, complete sentences: ${query} No pipe characters. No double periods. End with exactly one period.`
   }
   return `CONTEXT:\n${context}${instruction}`
 }
-function buildFallbackAnswer(query, hits) {
-  if (!hits || hits.length === 0) {
-    return "I could not find relevant information about this in your documents."
+function extractAllUrlsFromChunks(chunks) {
+  const results = []
+  const seen = new Set()
+  const urlRegex = /https?:\/\/[^\s"'<>]+/g
+  for (const chunk of chunks) {
+    const text = chunk.text || ''
+    const lines = text.split('\n')
+    for (const line of lines) {
+      const urls = line.match(urlRegex)
+      if (!urls) continue
+      for (const url of urls) {
+        const cleanUrl = url.replace(/[.,;]+$/, '')
+        if (seen.has(cleanUrl)) continue
+        seen.add(cleanUrl)
+        const nameMatch = line.match(/^(.+?)[:\-]\s*https?:/)
+        const name = nameMatch ? nameMatch[1].trim() : 'Report'
+        results.push({ name, url: cleanUrl })
+      }
+    }
   }
+  return results
+}
+function buildFallbackAnswer(query, hits) {
+  if (!hits || hits.length === 0) return "I could not find relevant information about this in your documents."
   const intent = detectQueryIntent(query)
   const subject = extractSubject(query)
   const subjectLower = subject.toLowerCase()
-
+  if (intent === 'all_urls') {
+    const urlEntries = extractAllUrlsFromChunks(hits)
+    if (urlEntries.length === 0) return "I could not find any URLs in your documents."
+    return urlEntries.map(e => `**${e.name}:** ${e.url}`).join('\n')
+  }
   if (intent === 'url_lookup') {
     const urlKeywords = extractUrlKeywords(query)
     for (const h of hits) {
@@ -683,46 +696,45 @@ function buildFallbackAnswer(query, hits) {
     return "I could not find a matching URL in your documents."
   }
   const synthesisPattern = new RegExp(
-    `${escapeRegex(subjectLower)}[^\\n]*is defined as:\\s*([^\\n]+?)(?:\\s+Formula:\\s*([^\\n]+))?(?:\\s+Additional Info:\\s*([^\\n]+))?$`,
+    `${escapeRegex(subjectLower)}[^\\n]*is defined as:\\s*([^.\\n]+(?:\\.[^.\\n]+)?)(?:\\.\\s*Formula:\\s*([^.\\n]+(?:\\.[^.\\n]+)?))?(?:\\.\\s*Additional Info:\\s*([^.\\n]+))?`,
     'im'
   )
   for (const h of hits) {
     const m = (h.text || '').match(synthesisPattern)
     if (m) {
-      const desc = (m[1] || '').trim().slice(0, 600)
+      const desc = trimToCompleteSentence((m[1] || '').trim(), 600)
       const formula = (m[2] || '').trim().slice(0, 400)
       const additional = (m[3] || '').trim().slice(0, 300)
-      const cap = subject.charAt(0).toUpperCase() + subject.slice(1)
-      let answer = `**${cap}** is ${desc}.`
-      if (formula) answer += `\n\n**Formula:** ${formula}.`
-      if (additional) answer += `\n\n**Additional Info:** ${additional}.`
-      return answer
+      const cap = capFirst(subject)
+      let answer = `**${cap}** is ${desc}`
+      if (!answer.endsWith('.')) answer += '.'
+      if (formula) answer += `\n\n**Formula:** ${formula}`
+      if (formula && !answer.endsWith('.')) answer += '.'
+      if (additional) answer += `\n\n**Additional Info:** ${additional}`
+      if (additional && !answer.endsWith('.')) answer += '.'
+      return ensureSinglePeriod(answer)
     }
   }
-
-  // Secondary: look for "How to calculate X: formula" lines
   if (intent === 'calculation') {
     const calcPattern = new RegExp(`how to calculate ${escapeRegex(subjectLower)}:\\s*([^\\n]+)`, 'im')
     for (const h of hits) {
       const m = (h.text || '').match(calcPattern)
       if (m) {
-        const cap = subject.charAt(0).toUpperCase() + subject.slice(1)
-        return `**How ${cap} is Calculated**\n\n**Formula:** ${m[1].trim().slice(0, 500)}.`
+        const cap = capFirst(subject)
+        const formula = trimToCompleteSentence(m[1].trim(), 500)
+        return ensureSinglePeriod(`**How ${cap} is Calculated**\n\n**Formula:** ${formula}.`)
       }
     }
   }
-
-  // Tertiary: extract meaningful lines that mention the subject
   const matchingLines = []
   for (const h of hits) {
     for (const line of (h.text || '').split('\n')) {
       const ll = line.toLowerCase()
       if (!ll.includes(subjectLower)) continue
       if (line.trim().length <= 20) continue
-      // Skip raw pipe-heavy rows (more than 3 pipes = raw spreadsheet row)
-      if ((line.match(/\|/g) || []).length > 3) continue
+      if ((line.match(/\|/g) || []).length > 2) continue
+      if (/^===\s*Sheet:/.test(line.trim())) continue
       const cleaned = line.trim()
-        .replace(/^===\s*Sheet:.*===\s*$/, '')
         .replace(/\(from\s+[A-Za-z\s]+\)/g, '')
         .trim()
       if (cleaned.length > 15) matchingLines.push(cleaned)
@@ -730,26 +742,44 @@ function buildFallbackAnswer(query, hits) {
   }
   if (matchingLines.length > 0) {
     const unique = [...new Set(matchingLines)].slice(0, 3)
-    const cap = subject.charAt(0).toUpperCase() + subject.slice(1)
-    return `**${cap}:** ${unique.join(' ').slice(0, 600)}.`
+    const cap = capFirst(subject)
+    const joined = trimToCompleteSentence(unique.join(' '), 600)
+    return ensureSinglePeriod(`**${cap}:** ${joined}.`)
   }
-
   return "I could not find that specific information in your documents."
 }
-// ───────────────────────────────────────────────────────────────────────────────
-
 function cleanAnswer(rawAnswer) {
   if (!rawAnswer) return ''
   let cleaned = fixBrokenUrls(rawAnswer)
     .replace(/^\s*\[Source\s*\d+\]\s*/gm, '')
-    // Remove pure pipe-delimited rows (4+ pipes = raw spreadsheet row)
-    .replace(/^[^\n]*\|[^\n]*\|[^\n]*\|[^\n]*\|[^\n]*$/gm, '')
+    .replace(/^[^\n]*(\|[^\n]*){3,}$/gm, '')
     .replace(/=== .+ ===\s*/gm, '')
     .replace(/\(from\s+[A-Za-z\s]+\)\s*/g, '')
     .replace(/\n{3,}/g, '\n\n')
+    .replace(/\.{2,}/g, '.')
+    .replace(/\.\s*\./g, '.')
     .trim()
+  cleaned = trimToLastCompleteSentence(cleaned)
   if (cleaned.length > 0 && !/[.!?]$/.test(cleaned)) cleaned += '.'
-  return cleaned
+  return ensureSinglePeriod(cleaned)
+}
+function trimToLastCompleteSentence(text) {
+  if (!text) return ''
+  const sentenceEnd = /[.!?]/
+  const lastIdx = Math.max(
+    text.lastIndexOf('. '),
+    text.lastIndexOf('.\n'),
+    text.lastIndexOf('! '),
+    text.lastIndexOf('? '),
+  )
+  if (lastIdx > text.length * 0.5) {
+    const trimmed = text.slice(0, lastIdx + 1).trim()
+    if (trimmed.length > 20) return trimmed
+  }
+  if (sentenceEnd.test(text[text.length - 1])) return text
+  const periodIdx = text.lastIndexOf('.')
+  if (periodIdx > text.length * 0.5) return text.slice(0, periodIdx + 1).trim()
+  return text
 }
 async function answerWithPhi4(query, hits, intent) {
   const systemPrompt = buildSystemPrompt(intent)
@@ -831,20 +861,12 @@ async function extractTextFromBuffer(buffer, fileName) {
   if (plainText.has(ext)) return buffer.toString('utf-8')
   return ''
 }
-
-// ─── IMPROVED CHUNKER ──────────────────────────────────────────────────────────
-// Spreadsheet synthesis lines ("X is defined as: ...") are short (100-300 chars).
-// We group them in PAIRS so each chunk contains both the raw row AND its synthesis,
-// keeping context together. This prevents the model from seeing the synthesis line
-// without the name, or the name without the description.
-
 function chunkText(text, sourceFile) {
   const chunks = []
   let chunkIndex = 0
   const blocks = text.replace(/\r\n/g, '\n').split(/\n{2,}/).map(b => b.trim()).filter(b => b.length > 0)
   let buffer = []
   let bufferLength = 0
-
   function flush() {
     const chunkStr = buffer.join('\n\n')
     if (chunkStr.length >= 30) {
@@ -853,7 +875,6 @@ function chunkText(text, sourceFile) {
     buffer = []
     bufferLength = 0
   }
-
   for (let bi = 0; bi < blocks.length; bi++) {
     const block = blocks[bi]
     if (block.length > CHUNK_SIZE * 1.5) {
@@ -890,8 +911,6 @@ function chunkText(text, sourceFile) {
   if (buffer.length > 0) flush()
   return chunks
 }
-// ───────────────────────────────────────────────────────────────────────────────
-
 async function downloadBlobAsBuffer(containerClient, blobName) {
   const download = await containerClient.getBlobClient(blobName).download()
   const parts = []
@@ -1297,6 +1316,42 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
           conversationId: conversationId || null,
           client: { clientId, name },
         }
+      }
+      if (intent === 'all_urls') {
+        const urlChunks = chunks.filter(c => /https?:\/\/\S+/.test(c.text || ''))
+        const urlEntries = extractAllUrlsFromChunks(urlChunks)
+        const answer = urlEntries.length > 0
+          ? urlEntries.map(e => `**${e.name}:** ${e.url}`).join('\n')
+          : "I could not find any URLs in your documents."
+        const sources = urlChunks.slice(0, 6).map(h => ({
+          source_file: h.source_file || 'unknown',
+          chunk_index: h.chunk_index ?? 0,
+          score: null,
+          preview: (h.text || '').slice(0, 200),
+        }))
+        let activeConversationId = conversationId || null
+        try {
+          const chatDatabase = await getChatDb()
+          const col = chatDatabase.collection('conversations')
+          const now = new Date()
+          const userMsg = { role: 'user', content: query.trim(), timestamp: now }
+          const assistantMsg = { role: 'assistant', content: answer, sources: sources.map(s => ({ source_file: s.source_file, score: s.score })), timestamp: now }
+          if (activeConversationId) {
+            const updated = await col.findOneAndUpdate(
+              { _id: new ObjectId(activeConversationId), clientId },
+              { $push: { messages: { $each: [userMsg, assistantMsg] } }, $set: { updatedAt: now } },
+              { returnDocument: 'after', projection: { _id: 1 } }
+            )
+            if (!updated) activeConversationId = null
+          }
+          if (!activeConversationId) {
+            const result = await col.insertOne({ clientId, title: generateTitle(query.trim()), messages: [userMsg, assistantMsg], createdAt: now, updatedAt: now })
+            activeConversationId = result.insertedId.toString()
+          }
+        } catch (saveErr) {
+          console.warn('[chat/message] Failed to save conversation:', saveErr.message)
+        }
+        return { answer, sources, conversationId: activeConversationId, client: { clientId, name } }
       }
       let hits = await retrieveChunks(query.trim(), chunks, Math.min(topK, 8), invertedIndex)
       if (hits.length === 0) {
