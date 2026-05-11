@@ -242,7 +242,7 @@ function extractSubject(query) {
 }
 function extractUrlKeywords(query) {
   const stopWords = new Set(['power', 'bi', 'report', 'url', 'link', 'for', 'the', 'a', 'an', 'of', 'in', 'get', 'me', 'show', 'give', 'find', 'fetch'])
-  return query.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1 && !stopWords.has(w))
+  return query.toLowerCase().replace(/[^\w\s-]/g, ' ').split(/\s+/).filter(w => w.length > 1 && !stopWords.has(w))
 }
 function fixBrokenUrls(text) {
   return text.replace(/https:\/\/[^\s]+(\s+[^\s]+)/g, (match) => match.replace(/\s/g, ''))
@@ -355,11 +355,12 @@ function detectColumns(headers) {
   const NAME_PATTERNS = [
     [/\b(measure|attribute|field|metric|kpi)\s*name\b/, 100],
     [/^name$/, 90],
+    [/report.?name/i, 85],
     [/\bname\b/, 70],
     [/\btitle\b/, 50],
   ]
   const TABLE_PATTERNS = [
-    [/\b(table|module|category|group|domain|section)\b/, 100],
+    [/\b(table|module|category|group|domain|section|workspace)\b/, 100],
     [/^table$/, 90],
   ]
   const DESC_PATTERNS = [
@@ -389,6 +390,15 @@ function detectColumns(headers) {
   for (const field of ['table', 'name', 'description', 'formula', 'url', 'additional']) {
     const best = scored.filter(c => c[field] > 0).sort((a, b) => b[field] - a[field])[0]
     if (best) colIdx[field] = best.i
+  }
+  if (colIdx.url !== undefined && colIdx.name === undefined) {
+    const usedIdx = new Set(Object.values(colIdx))
+    for (let i = 0; i < headers.length; i++) {
+      if (!usedIdx.has(i) && headers[i].trim()) {
+        colIdx.name = i
+        break
+      }
+    }
   }
   return colIdx
 }
@@ -437,7 +447,13 @@ function extractSpreadsheet(buffer) {
         if (urlVal) synthesis += `. URL: ${urlVal}`
         parts.push(synthesis)
         if (formulaVal) parts.push(`How to calculate ${nameVal}: ${formulaVal}`)
-        if (urlVal) parts.push(`Report URL for ${nameVal}: ${urlVal}`)
+        if (urlVal) {
+          parts.push(`Report URL for ${nameVal}: ${urlVal}`)
+          parts.push(`Power BI link for ${nameVal}: ${urlVal}`)
+          if (tableVal && tableVal !== sheetName) {
+            parts.push(`Report URL for ${nameVal} (${tableVal}): ${urlVal}`)
+          }
+        }
       } else if (descVal) {
         parts.push(descVal)
       }
@@ -664,7 +680,7 @@ function extractAllUrlsFromChunks(chunks) {
         if (seen.has(cleanUrl)) continue
         seen.add(cleanUrl)
         let name = 'Report'
-        const reportUrlMatch = line.match(/^Report URL for (.+?):\s*https?:/i)
+        const reportUrlMatch = line.match(/^(?:Report URL|Power BI link)\s+for\s+(.+?)(?:\s*\([^)]+\))?\s*:\s*https?:/i)
         if (reportUrlMatch) {
           name = reportUrlMatch[1].trim()
         } else {
