@@ -200,7 +200,7 @@ function validateQuery(query) {
   const trimmed = query.trim()
   if (trimmed.length <= 1) return { valid: false, message: 'Please enter a complete question to get an accurate answer.' }
   const words = trimmed.split(/\s+/).filter(w => w.length > 0)
-  if (words.length <= 2) return { valid: false, message: 'Please enter a more detailed question so I can provide an accurate answer.' }
+  if (words.length < 2) return { valid: false, message: 'Please enter a more detailed question so I can provide an accurate answer.' }
   return { valid: true }
 }
 function detectQueryIntent(query) {
@@ -229,6 +229,10 @@ function extractSubject(query) {
     /^how\s+are\s+(.+?)\s+(calculated|defined|measured|computed)$/,
     /^what\s+is\s+the\s+formula\s+for\s+(?:calculating\s+)?(?:an?\s+|the\s+)?(.+)$/,
     /^how\s+(?:do\s+you\s+)?calculate\s+(?:an?\s+|the\s+)?(.+)$/,
+    /^what\s+does\s+(.+?)\s+represent/,
+    /^what\s+is\s+the\s+purpose\s+of\s+(?:the\s+)?(.+?)\s+(?:attribute|measure|field|column)$/,
+    /^compare\s+(.+?)\s+(?:vs|versus)\s+(.+)$/,
+    /^difference\s+between\s+(.+?)\s+and\s+(.+)$/,
   ]
   for (const p of patterns) {
     const m = q.match(p)
@@ -601,10 +605,16 @@ function extractSpreadsheet(buffer) {
     const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: '', header: 1, raw: false })
     if (!rawRows.length) continue
     let headerRowIdx = 0
-    for (let i = 0; i < Math.min(5, rawRows.length); i++) {
-      if (rawRows[i].filter(cell => String(cell).trim() !== '').length >= 2) {
-        headerRowIdx = i
-        break
+    for (let i = 0; i < Math.min(10, rawRows.length); i++) {
+      const nonBlank = rawRows[i].filter(cell => String(cell).trim() !== '')
+      if (nonBlank.length >= 2) {
+        const rowStr = nonBlank.map(c => String(c).toLowerCase()).join(' ')
+        const looksLikeHeader = /name|description|formula|measure|attribute|table|column|field|type|calc/.test(rowStr)
+        if (looksLikeHeader) {
+          headerRowIdx = i
+          break
+        }
+        if (headerRowIdx === 0) headerRowIdx = i
       }
     }
     const rawHeaders = rawRows[headerRowIdx].map(h => String(h).trim())
@@ -616,11 +626,12 @@ function extractSpreadsheet(buffer) {
     }
     const colIdx = {}
     headers.forEach((h, i) => {
-      const hl = h.toLowerCase()
-      if (/table|module|category/.test(hl) && !colIdx.table) colIdx.table = i
-      if (/measure\s*name|attribute\s*name|name/.test(hl) && !colIdx.name) colIdx.name = i
-      if (/description|desc/.test(hl) && !colIdx.description) colIdx.description = i
-      if (/formula|calculation|calc/.test(hl) && !colIdx.formula) colIdx.formula = i
+      const hl = h.toLowerCase().trim()
+      if (/\b(table|module|category)\b/.test(hl) && colIdx.table === undefined) colIdx.table = i
+      if (/\b(measure\s*name|attribute\s*name)\b/.test(hl) && colIdx.name === undefined) colIdx.name = i
+      if (colIdx.name === undefined && /^name$/.test(hl)) colIdx.name = i
+      if (/\b(description|desc)\b/.test(hl) && colIdx.description === undefined) colIdx.description = i
+      if (/\b(formula|calculation|calc)\b/.test(hl) && colIdx.formula === undefined) colIdx.formula = i
     })
     parts.push(`=== Sheet: ${sheetName} ===`)
     for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
