@@ -21,6 +21,7 @@ const allowedOrigins = [
   'https://anuritchat.vercel.app',
   'https://ragadminpanel.vercel.app',
   'https://df.powerbi.com',
+  'https://www.anuritinnovation.com/',
   'https://api.powerbi.com',
 ]
 function originAllowed(origin) {
