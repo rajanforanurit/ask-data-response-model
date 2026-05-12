@@ -619,6 +619,7 @@ function relaxedKeywordSearch(query, chunks, topK, invertedIndex) {
 async function retrieveChunks(query, chunks, topK, invertedIndex) {
   const intent = detectQueryIntent(query)
   const normalizedQuery = query.toLowerCase().trim().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
+
   if (intent === 'all_urls') {
     const urlChunks = chunks.filter(c => /https?:\/\/\S+/.test(c.text || ''))
     return urlChunks.slice(0, 100)
@@ -629,6 +630,7 @@ async function retrieveChunks(query, chunks, topK, invertedIndex) {
   if (topScore >= 6) return pool.slice(0, Math.min(topK, 8))
   if ((intent === 'definition' || intent === 'calculation') && topScore >= 3) return pool.slice(0, Math.min(topK, 8))
   if (intent === 'url_lookup' && pool.length > 0) return pool.slice(0, Math.min(topK, 6))
+  if ((intent === 'lookup' || intent === 'general') && topScore >= 1) return pool.slice(0, Math.min(topK, 8))
   if (AZURE_EMBED_ENDPOINT && AZURE_EMBED_KEY) {
     try {
       const queryVec = await embedQueryAzure(normalizedQuery)
@@ -656,6 +658,7 @@ async function retrieveChunks(query, chunks, topK, invertedIndex) {
       console.warn('[retrieveChunks] embed failed, using keyword fallback:', err.message)
     }
   }
+
   if (pool.length > 0) return pool.slice(0, Math.min(topK, 8))
   const relaxed = relaxedKeywordSearch(normalizedQuery, chunks, Math.min(topK * 2, 16), invertedIndex)
   return relaxed.slice(0, Math.min(topK, 8))
@@ -664,7 +667,7 @@ function buildContext(hits) {
   const seen = new Set()
   const deduped = []
   for (const h of hits) {
-    const fp = (h.text || '').trim().slice(0, 80).toLowerCase()
+    const fp = `${h.source_file || ''}::${h.chunk_index ?? h.text?.slice(0, 40)}`
     if (!seen.has(fp)) {
       seen.add(fp)
       deduped.push(h)
