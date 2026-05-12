@@ -406,10 +406,12 @@ function detectColumns(headers) {
 function extractSpreadsheet(buffer) {
   const workbook = XLSX.read(buffer, { type: 'buffer', cellNF: true })
   const parts = []
+
   for (const sheetName of workbook.SheetNames) {
     const sheet = workbook.Sheets[sheetName]
     const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: '', header: 1, raw: false })
     if (!rawRows.length) continue
+
     let headerRowIdx = -1
     for (let i = 0; i < Math.min(15, rawRows.length); i++) {
       const cells = rawRows[i].map(c => String(c).trim()).filter(Boolean)
@@ -419,6 +421,7 @@ function extractSpreadsheet(buffer) {
       if (shortCells.length >= 2) { headerRowIdx = i; break }
     }
     if (headerRowIdx === -1) headerRowIdx = 0
+
     const rawHeaders = rawRows[headerRowIdx].map(h => String(h).trim())
     const headers = []
     let lastNonBlank = ''
@@ -427,47 +430,102 @@ function extractSpreadsheet(buffer) {
       else headers.push(lastNonBlank || `Col${headers.length + 1}`)
     }
     const colIdx = detectColumns(headers)
+    const isDictionary = colIdx.name !== undefined || colIdx.description !== undefined
     parts.push(`=== Sheet: ${sheetName} ===`)
-    let rowsEmitted = 0
-    for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
-      const row = rawRows[i]
-      if (!row.some(cell => String(cell).trim() !== '')) continue
-      const cells = row.map(cell => String(cell || '').replace(/\r?\n/g, ' ').trim())
-      const nameVal = colIdx.name !== undefined ? (cells[colIdx.name] || '').trim() : ''
-      const tableVal = colIdx.table !== undefined ? (cells[colIdx.table] || '').trim() : sheetName
-      const descVal = colIdx.description !== undefined ? (cells[colIdx.description] || '').trim() : ''
-      const formulaVal = colIdx.formula !== undefined ? (cells[colIdx.formula] || '').trim() : ''
-      const additionalVal = colIdx.additional !== undefined ? (cells[colIdx.additional] || '').trim() : ''
-      const urlVal = colIdx.url !== undefined ? (cells[colIdx.url] || '').trim() : ''
-      if (nameVal) {
-        let synthesis = `${nameVal}`
-        if (tableVal && tableVal !== sheetName) synthesis += ` (${tableVal})`
-        if (descVal) synthesis += ` is defined as: ${descVal}`
-        if (formulaVal) synthesis += `. Formula: ${formulaVal}`
-        if (additionalVal) synthesis += `. Additional Info: ${additionalVal}`
-        if (urlVal) synthesis += `. URL: ${urlVal}`
-        parts.push(synthesis)
-        if (formulaVal) parts.push(`How to calculate ${nameVal}: ${formulaVal}`)
-        if (urlVal) {
-          parts.push(`Report URL for ${nameVal}: ${urlVal}`)
-          parts.push(`Power BI link for ${nameVal}: ${urlVal}`)
-          if (tableVal && tableVal !== sheetName) {
-            parts.push(`Report URL for ${nameVal} (${tableVal}): ${urlVal}`)
-          }
-        }
-      } else if (descVal) {
-        parts.push(descVal)
-      }
-      parts.push('')
-      rowsEmitted++
-    }
-    if (rowsEmitted === 0) {
+    if (isDictionary) {
+      let rowsEmitted = 0
+
       for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
         const row = rawRows[i]
-        const cells = row.map(c => String(c || '').trim()).filter(Boolean)
-        if (cells.length) parts.push(cells.join(' | '))
+        if (!row.some(cell => String(cell).trim() !== '')) continue
+
+        const cells = row.map(cell => String(cell || '').replace(/\r?\n/g, ' ').trim())
+        const nameVal       = colIdx.name        !== undefined ? (cells[colIdx.name]        || '').trim() : ''
+        const tableVal      = colIdx.table       !== undefined ? (cells[colIdx.table]       || '').trim() : sheetName
+        const descVal       = colIdx.description !== undefined ? (cells[colIdx.description] || '').trim() : ''
+        const formulaVal    = colIdx.formula     !== undefined ? (cells[colIdx.formula]     || '').trim() : ''
+        const additionalVal = colIdx.additional  !== undefined ? (cells[colIdx.additional]  || '').trim() : ''
+        const urlVal        = colIdx.url         !== undefined ? (cells[colIdx.url]         || '').trim() : ''
+
+        if (nameVal) {
+          let synthesis = `${nameVal}`
+          if (tableVal && tableVal !== sheetName) synthesis += ` (${tableVal})`
+          if (descVal)       synthesis += ` is defined as: ${descVal}`
+          if (formulaVal)    synthesis += `. Formula: ${formulaVal}`
+          if (additionalVal) synthesis += `. Additional Info: ${additionalVal}`
+          if (urlVal)        synthesis += `. URL: ${urlVal}`
+          parts.push(synthesis)
+
+          if (formulaVal) parts.push(`How to calculate ${nameVal}: ${formulaVal}`)
+          if (urlVal) {
+            parts.push(`Report URL for ${nameVal}: ${urlVal}`)
+            parts.push(`Power BI link for ${nameVal}: ${urlVal}`)
+            if (tableVal && tableVal !== sheetName) {
+              parts.push(`Report URL for ${nameVal} (${tableVal}): ${urlVal}`)
+            }
+          }
+        } else if (descVal) {
+          parts.push(descVal)
+        }
+
+        parts.push('')
+        rowsEmitted++
+      }
+      if (rowsEmitted === 0) {
+        for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
+          const row = rawRows[i]
+          const cells = row.map(c => String(c || '').trim()).filter(Boolean)
+          if (cells.length) {
+            const sentence = headers
+              .map((h, idx) => `${h}: ${row[idx] !== undefined ? String(row[idx]).trim() : ''}`)
+              .filter(pair => !pair.endsWith(': '))
+              .join(', ')
+            if (sentence.trim()) parts.push(sentence)
+          }
+        }
+      }
+    } else {
+      parts.push(`This sheet contains columns: ${headers.filter(Boolean).join(', ')}.`)
+      parts.push('')
+
+      let dataRowsEmitted = 0
+
+      for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
+        const row = rawRows[i]
+        if (!row.some(cell => String(cell).trim() !== '')) continue
+        const cells = row.map(cell => String(cell || '').replace(/\r?\n/g, ' ').trim())
+        const firstCell = cells[0] || ''
+        const isLabelValueRow =
+          cells.filter(Boolean).length <= 3 &&
+          firstCell.length > 2 &&
+          isNaN(Number(firstCell)) &&
+          cells.slice(1).some(c => c !== '' && !isNaN(Number(c.replace(/,/g, ''))))
+
+        if (isLabelValueRow) {
+          const label = firstCell
+          const value = cells.slice(1).find(c => c !== '' && !isNaN(Number(c.replace(/,/g, '')))) || ''
+          parts.push(`${label}: ${value}`)
+          parts.push('')
+          continue
+        }
+        const pairs = headers
+          .map((h, idx) => {
+            const val = cells[idx] !== undefined ? cells[idx] : ''
+            return val !== '' ? `${h}: ${val}` : null
+          })
+          .filter(Boolean)
+
+        if (pairs.length > 0) {
+          parts.push(pairs.join(', '))
+          dataRowsEmitted++
+        }
+      }
+      if (dataRowsEmitted > 0) {
+        parts.push('')
+        parts.push(`Total data rows in this sheet: ${dataRowsEmitted}.`)
       }
     }
+    parts.push('') 
   }
   return parts.join('\n')
 }
