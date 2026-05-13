@@ -764,25 +764,37 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       try {
         hits = await searchChunks(clientId, query.trim(), Math.min(topK, 8))
         console.log(`[chat/message] "${query.slice(0, 60)}" → intent=${intent}, hits=${hits.length}, topScore=${hits[0]?._score?.toFixed(3) || 0}`)
-      } catch (searchErr) {
-        console.error('[chat/message] Azure AI Search failed:', searchErr.message)
-        return {
-          answer:         'Search service is temporarily unavailable. Please try again in a moment.',
-          sources:        [],
-          conversationId: conversationId || null,
-          client:         { clientId, name },
-        }
-      }
+      } ca// AFTER — logs real error, better empty-index message
+try {
+  hits = await searchChunks(clientId, query.trim(), Math.min(topK, 8))
+  console.log(
+    `[chat/message] "${query.slice(0, 60)}" → intent=${intent}, ` +
+    `hits=${hits.length}, topScore=${hits[0]?._score?.toFixed(3) || 0}`
+  )
+} catch (searchErr) {
+  console.error('[chat/message] Azure AI Search failed:', searchErr.message)
+  // Return actual error in dev, generic message in prod
+  const isDev = process.env.NODE_ENV !== 'production'
+  return {
+    answer: isDev
+      ? `Search error: ${searchErr.message}`
+      : 'Search service is temporarily unavailable. Please try again.',
+    sources:        [],
+    conversationId: conversationId || null,
+    client:         { clientId, name },
+  }
+}
 
-      if (hits.length === 0) {
-        return {
-          answer:         "I could not find relevant information about this in your documents.",
-          sources:        [],
-          conversationId: conversationId || null,
-          client:         { clientId, name },
-        }
-      }
-
+if (hits.length === 0) {
+  return {
+    answer: "No documents have been ingested for your account yet, " +
+            "or no relevant sections were found. " +
+            "Please upload your documents first via the ingestion API.",
+    sources:        [],
+    conversationId: conversationId || null,
+    client:         { clientId, name },
+  }
+}
       // Build answer — Phi-4 first, fallback if blank
       let rawAnswer = ''
       try {
