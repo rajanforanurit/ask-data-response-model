@@ -165,21 +165,29 @@ const cleaned = query.trim().replace(/[?!.]+$/, '')
 return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned
 }
 async function embedQueryAzure(query) {
-if (!AZURE_EMBED_ENDPOINT || !AZURE_EMBED_KEY) return null
-try {
-const response = await fetchWithTimeout(
-AZURE_EMBED_ENDPOINT,
-{
-method: 'POST',
-headers: { 'Content-Type': 'application/json', 'api-key': AZURE_EMBED_KEY },
-body: JSON.stringify({ input: query, model: AZURE_EMBED_MODEL }),
-},
-EMBED_TIMEOUT_MS
-)
-if (!response.ok) {
-const errText = await response.text()
-console.error('[embed] Azure embedding failed:', response.status, errText)
-return null
+  const endpoint = process.env.PYTHON_EMBED_ENDPOINT
+  const apiKey   = process.env.PYTHON_EMBED_API_KEY
+  if (!endpoint) return null
+  try {
+    const response = await fetchWithTimeout(
+      endpoint,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({ text: query }),
+      },
+      EMBED_TIMEOUT_MS
+    )
+    if (!response.ok) return null
+    const data = await response.json()
+    return data.embedding || null
+  } catch (err) {
+    console.error('[embed] Exception:', err.message)
+    return null
+  }
 }
 const data = await response.json()
 return data.data?.[0]?.embedding || null
