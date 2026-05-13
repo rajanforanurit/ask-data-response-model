@@ -1,9 +1,11 @@
-require('dotenv').config()
-const express = require('express')
-const cors = require('cors')
-const { MongoClient, ObjectId } = require('mongodb')
-const crypto = require('crypto')
-const app = express()
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const { MongoClient, ObjectId } = require('mongodb');
+const crypto = require('crypto');
+const { BlobServiceClient } = require('@azure/storage-blob');
+
+const app = express();
 
 const allowedOrigins = [
   'http://localhost:8080',
@@ -15,14 +17,14 @@ const allowedOrigins = [
   'https://df.powerbi.com',
   'https://www.anuritinnovation.com/',
   'https://api.powerbi.com',
-]
+];
 
 function originAllowed(origin) {
-  if (!origin) return true
-  if (origin === 'null') return true
-  if (allowedOrigins.includes(origin)) return true
-  if (/\.(powerbi|microsoft|office)\.com$/.test(origin)) return true
-  return false
+  if (!origin) return true;
+  if (origin === 'null') return true;
+  if (allowedOrigins.includes(origin)) return true;
+  if (/\.(powerbi|microsoft|office)\.com$/.test(origin)) return true;
+  return false;
 }
 
 app.use(cors({
@@ -30,162 +32,203 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-session-id'],
   credentials: true,
-}))
+}));
+
 app.options('*', cors({
   origin: (origin, callback) => callback(null, true),
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-session-id'],
   credentials: true,
-}))
-app.use(express.json())
+}));
+
+app.use(express.json());
 
 // ── Environment variables ──────────────────────────────────────────────────────
-const MONGODB_URI             = process.env.MONGODB_URI
-const MONGODB_DB              = process.env.MONGODB_DB || 'clientcreds'
-const CHAT_HISTORY_URI        = process.env.CHAT_HISTORY_URI
-const CHAT_HISTORY_DB         = process.env.CHAT_HISTORY_DB || 'chathistory'
-const ADMIN_API_KEY           = process.env.ADMIN_API_KEY
-const KEY_CHECK_INTERVAL_MS   = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10)
-const REQUEST_TIMEOUT_MS      = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10)
-const PHI4_ENDPOINT           = process.env.PHI4_ENDPOINT
-const PHI4_API_KEY            = process.env.PHI4_API_KEY
-const PHI4_MODEL              = process.env.PHI4_MODEL || 'Phi-4'
-const PHI4_TIMEOUT_MS         = parseInt(process.env.PHI4_TIMEOUT_MS || '30000', 10)
-const EMBED_TIMEOUT_MS        = parseInt(process.env.EMBED_TIMEOUT_MS || '10000', 10)
+const MONGODB_URI = process.env.MONGODB_URI;
+const MONGODB_DB = process.env.MONGODB_DB || 'clientcreds';
+const CHAT_HISTORY_URI = process.env.CHAT_HISTORY_URI;
+const CHAT_HISTORY_DB = process.env.CHAT_HISTORY_DB || 'chathistory';
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
+const KEY_CHECK_INTERVAL_MS = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10);
+const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10);
 
-// ── NEW: Python embed endpoint (replaces Azure OpenAI embeddings) ──────────────
-const PYTHON_EMBED_ENDPOINT   = process.env.PYTHON_EMBED_ENDPOINT || ''
-const PYTHON_EMBED_API_KEY    = process.env.PYTHON_EMBED_API_KEY || ''
+const PHI4_ENDPOINT = process.env.PHI4_ENDPOINT;
+const PHI4_API_KEY = process.env.PHI4_API_KEY;
+const PHI4_MODEL = process.env.PHI4_MODEL || 'Phi-4';
+const PHI4_TIMEOUT_MS = parseInt(process.env.PHI4_TIMEOUT_MS || '30000', 10);
+const EMBED_TIMEOUT_MS = parseInt(process.env.EMBED_TIMEOUT_MS || '10000', 10);
+
+const PYTHON_EMBED_ENDPOINT = process.env.PYTHON_EMBED_ENDPOINT || '';
+const PYTHON_EMBED_API_KEY = process.env.PYTHON_EMBED_API_KEY || '';
 
 // ── Azure AI Search ────────────────────────────────────────────────────────────
-const AZURE_SEARCH_ENDPOINT   = process.env.AZURE_SEARCH_ENDPOINT || ''
-const AZURE_SEARCH_KEY        = process.env.AZURE_SEARCH_KEY || ''
-const AZURE_SEARCH_INDEX      = process.env.AZURE_SEARCH_INDEX || 'rag-chunks'
-const SEARCH_API_VERSION      = '2024-11-01-preview'
+const AZURE_SEARCH_ENDPOINT = process.env.AZURE_SEARCH_ENDPOINT || '';
+const AZURE_SEARCH_KEY = process.env.AZURE_SEARCH_KEY || '';
+const AZURE_SEARCH_INDEX = process.env.AZURE_SEARCH_INDEX || 'rag-chunks';
+const SEARCH_API_VERSION = '2024-11-01-preview';
+
+// ── Azure Blob Storage ─────────────────────────────────────────────────────────
+const AZURE_STORAGE_CONNECTION_STRING = process.env.AZURE_STORAGE_CONNECTION_STRING || '';
+const AZURE_STORAGE_CONTAINER = process.env.AZURE_STORAGE_CONTAINER || 'documents';
 
 // ── Response cache ─────────────────────────────────────────────────────────────
-const RESPONSE_CACHE     = new Map()
-const RESPONSE_CACHE_TTL = 10 * 60 * 1000
-const RESPONSE_CACHE_MAX = 1000
+const RESPONSE_CACHE = new Map();
+const RESPONSE_CACHE_TTL = 10 * 60 * 1000;
+const RESPONSE_CACHE_MAX = 1000;
 
 function responseCacheGet(key) {
-  const entry = RESPONSE_CACHE.get(key)
-  if (!entry) return null
-  if (Date.now() - entry.ts > RESPONSE_CACHE_TTL) { RESPONSE_CACHE.delete(key); return null }
-  return entry.value
+  const entry = RESPONSE_CACHE.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > RESPONSE_CACHE_TTL) {
+    RESPONSE_CACHE.delete(key);
+    return null;
+  }
+  return entry.value;
 }
+
 function responseCacheSet(key, value) {
   if (RESPONSE_CACHE.size >= RESPONSE_CACHE_MAX) {
-    RESPONSE_CACHE.delete(RESPONSE_CACHE.keys().next().value)
+    RESPONSE_CACHE.delete(RESPONSE_CACHE.keys().next().value);
   }
-  RESPONSE_CACHE.set(key, { value, ts: Date.now() })
+  RESPONSE_CACHE.set(key, { value, ts: Date.now() });
 }
+
 function getCacheKey(clientId, query) {
-  return `${clientId}:${query.toLowerCase().trim()}`
+  return `${clientId}:${query.toLowerCase().trim()}`;
 }
 
 // ── Phi-4 concurrency limiter ──────────────────────────────────────────────────
-const IN_FLIGHT = new Map()
-let phiActiveCount = 0
-const PHI_MAX_CONCURRENT = 3
-const phiQueue = []
+const IN_FLIGHT = new Map();
+let phiActiveCount = 0;
+const PHI_MAX_CONCURRENT = 3;
+const phiQueue = [];
+
+function drainPhiQueue() {
+  if (phiQueue.length > 0 && phiActiveCount < PHI_MAX_CONCURRENT) {
+    phiQueue.shift()();
+  }
+}
 
 function runWithPhiLimit(fn) {
   return new Promise((resolve, reject) => {
     function tryRun() {
       if (phiActiveCount < PHI_MAX_CONCURRENT) {
-        phiActiveCount++
+        phiActiveCount++;
         Promise.resolve().then(fn).then(
-          result => { phiActiveCount--; drainPhiQueue(); resolve(result) },
-          err    => { phiActiveCount--; drainPhiQueue(); reject(err) }
-        )
-      } else { phiQueue.push(tryRun) }
+          result => { 
+            phiActiveCount--; 
+            drainPhiQueue(); 
+            resolve(result); 
+          },
+          err => { 
+            phiActiveCount--; 
+            drainPhiQueue(); 
+            reject(err); 
+          }
+        );
+      } else {
+        phiQueue.push(tryRun);
+      }
     }
-    tryRun()
-  })
-}
-function drainPhiQueue() {
-  if (phiQueue.length > 0 && phiActiveCount < PHI_MAX_CONCURRENT) phiQueue.shift()()
+    tryRun();
+  });
 }
 
 // ── Phi-4 circuit breaker ──────────────────────────────────────────────────────
-let phiFailures = 0
-let phiBlockedUntil = 0
+let phiFailures = 0;
+let phiBlockedUntil = 0;
+
 function phiCircuitOpen() {
-  if (Date.now() < phiBlockedUntil) return true
-  if (phiBlockedUntil > 0) { phiBlockedUntil = 0; phiFailures = 0 }
-  return false
+  if (Date.now() < phiBlockedUntil) return true;
+  if (phiBlockedUntil > 0) { phiBlockedUntil = 0; phiFailures = 0; }
+  return false;
 }
-function phiRecordSuccess() { phiFailures = 0; phiBlockedUntil = 0 }
+
+function phiRecordSuccess() { phiFailures = 0; phiBlockedUntil = 0; }
 function phiRecordFailure() {
-  phiFailures++
-  if (phiFailures >= 3) { phiBlockedUntil = Date.now() + 30000; console.error('[phi4] Circuit breaker OPEN for 30s') }
+  phiFailures++;
+  if (phiFailures >= 3) {
+    phiBlockedUntil = Date.now() + 30000;
+    console.error('[phi4] Circuit breaker OPEN for 30s');
+  }
 }
 
 // ── Utilities ──────────────────────────────────────────────────────────────────
 async function fetchWithTimeout(url, options, timeoutMs) {
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...options, signal: controller.signal })
+    return await fetch(url, { ...options, signal: controller.signal });
   } catch (err) {
-    if (err.name === 'AbortError') throw new Error(`Request timed out after ${timeoutMs}ms`)
-    throw err
-  } finally { clearTimeout(timer) }
+    if (err.name === 'AbortError') throw new Error(`Request timed out after ${timeoutMs}ms`);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function withRequestTimeout(fn, timeoutMs = REQUEST_TIMEOUT_MS) {
   return async (req, res, next) => {
-    let settled = false
+    let settled = false;
     const timer = setTimeout(() => {
-      if (!settled) { settled = true; if (!res.headersSent) res.status(503).json({ error: 'Request timed out. Please try again.' }) }
-    }, timeoutMs)
-    try { await fn(req, res, next) } catch (err) { if (!settled) next(err) } finally { settled = true; clearTimeout(timer) }
-  }
+      if (!settled) {
+        settled = true;
+        if (!res.headersSent) res.status(503).json({ error: 'Request timed out. Please try again.' });
+      }
+    }, timeoutMs);
+    try { await fn(req, res, next); } catch (err) { if (!settled) next(err); }
+    finally { settled = true; clearTimeout(timer); }
+  };
 }
-
+// ── Helper Functions ───────────────────────────────────────────────────────────
 function validateQuery(query) {
-  if (!query || typeof query !== 'string') return { valid: false, message: 'Please enter a complete question to get an accurate answer.' }
-  const trimmed = query.trim()
-  if (trimmed.length <= 1) return { valid: false, message: 'Please enter a complete question to get an accurate answer.' }
-  const words = trimmed.split(/\s+/).filter(w => w.length > 0)
-  if (words.length < 2) return { valid: false, message: 'Please enter a more detailed question so I can provide an accurate answer.' }
-  return { valid: true }
+  if (!query || typeof query !== 'string') 
+    return { valid: false, message: 'Please enter a complete question to get an accurate answer.' };
+  
+  const trimmed = query.trim();
+  if (trimmed.length <= 1) 
+    return { valid: false, message: 'Please enter a complete question to get an accurate answer.' };
+  
+  const words = trimmed.split(/\s+/).filter(w => w.length > 0);
+  if (words.length < 2) 
+    return { valid: false, message: 'Please enter a more detailed question so I can provide an accurate answer.' };
+  
+  return { valid: true };
 }
 
 function detectQueryIntent(query) {
-  const q = query.toLowerCase().trim()
-  if (/^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening)|how\s+are\s+you)\b/.test(q)) return 'greeting'
-  if (/\b(url|link|dashboard|power\s*bi|report\s+url)\b/.test(q)) return 'url_lookup'
-  if (/how\s+(is|are|was|were)\s+.+\s+(calculated|computed|determined|derived)|what\s+is\s+the\s+(formula|calculation)\s+for|how\s+do\s+you\s+(calculate|compute)/.test(q)) return 'calculation'
-  if (/^(what\s+(is|are|does)|define|explain|meaning\s+of|tell\s+me\s+about|describe)\s+/.test(q) || /\b(definition|meaning)\b/.test(q)) return 'definition'
-  if (/\b(vs|versus|difference|compare|between)\b/.test(q)) return 'comparison'
-  if (/^(show|list|find|get|fetch|give)\s+(me\s+)?|^how\s+many\s+/.test(q)) return 'lookup'
-  return 'general'
+  const q = query.toLowerCase().trim();
+  if (/^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening)|how\s+are\s+you)\b/.test(q)) return 'greeting';
+  if (/\b(url|link|dashboard|power\s*bi|report\s+url)\b/.test(q)) return 'url_lookup';
+  if (/how\s+(is|are|was|were)\s+.+\s+(calculated|computed|determined|derived)|what\s+is\s+the\s+(formula|calculation)\s+for|how\s+do\s+you\s+(calculate|compute)/.test(q)) return 'calculation';
+  if (/^(what\s+(is|are|does)|define|explain|meaning\s+of|tell\s+me\s+about|describe)\s+/.test(q) || /\b(definition|meaning)\b/.test(q)) return 'definition';
+  if (/\b(vs|versus|difference|compare|between)\b/.test(q)) return 'comparison';
+  if (/^(show|list|find|get|fetch|give)\s+(me\s+)?|^how\s+many\s+/.test(q)) return 'lookup';
+  return 'general';
 }
 
 function fixBrokenUrls(text) {
-  return text.replace(/https:\/\/[^\s]+(\s+[^\s]+)/g, (match) => match.replace(/\s/g, ''))
+  return text.replace(/https:\/\/[^\s]+(\s+[^\s]+)/g, (match) => match.replace(/\s/g, ''));
 }
 
 function ensureSinglePeriod(text) {
-  if (!text) return ''
-  return text.replace(/\.{2,}/g, '.').replace(/\.\s*\./g, '.').trim()
+  if (!text) return '';
+  return text.replace(/\.{2,}/g, '.').replace(/\.\s*\./g, '.').trim();
 }
 
 function capFirst(str) {
-  if (!str) return ''
-  return str.charAt(0).toUpperCase() + str.slice(1)
+  if (!str) return '';
+  return str.charAt(0).toUpperCase() + str.slice(1);
 }
 
 function generateTitle(query) {
-  const cleaned = query.trim().replace(/[?!.]+$/, '')
-  return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned
+  const cleaned = query.trim().replace(/[?!.]+$/, '');
+  return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned;
 }
 
-// ── Embeddings: calls Python ingestion API (384-dim MiniLM, matches index) ─────
+// ── Embeddings ─────────────────────────────────────────────────────────────────
 async function embedQueryAzure(query) {
-  if (!PYTHON_EMBED_ENDPOINT) return null
+  if (!PYTHON_EMBED_ENDPOINT) return null;
   try {
     const response = await fetchWithTimeout(
       PYTHON_EMBED_ENDPOINT,
@@ -198,71 +241,158 @@ async function embedQueryAzure(query) {
         body: JSON.stringify({ text: query }),
       },
       EMBED_TIMEOUT_MS
-    )
+    );
     if (!response.ok) {
-      console.error('[embed] Python embed API error:', response.status)
-      return null
+      console.error('[embed] Python embed API error:', response.status);
+      return null;
     }
-    const data = await response.json()
-    return data.embedding || null
+    const data = await response.json();
+    return data.embedding || null;
   } catch (err) {
-    console.error('[embed] Exception:', err.message)
-    return null
+    console.error('[embed] Exception:', err.message);
+    return null;
   }
 }
 
 // ── Azure AI Search ────────────────────────────────────────────────────────────
 async function searchChunks(clientId, query, topK = 6) {
   if (!AZURE_SEARCH_ENDPOINT || !AZURE_SEARCH_KEY) {
-    throw new Error('AZURE_SEARCH_ENDPOINT and AZURE_SEARCH_KEY are not configured')
+    throw new Error('AZURE_SEARCH_ENDPOINT and AZURE_SEARCH_KEY are not configured');
   }
-  const url = `${AZURE_SEARCH_ENDPOINT}/indexes/${AZURE_SEARCH_INDEX}/docs/search?api-version=${SEARCH_API_VERSION}`
+
+  const url = `${AZURE_SEARCH_ENDPOINT}/indexes/${AZURE_SEARCH_INDEX}/docs/search?api-version=${SEARCH_API_VERSION}`;
   const headers = {
     'Content-Type': 'application/json',
     'api-key': AZURE_SEARCH_KEY,
-  }
-  const queryVec = await embedQueryAzure(query)
+  };
+
+  const queryVec = await embedQueryAzure(query);
+
   const searchBody = {
     search: query,
     filter: `client_id eq '${clientId}'`,
-    select: 'text,source_file,chunk_index,page,doc_id',
+    select: 'id,text,source_file,chunk_index,page,doc_id',
     top: topK,
     queryType: 'semantic',
     semanticConfiguration: 'semantic-config',
-  }
-  if (queryVec) {
+  };
+
+  if (queryVec && Array.isArray(queryVec) && queryVec.length > 0) {
     searchBody.vectorQueries = [{
       kind: 'vector',
       vector: queryVec,
       fields: 'embedding',
-      k: topK * 3,
+      k: Math.min(topK * 3, 100),
       exhaustive: false,
-    }]
+    }];
   }
+
   const resp = await fetchWithTimeout(url, {
     method: 'POST',
     headers,
     body: JSON.stringify(searchBody),
-  }, 15000)
+  }, 15000);
+
   if (!resp.ok) {
-    const errText = await resp.text()
-    throw new Error(`Azure AI Search error ${resp.status}: ${errText}`)
+    const errText = await resp.text();
+    throw new Error(`Azure AI Search error ${resp.status}: ${errText}`);
   }
-  const data = await resp.json()
+
+  const data = await resp.json();
   return (data.value || []).map(doc => ({
-    text:        doc.text || '',
+    id: doc.id,
+    text: doc.text || '',
     source_file: doc.source_file || 'unknown',
     chunk_index: doc.chunk_index ?? 0,
-    page:        doc.page ?? 1,
-    doc_id:      doc.doc_id || '',
-    _score:      doc['@search.rerankerScore'] ?? doc['@search.score'] ?? 0,
-  }))
+    page: doc.page ?? 1,
+    doc_id: doc.doc_id || '',
+    _score: doc['@search.rerankerScore'] ?? doc['@search.score'] ?? 0,
+  }));
+}
+// ── Delete Client from Azure AI Search ─────────────────────────────────────
+async function deleteClientFromSearch(clientId) {
+  if (!AZURE_SEARCH_ENDPOINT || !AZURE_SEARCH_KEY) return;
+
+  try {
+    const searchUrl = `${AZURE_SEARCH_ENDPOINT}/indexes/${AZURE_SEARCH_INDEX}/docs/search?api-version=${SEARCH_API_VERSION}`;
+
+    const searchResp = await fetch(searchUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'api-key': AZURE_SEARCH_KEY,
+      },
+      body: JSON.stringify({
+        filter: `client_id eq '${clientId}'`,
+        select: 'id',
+        top: 1000
+      })
+    });
+
+    if (!searchResp.ok) return;
+
+    const data = await searchResp.json();
+    const docs = data.value || [];
+
+    if (docs.length === 0) return;
+
+    const deleteUrl = `${AZURE_SEARCH_ENDPOINT}/indexes/${AZURE_SEARCH_INDEX}/docs/index?api-version=${SEARCH_API_VERSION}`;
+
+    const deleteBatch = {
+      value: docs.map(doc => ({
+        "@search.action": "delete",
+        id: doc.id
+      }))
+    };
+
+    const deleteResp = await fetch(deleteUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'api-key': AZURE_SEARCH_KEY,
+      },
+      body: JSON.stringify(deleteBatch)
+    });
+
+    if (deleteResp.ok) {
+      console.log(`✅ Deleted ${docs.length} documents from Azure Search for client: ${clientId}`);
+    } else {
+      console.error(`❌ Failed to delete from search: ${deleteResp.status}`);
+    }
+  } catch (err) {
+    console.error('[deleteClientFromSearch] Error:', err.message);
+  }
 }
 
-// ── Phi-4 LLM ─────────────────────────────────────────────────────────────────
+// ── Delete Client from Blob Storage ────────────────────────────────────────
+async function deleteClientFromBlob(clientId) {
+  if (!AZURE_STORAGE_CONNECTION_STRING) {
+    console.warn('[delete] Blob Storage not configured');
+    return;
+  }
+
+  try {
+    const blobServiceClient = BlobServiceClient.fromConnectionString(AZURE_STORAGE_CONNECTION_STRING);
+    const containerClient = blobServiceClient.getContainerClient(AZURE_STORAGE_CONTAINER);
+
+    let deletedCount = 0;
+    for await (const blob of containerClient.listBlobsFlat({ includeMetadata: true })) {
+      if (blob.metadata?.clientId === clientId || blob.name.startsWith(`${clientId}/`)) {
+        await containerClient.deleteBlob(blob.name);
+        deletedCount++;
+      }
+    }
+    console.log(`✅ Deleted ${deletedCount} blobs for client: ${clientId}`);
+  } catch (err) {
+    console.error('[deleteClientFromBlob] Error:', err.message);
+  }
+}
+
+// ── Phi-4 LLM ──────────────────────────────────────────────────────────────
 async function callPhi4(systemPrompt, userMessage, maxTokens = 1024) {
-  if (!PHI4_ENDPOINT || !PHI4_API_KEY) throw new Error('PHI4_ENDPOINT and PHI4_API_KEY are required')
-  if (phiCircuitOpen()) throw new Error('Model temporarily unavailable')
+  if (!PHI4_ENDPOINT || !PHI4_API_KEY) throw new Error('PHI4_ENDPOINT and PHI4_API_KEY are required');
+  if (phiCircuitOpen()) throw new Error('Model temporarily unavailable');
+
   return runWithPhiLimit(async () => {
     try {
       const response = await fetchWithTimeout(
@@ -274,37 +404,48 @@ async function callPhi4(systemPrompt, userMessage, maxTokens = 1024) {
             model: PHI4_MODEL,
             messages: [
               { role: 'system', content: systemPrompt },
-              { role: 'user',   content: userMessage },
+              { role: 'user', content: userMessage },
             ],
             temperature: 0.1,
             max_tokens: maxTokens,
           }),
         },
         PHI4_TIMEOUT_MS
-      )
-      if (!response.ok) { const errText = await response.text(); throw new Error(`Phi-4 API error ${response.status}: ${errText}`) }
-      const data = await response.json()
-      phiRecordSuccess()
-      return data.choices?.[0]?.message?.content || ''
-    } catch (err) { phiRecordFailure(); throw err }
-  })
+      );
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Phi-4 API error ${response.status}: ${errText}`);
+      }
+
+      const data = await response.json();
+      phiRecordSuccess();
+      return data.choices?.[0]?.message?.content || '';
+    } catch (err) {
+      phiRecordFailure();
+      throw err;
+    }
+  });
 }
 
-// ── Context & prompt builders ──────────────────────────────────────────────────
+// ── Context & Prompt Builders ──────────────────────────────────────────────
 function buildContext(hits) {
-  const seen = new Set()
-  const deduped = []
+  const seen = new Set();
+  const deduped = [];
   for (const h of hits) {
-    const fp = `${h.source_file || ''}::${h.chunk_index ?? h.text?.slice(0, 40)}`
-    if (!seen.has(fp)) { seen.add(fp); deduped.push(h) }
-    if (deduped.length >= 6) break
+    const fp = `${h.source_file || ''}::${h.chunk_index ?? h.text?.slice(0, 40)}`;
+    if (!seen.has(fp)) {
+      seen.add(fp);
+      deduped.push(h);
+    }
+    if (deduped.length >= 6) break;
   }
-  return deduped.map((h, i) => {
-    const limit = i === 0 ? 1200 : 900
-    return `[Source ${i + 1}]\n${(h.text || '').trim().slice(0, limit)}`
-  }).join('\n\n---\n\n')
-}
 
+  return deduped.map((h, i) => {
+    const limit = i === 0 ? 1200 : 900;
+    return `[Source ${i + 1}]\n${(h.text || '').trim().slice(0, limit)}`;
+  }).join('\n\n---\n\n');
+}
 function buildSystemPrompt() {
   return `You are a helpful, versatile data assistant. You can answer questions about any topic found in the provided documents — real estate, finance, healthcare, logistics, retail, or any other domain.
 Answer ONLY using the provided context. Follow these STRICT rules:
@@ -619,17 +760,33 @@ app.patch('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
 
 app.delete('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
   try {
-    const { clientId } = req.params
-    const database = await getDb()
-    const client = await database.collection('clients').findOne({ clientId })
-    if (!client) return res.status(404).json({ error: 'Client not found' })
-    if (client.apiKey) evictCache(client.apiKey)
-    await database.collection('clients').deleteOne({ clientId })
-    RESPONSE_CACHE.forEach((_, key) => { if (key.startsWith(clientId + ':')) RESPONSE_CACHE.delete(key) })
-    res.json({ ok: true, deleted: clientId })
-  } catch (err) { res.status(500).json({ error: err.message }) }
-})
+    const { clientId } = req.params;
+    const database = await getDb();
+    const client = await database.collection('clients').findOne({ clientId });
 
+    if (!client) return res.status(404).json({ error: 'Client not found' });
+
+    console.log(`🗑️ Starting full cleanup for client: ${clientId}`);
+    await Promise.allSettled([
+      deleteClientFromSearch(clientId),
+      deleteClientFromBlob(clientId)
+    ]);
+    if (client.apiKey) evictCache(client.apiKey);
+    await database.collection('clients').deleteOne({ clientId });
+    RESPONSE_CACHE.forEach((_, key) => {
+      if (key.startsWith(clientId + ':')) RESPONSE_CACHE.delete(key);
+    });
+
+    res.json({
+      ok: true,
+      deleted: clientId,
+      message: 'Client and all associated data (Search + Blob) deleted successfully'
+    });
+  } catch (err) {
+    console.error('[admin delete] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 app.post('/admin/clients/:clientId/invalidate-cache', requireAdminKey, (req, res) => {
   const { clientId } = req.params
   RESPONSE_CACHE.forEach((_, key) => { if (key.startsWith(clientId + ':')) RESPONSE_CACHE.delete(key) })
