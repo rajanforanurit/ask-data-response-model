@@ -65,7 +65,7 @@ const PYTHON_EMBED_API_KEY = process.env.PYTHON_EMBED_API_KEY || '';
 const AZURE_SEARCH_ENDPOINT = process.env.AZURE_SEARCH_ENDPOINT || '';
 const AZURE_SEARCH_KEY = process.env.AZURE_SEARCH_KEY || '';
 const AZURE_SEARCH_INDEX = process.env.AZURE_SEARCH_INDEX || 'rag-chunks';
-const SEARCH_API_VERSION = '2023-11-01'; // Changed to stable version
+const SEARCH_API_VERSION = '2024-07-01'; 
 
 // ── Azure Blob Storage ─────────────────────────────────────────────────────────
 const AZURE_STORAGE_CONNECTION_STRING = process.env.AZURE_STORAGE_CONNECTION_STRING || '';
