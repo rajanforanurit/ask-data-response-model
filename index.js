@@ -270,22 +270,22 @@ async function searchChunks(clientId, query, topK = 6) {
   const queryVec = await embedQueryAzure(query);
 
   const searchBody = {
-    search: query,
-    filter: `client_id eq '${clientId}'`,
-    select: 'id,text,source_file,chunk_index,page,doc_id',
-    top: topK,
-    queryType: 'semantic',
-    semanticConfiguration: 'semantic-config',
-  };
+  search: query,
+  filter: `client_id eq '${clientId}'`,
+  select: 'id,text,source_file,chunk_index,page,doc_id',
+  top: topK,
 
-  if (queryVec && Array.isArray(queryVec) && queryVec.length > 0) {
-    // Fixed vector search syntax for stable API version
-    searchBody.vectors = [{
-      value: queryVec,
-      fields: 'embedding',
-      k: Math.min(topK * 3, 100)
-    }];
-  }
+  queryType: 'semantic',
+  semanticConfiguration: 'semantic-config',
+  searchMode: 'all',
+
+  vectorQueries: [{
+    kind: "vector",
+    vector: queryVec,
+    fields: "embedding",
+    k: Math.min(topK * 3, 100)
+  }]
+};
 
   const resp = await fetchWithTimeout(url, {
     method: 'POST',
