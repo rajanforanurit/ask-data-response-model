@@ -106,6 +106,20 @@ if (ext === '.eml') return DOC_TYPE.EMAIL
 if (['.html', '.htm', '.xml'].includes(ext)) return DOC_TYPE.WEB
 return DOC_TYPE.UNKNOWN
 }
+function normalizeMetricName(name) {
+if (!name || typeof name !== 'string') return ''
+return name.toLowerCase().replace(/[_\-]/g, ' ').replace(/\s+/g, ' ').trim()
+}
+function metricNamesMatch(a, b) {
+return normalizeMetricName(a) === normalizeMetricName(b)
+}
+function metricNameContains(haystack, needle) {
+const h = normalizeMetricName(haystack)
+const n = normalizeMetricName(needle)
+if (!n) return false
+const boundary = new RegExp(`(^|\\s|\\b)${escapeRegex(n)}(\\s|\\b|$)`, 'i')
+return boundary.test(h)
+}
 const RESPONSE_CACHE = new Map()
 const RESPONSE_CACHE_TTL = 10 * 60 * 1000
 const RESPONSE_CACHE_MAX = 1000
@@ -283,6 +297,92 @@ function capFirst(str) {
 if (!str) return ''
 return str.charAt(0).toUpperCase() + str.slice(1)
 }
+function countDefinitionsInChunk(text) {
+const matches = (text || '').match(/is defined as|is calculated as|formula:|is described as/gi)
+return matches ? matches.length : 0
+}
+function countPipesInChunk(text) {
+const matches = (text || '').match(/\|/g)
+return matches ? matches.length : 0
+}
+function negativeChunkScore(chunk) {
+const defCount = countDefinitionsInChunk(chunk.text || '')
+const pipeCount = countPipesInChunk(chunk.text || '')
+let penalty = 0
+if (defCount > 1) penalty += (defCount - 1) * 15
+if (pipeCount > 8) penalty += (pipeCount - 8) * 2
+return penalty
+}
+function exactMetricSearch(subject, chunks) {
+const normalizedSubject = normalizeMetricName(subject)
+if (!normalizedSubject) return []
+const results = []
+for (const chunk of chunks) {
+const metricName = normalizeMetricName(chunk.metric_name || '')
+const chunkText = (chunk.text || '').toLowerCase()
+let score = 0
+let exactMatch = false
+if (metricName && metricName === normalizedSubject) {
+score += 200
+exactMatch = true
+} else if (metricName && metricName.includes(normalizedSubject)) {
+score += 80
+} else if (metricName && normalizedSubject.includes(metricName) && metricName.length > 4) {
+score += 60
+} else {
+const subjectEscaped = escapeRegex(normalizedSubject)
+const exactBoundary = new RegExp(`(^|[\\s|:])${subjectEscaped}([\\s|:]|$)`, 'i')
+if (exactBoundary.test(chunk.text || '')) {
+score += 50
+} else {
+continue
+}
+}
+const hasDefinition = /is defined as|is calculated as|is described as/i.test(chunk.text || '')
+const hasFormula = /formula:/i.test(chunk.text || '')
+if (hasDefinition) score += 30
+if (hasFormula) score += 20
+if (exactMatch && hasDefinition) score += 50
+score -= negativeChunkScore(chunk)
+results.push({ ...chunk, _score: score, _exactMatch: exactMatch })
+}
+return results.sort((a, b) => b._score - a._score)
+}
+function retrieveDefinitionChunks(subject, chunks, topK) {
+const normalizedSubject = normalizeMetricName(subject)
+const exactMatches = exactMetricSearch(subject, chunks)
+if (exactMatches.length > 0 && exactMatches[0]._score >= 100) {
+return exactMatches.slice(0, Math.min(topK, 3))
+}
+const hardFiltered = chunks.filter(chunk => {
+const metricName = normalizeMetricName(chunk.metric_name || '')
+const text = normalizeMetricName(chunk.text || '')
+if (metricName) {
+return metricName === normalizedSubject || metricName.includes(normalizedSubject) || (normalizedSubject.includes(metricName) && metricName.length > 4)
+}
+const subjectWords = normalizedSubject.split(/\s+/).filter(w => w.length > 2)
+if (subjectWords.length === 0) return false
+const allWordsPresent = subjectWords.every(w => text.includes(w))
+if (!allWordsPresent) return false
+const boundaryRegex = new RegExp(`(^|[\\s])${escapeRegex(normalizedSubject)}([\\s]|$)`, 'i')
+return boundaryRegex.test(chunk.text || '')
+})
+if (hardFiltered.length === 0) return exactMatches.slice(0, Math.min(topK, 3))
+return hardFiltered
+.map(chunk => {
+let score = 0
+const metricName = normalizeMetricName(chunk.metric_name || '')
+if (metricName === normalizedSubject) score += 100
+else if (metricName.includes(normalizedSubject)) score += 60
+else score += 30
+if (/is defined as|is described as/i.test(chunk.text || '')) score += 30
+if (/formula:/i.test(chunk.text || '')) score += 20
+score -= negativeChunkScore(chunk)
+return { ...chunk, _score: score }
+})
+.sort((a, b) => b._score - a._score)
+.slice(0, Math.min(topK, 3))
+}
 function inferSchema(fileName, textSamples) {
 const type = classifyExtension(fileName)
 const schema = { type, fileName, columns: [], sampleValues: [], topics: [] }
@@ -332,43 +432,46 @@ const codeFiles = schemas.filter(s => s.type === DOC_TYPE.CODE)
 const textFiles = schemas.filter(s => s.type === DOC_TYPE.TEXT)
 const emailFiles = schemas.filter(s => s.type === DOC_TYPE.EMAIL)
 const webFiles = schemas.filter(s => s.type === DOC_TYPE.WEB)
+const strictDefinitionPrompt = `You are a strict enterprise data dictionary assistant.
+STRICT RULES:
+1. Answer ONLY from the single best matching metric definition in the context.
+2. NEVER combine or merge multiple metrics into one answer.
+3. NEVER infer or add details not explicitly in the context.
+4. If multiple metrics appear, use ONLY the one that exactly matches the question.
+5. If confidence is low or no exact match found, say: "I could not find an exact definition for this metric."
+6. Keep answers concise: one sentence definition, one formula line if present.
+7. Bold the metric name using **name** format.
+8. Do NOT add examples or analogies.
+9. End with exactly one period.
+10. Never output pipe characters or raw spreadsheet data.`
 const intentInstructions = {
-definition: `ANSWER STRATEGY — DEFINITION QUERY: The user is asking for the definition or meaning of a specific term or metric. 1. Scan ALL excerpts for: the EXACT term, "is defined as", "is described as", "is calculated as", or any sentence that explains what the term IS. 2. If found, state the definition clearly and completely. Include calculation logic, filters, or conditions if mentioned. 3. If the term appears as a column name or value in structured data, explain its role in that context. 4. Do NOT describe tangentially related metrics — focus on the EXACT term asked about. 5. If multiple excerpts define the same term differently, reconcile them or present both definitions.`,
-calculation: `ANSWER STRATEGY — CALCULATION QUERY: The user wants to know how something is calculated. 1. Find the formula or calculation logic for the EXACT term. 2. State the formula clearly. 3. Include any filters, conditions, or edge cases mentioned. 4. Bold "Formula:" before the formula.`,
-lookup: `ANSWER STRATEGY — LOOKUP QUERY: The user wants a specific value, count, or list from the data. 1. Find the exact records, rows, or values that match the query. 2. Report the precise values — do not approximate. 3. For spreadsheet data, scan all rows; the answer may span multiple records. 4. State clearly where the data comes from (metric name, column name, etc.).`,
-comparison: `ANSWER STRATEGY — COMPARISON QUERY: The user wants to compare two or more items. 1. Find all relevant information for EACH item being compared. 2. Structure the answer as a clear comparison — similarities and differences. 3. Use parallel structure so the comparison is easy to follow. 4. If one side has more data than the other, note the gap explicitly.`,
+definition: strictDefinitionPrompt,
+calculation: strictDefinitionPrompt,
+lookup: `ANSWER STRATEGY — LOOKUP QUERY: The user wants a specific value, count, or list from the data. Find the exact records, rows, or values that match the query. Report the precise values. State clearly where the data comes from.`,
+comparison: `ANSWER STRATEGY — COMPARISON QUERY: Find all relevant information for EACH item being compared. Structure the answer as a clear comparison. Use parallel structure. If one side has more data, note the gap explicitly.`,
 url_lookup: `ANSWER STRATEGY — URL LOOKUP: Find and return the exact URL or link requested. Return only the URL, nothing else.`,
-general: `ANSWER STRATEGY — GENERAL QUERY: Scan all excerpts carefully. Find information that directly answers the question. Synthesise a clear, complete answer. If the information spans multiple excerpts, combine it coherently. For questions about people, entities, apps, or products, extract all available details including names, descriptions, contact info, and any other relevant facts.`,
-}[intent] || ''
-const base = `You are a knowledgeable document assistant. Answer questions ONLY using the document context provided.
-UNIVERSAL RULES:
+general: `You are a knowledgeable document assistant. Answer questions ONLY using the document context provided.
+RULES:
 1. Answer ONLY from the context. Never invent or assume information.
-2. Search the ENTIRE context — every excerpt — before concluding something is absent.
-3. Case-insensitive matching: treat all casing variants as identical.
-4. If a term appears ANYWHERE in the context — as a label, value, heading, or inline text — treat it as present.
-5. If information is truly absent after thorough search, say: "I couldn't find specific information about that in your documents."
-6. Do NOT add citation markers like [1], [2], [3].
-7. Do NOT mention file names or source document names in your answer.
-8. Write clearly, concisely, and directly — like a knowledgeable colleague.
-9. Answer only what was asked. No padding or filler.
-10. NEVER say "the context does not define" or "not mentioned" if the term appears anywhere.
-11. For questions about apps, people, companies, or policies: extract ALL relevant details from the context — names, descriptions, contact info, features, rules, etc.
-12. Bold important terms using **term** format.
-13. Never output raw pipe-separated data. Never use double periods (..).
-${intentInstructions}`
-const typeBlocks = []
-if (spreadsheets.length > 0) {
-const colSummary = spreadsheets.filter(s => s.columns.length > 0).map(s => ` • ${s.fileName}: [${s.columns.join(', ')}]`).join('\n')
-typeBlocks.push(`SPREADSHEET RULES: Data is serialised as pipe-delimited key:value rows. Each line = one record. Lines like "X is described as: ..." are definition summaries — prioritise them for definition queries. For definition queries: a field name matching the subject IS a definition. Explain it from surrounding values. Scan ALL rows — the answer may not be in the first matching row. ${colSummary ? `Detected columns:\n${colSummary}` : ''}`)
+2. Search the ENTIRE context before concluding something is absent.
+3. If information is truly absent, say: "I couldn't find specific information about that in your documents."
+4. Do NOT add citation markers like [1], [2], [3].
+5. Write clearly and directly.
+6. Bold important terms using **term** format.
+7. Never output raw pipe-separated data.
+8. For questions about apps, people, companies, or policies: extract ALL relevant details.`,
 }
-if (dataFiles.length > 0) typeBlocks.push(`STRUCTURED DATA RULES (JSON/YAML/CSV): Fields and values may be nested. Treat "parent.child: value" as a nested attribute. Every key and every value is meaningful data.`)
-if (pdfDocs.length > 0) typeBlocks.push(`PDF RULES: Content is extracted from PDF pages. Minor formatting artefacts may exist. Read numbers, dates, and figures exactly as they appear.`)
-if (wordDocs.length > 0) typeBlocks.push(`WORD DOCUMENT RULES: Context contains prose, lists, and tables. Headings indicate section structure. Extract ALL information relevant to the question — policies, contact info, names, descriptions, lists, etc. Quote definitions or policy statements accurately.`)
+const base = (intent === 'definition' || intent === 'calculation') ? strictDefinitionPrompt : intentInstructions[intent] || intentInstructions.general
+const typeBlocks = []
+if (spreadsheets.length > 0) typeBlocks.push(`SPREADSHEET RULES: Each excerpt is ONE metric definition. Do NOT blend metrics. Read the single metric provided and answer from it only.`)
+if (dataFiles.length > 0) typeBlocks.push(`STRUCTURED DATA RULES (JSON/YAML/CSV): Fields and values may be nested. Every key and every value is meaningful data.`)
+if (pdfDocs.length > 0) typeBlocks.push(`PDF RULES: Content is extracted from PDF pages. Read numbers, dates, and figures exactly as they appear.`)
+if (wordDocs.length > 0) typeBlocks.push(`WORD DOCUMENT RULES: Context contains prose, lists, and tables. Extract ALL information relevant to the question.`)
 if (presentations.length > 0) typeBlocks.push(`PRESENTATION RULES: Slide titles are section headers; bullets are supporting detail. Do not infer beyond what the slide explicitly states.`)
-if (codeFiles.length > 0) typeBlocks.push(`CODE RULES: Read code literally. Function/variable names and comments are all meaningful. Describe what code does in plain English unless code output is requested.`)
-if (textFiles.length > 0) typeBlocks.push(`TEXT/MARKDOWN RULES: Markdown formatting (##, **, -) indicates structure. Interpret accordingly. Lists represent discrete facts or steps.`)
-if (emailFiles.length > 0) typeBlocks.push(`EMAIL RULES: Attribute statements to their sender. Do not mix up correspondents. Dates and times are as stated in the email header.`)
-if (webFiles.length > 0) typeBlocks.push(`WEB/HTML RULES: Focus on main body content. Ignore repetitive navigation text. Include URLs exactly if mentioned.`)
+if (codeFiles.length > 0) typeBlocks.push(`CODE RULES: Read code literally. Describe what code does in plain English unless code output is requested.`)
+if (textFiles.length > 0) typeBlocks.push(`TEXT/MARKDOWN RULES: Markdown formatting indicates structure. Lists represent discrete facts or steps.`)
+if (emailFiles.length > 0) typeBlocks.push(`EMAIL RULES: Attribute statements to their sender. Do not mix up correspondents.`)
+if (webFiles.length > 0) typeBlocks.push(`WEB/HTML RULES: Focus on main body content. Include URLs exactly if mentioned.`)
 const uniqueTypes = [...new Set(schemas.map(s => s.type))]
 const mixedNote = uniqueTypes.length > 1 ? `\nMIXED DOCUMENT SET: Context contains ${uniqueTypes.length} document types (${uniqueTypes.join(', ')}). Apply the relevant rules above for each excerpt.` : ''
 return [base, ...typeBlocks, mixedNote].filter(Boolean).join('\n') + '\n'
@@ -389,7 +492,7 @@ messages: [
 { role: 'system', content: systemPrompt },
 { role: 'user', content: userMessage },
 ],
-temperature: 0.1,
+temperature: 0.0,
 max_tokens: maxTokens,
 }),
 },
@@ -475,6 +578,77 @@ if (!usedIdx.has(i) && headers[i].trim()) { colIdx.name = i; break }
 }
 }
 return colIdx
+}
+function extractSpreadsheetRowChunks(buffer, sourceFile) {
+const workbook = XLSX.read(buffer, { type: 'buffer', cellNF: true })
+const rowChunks = []
+let globalRowIndex = 0
+for (const sheetName of workbook.SheetNames) {
+const sheet = workbook.Sheets[sheetName]
+const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: '', header: 1, raw: false })
+if (!rawRows.length) continue
+let headerRowIdx = -1
+for (let i = 0; i < Math.min(15, rawRows.length); i++) {
+const cells = rawRows[i].map(c => String(c).trim()).filter(Boolean)
+if (cells.length < 2) continue
+if (cells.length === 1 && cells[0].length > 60) continue
+const shortCells = cells.filter(c => c.length <= 60)
+if (shortCells.length >= 2) { headerRowIdx = i; break }
+}
+if (headerRowIdx === -1) headerRowIdx = 0
+const rawHeaders = rawRows[headerRowIdx].map(h => String(h).trim())
+const headers = []
+let lastNonBlank = ''
+for (const h of rawHeaders) {
+if (h !== '') { lastNonBlank = h; headers.push(h) } else headers.push(lastNonBlank || `Col${headers.length + 1}`)
+}
+const colIdx = detectColumns(headers)
+for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
+const row = rawRows[i]
+if (!row.some(cell => String(cell).trim() !== '')) continue
+const cells = row.map(cell => String(cell || '').replace(/\r?\n/g, ' ').trim())
+const nameVal = colIdx.name !== undefined ? (cells[colIdx.name] || '').trim() : ''
+const tableVal = colIdx.table !== undefined ? (cells[colIdx.table] || '').trim() : sheetName
+const descVal = colIdx.description !== undefined ? (cells[colIdx.description] || '').trim() : ''
+const formulaVal = colIdx.formula !== undefined ? (cells[colIdx.formula] || '').trim() : ''
+const additionalVal = colIdx.additional !== undefined ? (cells[colIdx.additional] || '').trim() : ''
+const urlVal = colIdx.url !== undefined ? (cells[colIdx.url] || '').trim() : ''
+if (!nameVal && !descVal) continue
+const parts = []
+if (nameVal) {
+let synthesis = nameVal
+if (tableVal && tableVal !== sheetName) synthesis += ` (${tableVal})`
+if (descVal) synthesis += ` is defined as: ${descVal}`
+if (formulaVal) synthesis += `. Formula: ${formulaVal}`
+if (additionalVal) synthesis += `. Additional Info: ${additionalVal}`
+if (urlVal) synthesis += `. URL: ${urlVal}`
+parts.push(synthesis)
+if (formulaVal) parts.push(`How to calculate ${nameVal}: ${formulaVal}`)
+if (urlVal) {
+parts.push(`Report URL for ${nameVal}: ${urlVal}`)
+parts.push(`Power BI link for ${nameVal}: ${urlVal}`)
+if (tableVal && tableVal !== sheetName) parts.push(`Report URL for ${nameVal} (${tableVal}): ${urlVal}`)
+}
+} else if (descVal) {
+parts.push(descVal)
+}
+const chunkText = parts.join('\n')
+if (chunkText.length < 10) continue
+rowChunks.push({
+type: 'metric_definition',
+metric_name: nameVal || '',
+description: descVal || '',
+formula: formulaVal || '',
+sheet_name: sheetName,
+source_file: sourceFile,
+chunk_index: globalRowIndex++,
+row_index: i,
+text: chunkText,
+embedding: [],
+})
+}
+}
+return rowChunks
 }
 function extractSpreadsheet(buffer) {
 const workbook = XLSX.read(buffer, { type: 'buffer', cellNF: true })
@@ -590,11 +764,16 @@ if (matched === 0) return { ...c, _score: 0 }
 score += matched * 10
 if (text.includes(kws.join(' '))) score += 15
 } else {
+const metricName = normalizeMetricName(c.metric_name || '')
+const normalizedSubject = normalizeMetricName(subject)
+if (metricName && metricName === normalizedSubject) {
+score += 200
+} else if (metricName && metricName.includes(normalizedSubject)) {
+score += 80
+} else {
 const phraseFound = subjectPhraseRegex.test(c.text || '')
 if (phraseFound) {
 score += subjectWords.length * 6
-const measurePattern = new RegExp(`\\|\\s*${escapeRegex(subject.toLowerCase())}\\s*\\|`, 'i')
-if (measurePattern.test(c.text || '')) score += subjectWords.length * 4
 const defPattern = new RegExp(`${escapeRegex(subject.toLowerCase())}\\s*(is defined as|is calculated as|formula:|is described as)`, 'i')
 if (defPattern.test(c.text || '')) score += subjectWords.length * 8
 }
@@ -602,14 +781,8 @@ const wordCoverage = subjectWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\
 score += wordCoverage * 2
 if (text.includes(queryLower)) score += 3
 if ((docType === DOC_TYPE.WORD || docType === DOC_TYPE.PDF || docType === DOC_TYPE.TEXT) && phraseFound) score += 4
-if (docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA) {
-const descPattern = new RegExp(`${escapeRegex(subject.toLowerCase())}\\s*(is described as|is defined as):`, 'i')
-if (descPattern.test(c.text || '')) score += subjectWords.length * 8
-for (const w of subjectWords) {
-const kvPattern = new RegExp(`:\\s*${escapeRegex(w)}\\b|\\|\\s*${escapeRegex(w)}\\b`, 'i')
-if (kvPattern.test(c.text || '')) score += 2
 }
-}
+score -= negativeChunkScore(c)
 }
 return { ...c, _score: score }
 })
@@ -646,13 +819,25 @@ if (intent === 'all_urls') {
 const urlChunks = chunks.filter(c => /https?:\/\/\S+/.test(c.text || ''))
 return urlChunks.slice(0, 100)
 }
-const keywordTopK = (intent === 'definition' || intent === 'general') ? Math.min(200, chunks.length) : Math.min(150, chunks.length)
+const maxDefinitionChunks = 3
+const maxCalculationChunks = 2
+const maxGeneralChunks = 6
+if (intent === 'definition' || intent === 'calculation') {
+const subject = extractSubject(query)
+const defChunks = retrieveDefinitionChunks(subject, chunks, maxDefinitionChunks)
+if (defChunks.length > 0) {
+console.log(`[retrieveChunks] definition exact path: subject="${subject}", chunks=${defChunks.length}, topScore=${defChunks[0]?._score}`)
+return defChunks.slice(0, intent === 'calculation' ? maxCalculationChunks : maxDefinitionChunks)
+}
+}
+const keywordTopK = Math.min(150, chunks.length)
 const candidates = keywordSearch(normalizedQuery, chunks, keywordTopK, intent, invertedIndex)
 const pool = candidates.length > 0 ? candidates : chunks.slice(0, 150)
 const topScore = pool[0]?._score || 0
-if (topScore >= 6) return pool.slice(0, Math.min(topK, 10))
-if ((intent === 'definition' || intent === 'calculation') && topScore >= 3) return pool.slice(0, Math.min(topK, 10))
-if (intent === 'url_lookup' && pool.length > 0) return pool.slice(0, Math.min(topK, 6))
+const chunkLimit = intent === 'definition' ? maxDefinitionChunks : intent === 'calculation' ? maxCalculationChunks : maxGeneralChunks
+if (topScore >= 6) return pool.slice(0, Math.min(chunkLimit, topK))
+if ((intent === 'definition' || intent === 'calculation') && topScore >= 3) return pool.slice(0, Math.min(chunkLimit, topK))
+if (intent === 'url_lookup' && pool.length > 0) return pool.slice(0, Math.min(6, topK))
 if (AZURE_EMBED_ENDPOINT && AZURE_EMBED_KEY) {
 try {
 const queryVec = await embedQueryAzure(normalizedQuery)
@@ -661,7 +846,7 @@ const poolSlice = pool.slice(0, EMBED_POOL_LIMIT)
 const embeddings = await embedBatch(poolSlice.map(c => (c.text || '').slice(0, 512)))
 const maxKeyword = pool[0]?._score || 1
 const weight = (intent === 'definition' || intent === 'calculation')
-? { semantic: 0.35, keyword: 0.65 }
+? { semantic: 0.2, keyword: 0.8 }
 : { semantic: 0.70, keyword: 0.30 }
 const scored = poolSlice.map((c, i) => {
 if (!embeddings[i]) return c
@@ -672,14 +857,14 @@ return { ...c, _score: semanticScore * weight.semantic + keywordNorm * weight.ke
 const remainder = pool.slice(EMBED_POOL_LIMIT).map(c => ({
 ...c, _score: (typeof c._score === 'number' ? c._score / maxKeyword : 0) * weight.keyword,
 }))
-const result = [...scored, ...remainder].sort((a, b) => b._score - a._score).slice(0, Math.min(topK, 10))
+const result = [...scored, ...remainder].sort((a, b) => b._score - a._score).slice(0, Math.min(chunkLimit, topK))
 if (result.length > 0) return result
 }
 } catch (err) { console.warn('[retrieveChunks] embed failed, keyword fallback:', err.message) }
 }
-if (pool.length > 0) return pool.slice(0, Math.min(topK, 10))
+if (pool.length > 0) return pool.slice(0, Math.min(chunkLimit, topK))
 const relaxed = relaxedKeywordSearch(normalizedQuery, chunks, Math.min(topK * 2, 20), invertedIndex)
-return relaxed.slice(0, Math.min(topK, 10))
+return relaxed.slice(0, Math.min(chunkLimit, topK))
 }
 function buildContext(hits) {
 const seen = new Set()
@@ -699,9 +884,9 @@ const context = buildContext(hits)
 const subject = extractSubject(query)
 let instruction = ''
 if (intent === 'definition') {
-instruction = `\n\nUsing ONLY the context above, write a clean definition of "${subject}". Bold the name with **name**. One sentence for definition, one for formula if present. No pipe characters. No double periods. End with exactly one period.`
+instruction = `\n\nUsing ONLY the context above, write a clean definition of "${subject}". Bold the name with **name**. One sentence for definition, one for formula if present. No pipe characters. No double periods. End with exactly one period. Do NOT mention any other metrics.`
 } else if (intent === 'calculation') {
-instruction = `\n\nUsing ONLY the context above, explain how "${subject}" is calculated. Bold "**Formula:**". No pipe characters. No double periods. End with exactly one period.`
+instruction = `\n\nUsing ONLY the context above, explain how "${subject}" is calculated. Bold "**Formula:**". No pipe characters. No double periods. End with exactly one period. Do NOT mention any other metrics.`
 } else if (intent === 'url_lookup') {
 instruction = `\n\nUsing ONLY the context above, return the full URL related to "${extractUrlKeywords(query).join(' ')}". Return ONLY the URL, nothing else.`
 } else if (intent === 'all_urls') {
@@ -709,7 +894,7 @@ instruction = `\n\nUsing ONLY the context above, list ALL URLs you find. For eac
 } else if (intent === 'comparison') {
 instruction = `\n\nUsing ONLY the context above, compare: ${query}. Bold each item name. End with a key difference sentence. No pipe characters. End with exactly one period.`
 } else {
-instruction = `\n\nUsing ONLY the context above, answer this question in clear, complete sentences: ${query}. Extract and present ALL relevant information from the context — names, descriptions, lists, contact details, policies, types, features, etc. No pipe characters. No double periods.`
+instruction = `\n\nUsing ONLY the context above, answer this question in clear, complete sentences: ${query}. Extract and present ALL relevant information from the context. No pipe characters. No double periods.`
 }
 return `CONTEXT:\n${context}${instruction}`
 }
@@ -744,6 +929,27 @@ results.push({ name, url: cleanUrl })
 }
 }
 return results
+}
+function validateAnswer(answer, subject, hits) {
+if (!answer || answer.trim().length < 15) return false
+const normalizedSubject = normalizeMetricName(subject)
+const answerLower = answer.toLowerCase()
+if (!answerLower.includes(normalizedSubject.split(' ')[0])) return false
+const otherMetricNames = hits
+.slice(1)
+.map(h => normalizeMetricName(h.metric_name || ''))
+.filter(n => n && n !== normalizedSubject && n.length > 5)
+let contaminated = false
+for (const otherName of otherMetricNames) {
+const otherWords = otherName.split(' ').filter(w => w.length > 4)
+const matchCount = otherWords.filter(w => answerLower.includes(w)).length
+if (matchCount >= 2 && matchCount === otherWords.length) {
+console.warn(`[validateAnswer] Contamination detected: answer contains "${otherName}" which is different from subject "${normalizedSubject}"`)
+contaminated = true
+break
+}
+}
+return !contaminated
 }
 function buildFallbackAnswer(query, hits) {
 if (!hits || hits.length === 0) return "I could not find relevant information about this in your documents."
@@ -780,12 +986,13 @@ if (urlMatch) return urlMatch[0].replace(/[.,;)]+$/, '').trim()
 }
 return "I could not find a matching URL in your documents."
 }
+const bestHit = hits[0]
+if (!bestHit) return "I could not find specific information about that in your documents."
 const synthesisPattern = new RegExp(
 `${escapeRegex(subjectLower)}[^\\n]*is defined as:\\s*([^.\\n]+(?:\\.[^.\\n]+)?)(?:\\.\\s*Formula:\\s*([^.\\n]+(?:\\.[^.\\n]+)?))?(?:\\.\\s*Additional Info:\\s*([^.\\n]+))?`,
 'im'
 )
-for (const h of hits) {
-const m = (h.text || '').match(synthesisPattern)
+const m = (bestHit.text || '').match(synthesisPattern)
 if (m) {
 const desc = trimToCompleteSentence((m[1] || '').trim(), 600)
 const formula = (m[2] || '').trim().slice(0, 400)
@@ -799,21 +1006,16 @@ if (additional) answer += `\n\n**Additional Info:** ${additional}`
 if (additional && !answer.endsWith('.')) answer += '.'
 return ensureSinglePeriod(answer)
 }
-}
-if (intent === 'calculation') {
-const calcPattern = new RegExp(`how to calculate ${escapeRegex(subjectLower)}:\\s*([^\\n]+)`, 'im')
-for (const h of hits) {
-const m = (h.text || '').match(calcPattern)
-if (m) {
-const cap = capFirst(subject)
-const formula = trimToCompleteSentence(m[1].trim(), 500)
-return ensureSinglePeriod(`**How ${cap} is Calculated**\n\n**Formula:** ${formula}.`)
-}
-}
+if (bestHit.metric_name && bestHit.description) {
+const cap = capFirst(bestHit.metric_name)
+let answer = `**${cap}** is ${bestHit.description}`
+if (!answer.endsWith('.')) answer += '.'
+if (bestHit.formula) answer += `\n\n**Formula:** ${bestHit.formula}`
+if (bestHit.formula && !answer.endsWith('.')) answer += '.'
+return ensureSinglePeriod(answer)
 }
 const matchingLines = []
-for (const h of hits) {
-for (const line of (h.text || '').split('\n')) {
+for (const line of (bestHit.text || '').split('\n')) {
 const ll = line.toLowerCase()
 if (!ll.includes(subjectLower)) continue
 if (line.trim().length <= 20) continue
@@ -822,21 +1024,10 @@ if (/^===\s*Sheet:/.test(line.trim())) continue
 const cleaned = line.trim().replace(/\(from\s+[A-Za-z\s]+\)/g, '').trim()
 if (cleaned.length > 15) matchingLines.push(cleaned)
 }
-}
 if (matchingLines.length > 0) {
-const unique = [...new Set(matchingLines)].slice(0, 5)
 const cap = capFirst(subject)
-const joined = trimToCompleteSentence(unique.join(' '), 800)
+const joined = trimToCompleteSentence(matchingLines[0], 800)
 return ensureSinglePeriod(`**${cap}:** ${joined}.`)
-}
-const broadLines = []
-for (const h of hits) {
-const lines = (h.text || '').split('\n').filter(l => l.trim().length > 20 && (l.match(/\|/g) || []).length <= 2 && !/^===/.test(l.trim()))
-broadLines.push(...lines.slice(0, 3))
-}
-if (broadLines.length > 0) {
-const joined = trimToCompleteSentence([...new Set(broadLines)].slice(0, 4).join(' '), 800)
-return ensureSinglePeriod(`**${capFirst(subject)}:** ${joined}.`)
 }
 return "I could not find that specific information in your documents."
 }
@@ -931,7 +1122,7 @@ const ext = ('.' + fileName.split('.').pop()).toLowerCase()
 if (ext === '.pdf') return extractPdf(buffer)
 if (ext === '.docx' || ext === '.doc') return extractWord(buffer)
 if (ext === '.odt' || ext === '.rtf') return extractOffice(buffer)
-if (['.xlsx', '.xls', '.ods'].includes(ext)) return extractSpreadsheet(buffer)
+if (['.xlsx', '.xls', '.ods'].includes(ext)) return null
 if (ext === '.csv') return extractCsv(buffer, ',')
 if (ext === '.tsv') return extractCsv(buffer, '\t')
 if (ext === '.pptx' || ext === '.ppt') return extractOffice(buffer)
@@ -947,6 +1138,10 @@ if (ext === '.eml') return extractEml(buffer)
 const plainText = new Set(['.txt', '.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.cpp', '.c', '.h', '.cs', '.go', '.rb', '.php', '.swift', '.kt', '.r', '.sql', '.sh', '.bash', '.ps1'])
 if (plainText.has(ext)) return buffer.toString('utf-8')
 return ''
+}
+function isSpreadsheetFile(fileName) {
+const ext = ('.' + fileName.split('.').pop()).toLowerCase()
+return ['.xlsx', '.xls', '.ods'].includes(ext)
 }
 function chunkText(text, sourceFile) {
 const chunks = []
@@ -1019,6 +1214,10 @@ const results = await Promise.allSettled(
 batch.map(async (blobName) => {
 const fileName = blobName.split('/').pop()
 const buffer = await downloadBlobAsBuffer(containerClient, blobName)
+if (isSpreadsheetFile(fileName)) {
+const rowChunks = extractSpreadsheetRowChunks(buffer, fileName)
+return rowChunks
+}
 const text = await extractTextFromBuffer(buffer, fileName)
 if (!text?.trim()) return []
 return chunkText(text, fileName)
@@ -1412,8 +1611,23 @@ new Promise((_, reject) => setTimeout(() => reject(new Error('Model timeout')), 
 } catch (err) { console.warn(`[phi4] Using fallback: ${err.message}`) }
 }
 const isBlank = !rawAnswer || rawAnswer.trim().length < 15
-const answer = isBlank ? buildFallbackAnswer(query.trim(), hits) : cleanAnswer(rawAnswer)
-if (isBlank) console.warn(`[phi4] Blank response, used fallback for: "${query.slice(0, 60)}"`)
+let answer
+if (isBlank) {
+answer = buildFallbackAnswer(query.trim(), hits)
+console.warn(`[phi4] Blank response, used fallback for: "${query.slice(0, 60)}"`)
+} else {
+const cleaned = cleanAnswer(rawAnswer)
+const subject = extractSubject(query.trim())
+const isValid = (intent === 'definition' || intent === 'calculation')
+? validateAnswer(cleaned, subject, hits)
+: true
+if (!isValid) {
+console.warn(`[validateAnswer] Answer contaminated for "${query.slice(0, 60)}", using fallback`)
+answer = buildFallbackAnswer(query.trim(), hits.slice(0, 1))
+} else {
+answer = cleaned
+}
+}
 const sources = hits.map(h => ({ source_file: h.source_file || 'unknown', chunk_index: h.chunk_index ?? 0, score: typeof h._score === 'number' ? parseFloat(h._score.toFixed(4)) : null, preview: (h.text || '').slice(0, 200) }))
 let activeConversationId = conversationId || null
 try {
