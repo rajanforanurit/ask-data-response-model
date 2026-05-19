@@ -52,10 +52,14 @@ const AZURE_CONNECTION_STRING = process.env.AZURE_CONNECTION_STRING || ''
 const AZURE_CONTAINER_NAME = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY
 const KEY_CHECK_INTERVAL_MS = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10)
-const PHI4_ENDPOINT = process.env.PHI4_ENDPOINT
-const PHI4_API_KEY = process.env.PHI4_API_KEY
-const PHI4_MODEL = process.env.PHI4_MODEL || 'Phi-4'
-const PHI4_TIMEOUT_MS = parseInt(process.env.PHI4_TIMEOUT_MS || '30000', 10)
+const ASKDATA_ENDPOINT = process.env.ASKDATA_ENDPOINT || ''
+const ASKDATA_KEY = process.env.ASKDATA_KEY || ''
+const ASKDATA_MODEL = process.env.ASKDATA_MODEL || 'ASKDATA'
+const ASKDATA_TIMEOUT_MS = parseInt(process.env.ASKDATA_TIMEOUT_MS || '30000', 10)
+const ASKDATA2_ENDPOINT = process.env.ASKDATA2_ENDPOINT || ''
+const ASKDATA2_KEY = process.env.ASKDATA2_KEY || ''
+const ASKDATA2_MODEL = process.env.ASKDATA2_MODEL || 'ASKDATA2'
+const ASKDATA2_TIMEOUT_MS = parseInt(process.env.ASKDATA2_TIMEOUT_MS || '30000', 10)
 const AZURE_EMBED_ENDPOINT = process.env.AZURE_EMBED_ENDPOINT || ''
 const AZURE_EMBED_KEY = process.env.AZURE_EMBED_KEY || ''
 const AZURE_EMBED_MODEL = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
@@ -98,47 +102,62 @@ function responseCacheSet(key, value) {
   }
   RESPONSE_CACHE.set(key, { value, ts: Date.now() })
 }
+function normalizeQueryForCache(query) {
+  return query
+    .toLowerCase()
+    .trim()
+    .replace(/^(what\s+is\s+(the\s+)?(definition|meaning)\s+(of|for|to)\s+)/i, '')
+    .replace(/^(define\s+(the\s+)?)/i, '')
+    .replace(/^(explain\s+(the\s+)?)/i, '')
+    .replace(/^(tell\s+me\s+about\s+(the\s+)?)/i, '')
+    .replace(/^(what\s+are\s+(the\s+)?)/i, '')
+    .replace(/^(what\s+is\s+)/i, '')
+    .replace(/^(how\s+(do\s+you\s+|is\s+|are\s+)?calculate\s+(the\s+)?)/i, '')
+    .replace(/[?!.]+$/, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
 function getCacheKey(clientId, query) {
-  return `${clientId}:${query.toLowerCase().trim()}`
+  return `${clientId}:${normalizeQueryForCache(query)}`
 }
 const IN_FLIGHT = new Map()
-let phiActiveCount = 0
-const PHI_MAX_CONCURRENT = 3
-const phiQueue = []
-function runWithPhiLimit(fn) {
+let askedataActiveCount = 0
+const ASKDATA_MAX_CONCURRENT = 3
+const askedataQueue = []
+function runWithAskedataLimit(fn) {
   return new Promise((resolve, reject) => {
     function tryRun() {
-      if (phiActiveCount < PHI_MAX_CONCURRENT) {
-        phiActiveCount++
+      if (askedataActiveCount < ASKDATA_MAX_CONCURRENT) {
+        askedataActiveCount++
         Promise.resolve().then(fn).then(
-          result => { phiActiveCount--; drainPhiQueue(); resolve(result) },
-          err => { phiActiveCount--; drainPhiQueue(); reject(err) }
+          result => { askedataActiveCount--; drainAskedataQueue(); resolve(result) },
+          err => { askedataActiveCount--; drainAskedataQueue(); reject(err) }
         )
       } else {
-        phiQueue.push(tryRun)
+        askedataQueue.push(tryRun)
       }
     }
     tryRun()
   })
 }
-function drainPhiQueue() {
-  if (phiQueue.length > 0 && phiActiveCount < PHI_MAX_CONCURRENT) {
-    phiQueue.shift()()
+function drainAskedataQueue() {
+  if (askedataQueue.length > 0 && askedataActiveCount < ASKDATA_MAX_CONCURRENT) {
+    askedataQueue.shift()()
   }
 }
-let phiFailures = 0
-let phiBlockedUntil = 0
-function phiCircuitOpen() {
-  if (Date.now() < phiBlockedUntil) return true
-  if (phiBlockedUntil > 0) { phiBlockedUntil = 0; phiFailures = 0 }
+let askedataFailures = 0
+let askedataBlockedUntil = 0
+function askedataCircuitOpen() {
+  if (Date.now() < askedataBlockedUntil) return true
+  if (askedataBlockedUntil > 0) { askedataBlockedUntil = 0; askedataFailures = 0 }
   return false
 }
-function phiRecordSuccess() { phiFailures = 0; phiBlockedUntil = 0 }
-function phiRecordFailure() {
-  phiFailures++
-  if (phiFailures >= 3) {
-    phiBlockedUntil = Date.now() + 30000
-    console.error(`[phi4] Circuit breaker OPEN for 30s`)
+function askedataRecordSuccess() { askedataFailures = 0; askedataBlockedUntil = 0 }
+function askedataRecordFailure() {
+  askedataFailures++
+  if (askedataFailures >= 3) {
+    askedataBlockedUntil = Date.now() + 30000
+    console.error('[ASKDATA] Circuit breaker OPEN for 30s')
   }
 }
 async function fetchWithTimeout(url, options, timeoutMs) {
@@ -196,6 +215,9 @@ function buildInvertedIndex(chunks) {
   }
   return index
 }
+function normalizeQuery(query) {
+  return query.toLowerCase().trim().replace(/[?!.]+$/, '').replace(/\s+/g, ' ')
+}
 function validateQuery(query) {
   if (!query || typeof query !== 'string') return { valid: false, message: 'Please enter a complete question to get an accurate answer.' }
   const trimmed = query.trim()
@@ -205,41 +227,57 @@ function validateQuery(query) {
   return { valid: true }
 }
 function detectQueryIntent(query) {
-  const q = query.toLowerCase().trim()
+  const q = normalizeQuery(query)
   if (/^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening)|how\s+are\s+you)\b/.test(q)) return 'greeting'
   if (/\b(url|link|dashboard|power\s*bi|report\s+url)\b/.test(q)) return 'url_lookup'
-  if (/how\s+(is|are|was|were)\s+.+\s+(calculated|computed|determined|derived)|what\s+is\s+the\s+(formula|calculation)\s+for|how\s+do\s+you\s+(calculate|compute)/.test(q)) return 'calculation'
-  if (/^(what\s+(is|are|does)|define|explain|meaning\s+of|tell\s+me\s+about|describe)\s+/.test(q) || /\b(definition|meaning)\b/.test(q)) return 'definition'
+  if (
+    /how\s+(is|are|was|were)\s+.+\s+(calculated|computed|determined|derived)/i.test(q) ||
+    /what\s+is\s+the\s+(formula|calculation)\s+for/i.test(q) ||
+    /how\s+do\s+you\s+(calculate|compute)/i.test(q) ||
+    /\b(formula|calculation|how\s+calculated|computed?)\b/i.test(q)
+  ) return 'calculation'
+  if (
+    /^(what\s+is\s+(the\s+)?(definition|meaning)\s+(of|for|to)\s+)/i.test(q) ||
+    /^(define\s+(the\s+)?)/i.test(q) ||
+    /^(what\s+(is|are)\s+(an?\s+|the\s+)?)/i.test(q) ||
+    /^(explain\s+(the\s+)?)/i.test(q) ||
+    /^(tell\s+me\s+about\s+(the\s+)?)/i.test(q) ||
+    /\b(definition|meaning)\b/i.test(q)
+  ) return 'definition'
   if (/\b(vs|versus|difference|compare|between)\b/.test(q)) return 'comparison'
   if (/^(show|list|find|get|fetch|give)\s+(me\s+)?|^how\s+many\s+/.test(q)) return 'lookup'
   return 'general'
 }
 function extractSubject(query) {
-  const q = query.toLowerCase().trim().replace(/[?!.]+$/, '')
+  const q = normalizeQuery(query)
   const patterns = [
-    /^what\s+is\s+(?:an?\s+|the\s+)?(.+)$/,
-    /^what\s+are\s+(.+)$/,
-    /^what\s+does\s+(.+?)\s+mean$/,
-    /^define\s+(?:an?\s+|the\s+)?(.+)$/,
-    /^explain\s+(?:an?\s+|the\s+)?how\s+(.+?)\s+(?:is\s+)?calculated$/,
-    /^explain\s+(?:an?\s+|the\s+)?(.+)$/,
-    /^tell\s+me\s+about\s+(?:an?\s+|the\s+)?(.+)$/,
-    /^meaning\s+of\s+(?:an?\s+|the\s+)?(.+)$/,
-    /^describe\s+(?:an?\s+|the\s+)?(.+)$/,
-    /^how\s+is\s+(.+?)\s+(calculated|defined|measured|computed)$/,
-    /^how\s+are\s+(.+?)\s+(calculated|defined|measured|computed)$/,
-    /^what\s+is\s+the\s+formula\s+for\s+(?:calculating\s+)?(?:an?\s+|the\s+)?(.+)$/,
-    /^how\s+(?:do\s+you\s+)?calculate\s+(?:an?\s+|the\s+)?(.+)$/,
-    /^what\s+does\s+(.+?)\s+represent/,
-    /^what\s+is\s+the\s+purpose\s+of\s+(?:the\s+)?(.+?)\s+(?:attribute|measure|field|column)$/,
-    /^compare\s+(.+?)\s+(?:vs|versus)\s+(.+)$/,
-    /^difference\s+between\s+(.+?)\s+and\s+(.+)$/,
+    /^what\s+is\s+(?:the\s+)?(?:definition|meaning)\s+(?:of|for|to)\s+(?:an?\s+|the\s+)?(.+)$/i,
+    /^what\s+(?:is|are)\s+(?:the\s+)?(?:definition|meaning)\s+(?:of|for|to)\s+(?:an?\s+|the\s+)?(.+)$/i,
+    /^define\s+(?:an?\s+|the\s+)?(.+)$/i,
+    /^explain\s+(?:an?\s+|the\s+)?how\s+(.+?)\s+(?:is\s+)?calculated$/i,
+    /^explain\s+(?:an?\s+|the\s+)?(.+)$/i,
+    /^tell\s+me\s+about\s+(?:an?\s+|the\s+)?(.+)$/i,
+    /^(?:what\s+is\s+the\s+)?meaning\s+of\s+(?:an?\s+|the\s+)?(.+)$/i,
+    /^describe\s+(?:an?\s+|the\s+)?(.+)$/i,
+    /^how\s+is\s+(.+?)\s+(?:calculated|defined|measured|computed)$/i,
+    /^how\s+are\s+(.+?)\s+(?:calculated|defined|measured|computed)$/i,
+    /^what\s+is\s+the\s+formula\s+for\s+(?:calculating\s+)?(?:an?\s+|the\s+)?(.+)$/i,
+    /^how\s+(?:do\s+you\s+)?calculate\s+(?:an?\s+|the\s+)?(.+)$/i,
+    /^what\s+does\s+(.+?)\s+represent/i,
+    /^what\s+is\s+the\s+purpose\s+of\s+(?:the\s+)?(.+?)\s+(?:attribute|measure|field|column)$/i,
+    /^compare\s+(.+?)\s+(?:vs|versus)\s+(.+)$/i,
+    /^difference\s+between\s+(.+?)\s+and\s+(.+)$/i,
+    /^what\s+(?:is|are)\s+(?:an?\s+|the\s+)?(.+)$/i,
+    /^(?:what\s+is\s+)?(.+)$/i,
   ]
   for (const p of patterns) {
     const m = q.match(p)
-    if (m) return m[1].trim()
+    if (m) {
+      const subject = m[1].trim().replace(/[?!.]+$/, '').trim()
+      if (subject.length > 0) return subject
+    }
   }
-  return q
+  return q.replace(/[?!.]+$/, '').trim()
 }
 function extractUrlKeywords(query) {
   const stopWords = new Set(['power', 'bi', 'report', 'url', 'link', 'for', 'the', 'a', 'an', 'of', 'in', 'get', 'me', 'show', 'give', 'find', 'fetch'])
@@ -260,11 +298,7 @@ function normalizeTerms(term) {
 function trimToCompleteSentence(text, maxLen = 1200) {
   if (!text || text.length <= maxLen) return text
   const truncated = text.slice(0, maxLen)
-  const lastPeriod = Math.max(
-    truncated.lastIndexOf('. '),
-    truncated.lastIndexOf('.\n'),
-    truncated.lastIndexOf('.')
-  )
+  const lastPeriod = Math.max(truncated.lastIndexOf('. '), truncated.lastIndexOf('.\n'), truncated.lastIndexOf('.'))
   if (lastPeriod > maxLen * 0.5) return truncated.slice(0, lastPeriod + 1).trim()
   return truncated.trim()
 }
@@ -276,18 +310,18 @@ function capFirst(str) {
   if (!str) return ''
   return str.charAt(0).toUpperCase() + str.slice(1)
 }
-async function callPhi4(systemPrompt, userMessage, maxTokens = 1024) {
-  if (!PHI4_ENDPOINT || !PHI4_API_KEY) throw new Error('PHI4_ENDPOINT and PHI4_API_KEY are required')
-  if (phiCircuitOpen()) throw new Error('Model temporarily unavailable')
-  return runWithPhiLimit(async () => {
+async function callASKDATA(systemPrompt, userMessage, maxTokens = 1024) {
+  if (!ASKDATA_ENDPOINT || !ASKDATA_KEY) throw new Error('ASKDATA_ENDPOINT and ASKDATA_KEY are required')
+  if (askedataCircuitOpen()) throw new Error('ASKDATA temporarily unavailable')
+  return runWithAskedataLimit(async () => {
     try {
       const response = await fetchWithTimeout(
-        PHI4_ENDPOINT,
+        ASKDATA_ENDPOINT,
         {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${PHI4_API_KEY}` },
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${ASKDATA_KEY}` },
           body: JSON.stringify({
-            model: PHI4_MODEL,
+            model: ASKDATA_MODEL,
             messages: [
               { role: 'system', content: systemPrompt },
               { role: 'user', content: userMessage },
@@ -296,20 +330,82 @@ async function callPhi4(systemPrompt, userMessage, maxTokens = 1024) {
             max_tokens: maxTokens,
           }),
         },
-        PHI4_TIMEOUT_MS
+        ASKDATA_TIMEOUT_MS
       )
       if (!response.ok) {
         const errText = await response.text()
-        throw new Error(`Phi-4 API error ${response.status}: ${errText}`)
+        throw new Error(`ASKDATA error ${response.status}: ${errText}`)
       }
       const data = await response.json()
-      phiRecordSuccess()
+      askedataRecordSuccess()
       return data.choices?.[0]?.message?.content || ''
     } catch (err) {
-      phiRecordFailure()
+      askedataRecordFailure()
       throw err
     }
   })
+}
+async function callASKDATA2(systemPrompt, userMessage, maxTokens = 1024) {
+  if (!ASKDATA2_ENDPOINT || !ASKDATA2_KEY) throw new Error('ASKDATA2_ENDPOINT and ASKDATA2_KEY are required')
+  try {
+    const response = await fetchWithTimeout(
+      ASKDATA2_ENDPOINT,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${ASKDATA2_KEY}`,
+          'Accept': 'application/json',
+        },
+        body: JSON.stringify({
+          model: ASKDATA2_MODEL,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userMessage },
+          ],
+          max_tokens: maxTokens,
+          temperature: 0.1,
+          top_p: 1.0,
+          stream: false,
+        }),
+      },
+      ASKDATA2_TIMEOUT_MS
+    )
+    if (!response.ok) {
+      const errText = await response.text()
+      throw new Error(`ASKDATA2 error ${response.status}: ${errText}`)
+    }
+    const data = await response.json()
+    return data.choices?.[0]?.message?.content || ''
+  } catch (err) {
+    console.error(`[ASKDATA2] Failed: ${err.message}`)
+    throw err
+  }
+}
+async function callBestAvailableEngine(systemPrompt, userMessage, maxTokens = 1024) {
+  let primaryError = null
+  if (ASKDATA_ENDPOINT && ASKDATA_KEY && !askedataCircuitOpen()) {
+    try {
+      const result = await callASKDATA(systemPrompt, userMessage, maxTokens)
+      if (result && result.trim().length >= 15) return result
+      primaryError = new Error('ASKDATA returned blank response')
+    } catch (err) {
+      primaryError = err
+      console.warn(`[ASKDATA] Failed, switching to ASKDATA2: ${err.message}`)
+    }
+  } else {
+    primaryError = new Error('ASKDATA unavailable (circuit open or not configured)')
+  }
+  if (ASKDATA2_ENDPOINT && ASKDATA2_KEY) {
+    try {
+      console.log(`[ASKDATA2] Activating (Reason: ${primaryError?.message})`)
+      const result = await callASKDATA2(systemPrompt, userMessage, maxTokens)
+      if (result && result.trim().length >= 15) return result
+    } catch (err) {
+      console.error(`[ASKDATA2] Also failed: ${err.message}`)
+    }
+  }
+  return ''
 }
 async function embedQueryAzure(query) {
   if (!AZURE_EMBED_ENDPOINT || !AZURE_EMBED_KEY) return null
@@ -395,10 +491,7 @@ function detectColumns(headers) {
   if (colIdx.url !== undefined && colIdx.name === undefined) {
     const usedIdx = new Set(Object.values(colIdx))
     for (let i = 0; i < headers.length; i++) {
-      if (!usedIdx.has(i) && headers[i].trim()) {
-        colIdx.name = i
-        break
-      }
+      if (!usedIdx.has(i) && headers[i].trim()) { colIdx.name = i; break }
     }
   }
   return colIdx
@@ -451,9 +544,7 @@ function extractSpreadsheet(buffer) {
         if (urlVal) {
           parts.push(`Report URL for ${nameVal}: ${urlVal}`)
           parts.push(`Power BI link for ${nameVal}: ${urlVal}`)
-          if (tableVal && tableVal !== sheetName) {
-            parts.push(`Report URL for ${nameVal} (${tableVal}): ${urlVal}`)
-          }
+          if (tableVal && tableVal !== sheetName) parts.push(`Report URL for ${nameVal} (${tableVal}): ${urlVal}`)
         }
       } else if (descVal) {
         parts.push(descVal)
@@ -474,7 +565,7 @@ function extractSpreadsheet(buffer) {
 function keywordSearch(query, chunks, topK, intent, invertedIndex) {
   const subject = extractSubject(query)
   const subjectWords = subject.toLowerCase().split(/\s+/).filter(w => w.length > 1)
-  const queryLower = query.toLowerCase()
+  const queryLower = normalizeQuery(query)
   const isMultiWord = subjectWords.length > 1
   const subjectPhraseRegex = isMultiWord
     ? new RegExp(escapeRegex(subject.toLowerCase()), 'i')
@@ -505,8 +596,7 @@ function keywordSearch(query, chunks, topK, intent, invertedIndex) {
       let score = 0
       if (intent === 'all_urls') {
         if (!text.includes('http')) return { ...c, _score: 0 }
-        score += 10
-        return { ...c, _score: score }
+        return { ...c, _score: 10 }
       }
       if (intent === 'url_lookup') {
         if (!text.includes('http')) return { ...c, _score: 0 }
@@ -519,14 +609,13 @@ function keywordSearch(query, chunks, topK, intent, invertedIndex) {
         const phraseFound = subjectPhraseRegex.test(c.text || '')
         if (phraseFound) {
           score += subjectWords.length * 6
-          const measurePattern = new RegExp(`\\|\\s*${escapeRegex(subject.toLowerCase())}\\s*\\|`, 'i')
-          if (measurePattern.test(c.text || '')) score += subjectWords.length * 4
-          const defPattern = new RegExp(`${escapeRegex(subject.toLowerCase())}\\s*(is defined as|is calculated as|formula:)`, 'i')
-          if (defPattern.test(c.text || '')) score += subjectWords.length * 8
+          if (new RegExp(`\\|\\s*${escapeRegex(subject.toLowerCase())}\\s*\\|`, 'i').test(c.text || '')) score += subjectWords.length * 4
+          if (new RegExp(`${escapeRegex(subject.toLowerCase())}\\s*(is defined as|is calculated as|formula:)`, 'i').test(c.text || '')) score += subjectWords.length * 8
         }
         const wordCoverage = subjectWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(c.text || '')).length
         score += wordCoverage * 2
         if (text.includes(queryLower)) score += 3
+        if (text.includes(subject.toLowerCase())) score += 4
       }
       return { ...c, _score: score }
     })
@@ -535,24 +624,28 @@ function keywordSearch(query, chunks, topK, intent, invertedIndex) {
     .slice(0, topK)
 }
 function relaxedKeywordSearch(query, chunks, topK, invertedIndex) {
-  const allWords = query.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 2)
+  const subject = extractSubject(query)
+  const allWords = [
+    ...subject.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1),
+    ...query.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 2),
+  ]
+  const uniqueWords = [...new Set(allWords)]
   const union = new Set()
   if (invertedIndex) {
-    for (const w of allWords) {
+    for (const w of uniqueWords) {
       for (const idx of (invertedIndex.get(w) || new Set())) union.add(idx)
       for (const variant of normalizeTerms(w)) {
         for (const idx of (invertedIndex.get(variant) || new Set())) union.add(idx)
       }
     }
   }
-  const source = union.size > 0
-    ? [...union].map(i => chunks[i]).filter(Boolean)
-    : chunks.slice(0, 300)
+  const source = union.size > 0 ? [...union].map(i => chunks[i]).filter(Boolean) : chunks.slice(0, 300)
   return source
     .map(c => {
       const text = (c.text || '').toLowerCase()
-      const matched = allWords.filter(w => text.includes(w)).length
-      return { ...c, _score: matched }
+      const matched = uniqueWords.filter(w => text.includes(w)).length
+      const subjectMatch = subject.length > 2 && text.includes(subject.toLowerCase()) ? 5 : 0
+      return { ...c, _score: matched + subjectMatch }
     })
     .filter(c => c._score > 0)
     .sort((a, b) => b._score - a._score)
@@ -560,10 +653,9 @@ function relaxedKeywordSearch(query, chunks, topK, invertedIndex) {
 }
 async function retrieveChunks(query, chunks, topK, invertedIndex) {
   const intent = detectQueryIntent(query)
-  const normalizedQuery = query.toLowerCase().trim().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
+  const normalizedQuery = normalizeQuery(query).replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
   if (intent === 'all_urls') {
-    const urlChunks = chunks.filter(c => /https?:\/\/\S+/.test(c.text || ''))
-    return urlChunks.slice(0, 100)
+    return chunks.filter(c => /https?:\/\/\S+/.test(c.text || '')).slice(0, 100)
   }
   const candidates = keywordSearch(normalizedQuery, chunks, Math.min(150, chunks.length), intent, invertedIndex)
   const pool = candidates.length > 0 ? candidates : chunks.slice(0, 150)
@@ -595,22 +687,18 @@ async function retrieveChunks(query, chunks, topK, invertedIndex) {
         if (result.length > 0) return result
       }
     } catch (err) {
-      console.warn('[retrieveChunks] embed failed, using keyword fallback:', err.message)
+      console.warn('[retrieveChunks] Embedding failed, using keyword fallback:', err.message)
     }
   }
   if (pool.length > 0) return pool.slice(0, Math.min(topK, 8))
-  const relaxed = relaxedKeywordSearch(normalizedQuery, chunks, Math.min(topK * 2, 16), invertedIndex)
-  return relaxed.slice(0, Math.min(topK, 8))
+  return relaxedKeywordSearch(normalizedQuery, chunks, Math.min(topK * 2, 16), invertedIndex).slice(0, Math.min(topK, 8))
 }
 function buildContext(hits) {
   const seen = new Set()
   const deduped = []
   for (const h of hits) {
     const fp = (h.text || '').trim().slice(0, 80).toLowerCase()
-    if (!seen.has(fp)) {
-      seen.add(fp)
-      deduped.push(h)
-    }
+    if (!seen.has(fp)) { seen.add(fp); deduped.push(h) }
     if (deduped.length >= 6) break
   }
   return deduped.map((h, i) => {
@@ -618,8 +706,8 @@ function buildContext(hits) {
     return `[Source ${i + 1}]\n${(h.text || '').trim().slice(0, limit)}`
   }).join('\n\n---\n\n')
 }
-function buildSystemPrompt(intent) {
-  const base = `You are a helpful data dictionary assistant for a real estate analytics platform.
+function buildSystemPrompt() {
+  return `You are a helpful data dictionary assistant for a real estate analytics platform.
 Answer ONLY using the provided context. Follow these STRICT rules:
 
 CRITICAL FORMATTING RULES:
@@ -642,9 +730,7 @@ RESPONSE PATTERNS:
 - Calculation: "**[Name]** is calculated as [explanation]. **Formula:** [formula]."
 - URL lookup: return only the URL.
 - All URLs: "**[Report Name]:** [URL]" — one per line.
-- Comparison: "**[A]:** [desc]. **[B]:** [desc]. **Key Difference:** [one sentence]."
-`
-  return base
+- Comparison: "**[A]:** [desc]. **[B]:** [desc]. **Key Difference:** [one sentence]."`
 }
 function buildUserMessage(query, hits, intent) {
   const context = buildContext(hits)
@@ -670,15 +756,13 @@ function extractAllUrlsFromChunks(chunks) {
   const seen = new Set()
   const urlRegex = /https?:\/\/[^\s"'<>]+/g
   for (const chunk of chunks) {
-    const text = chunk.text || ''
-    const lines = text.split('\n')
+    const lines = (chunk.text || '').split('\n')
     for (const line of lines) {
       const urls = line.match(urlRegex)
       if (!urls) continue
       for (const url of urls) {
         const cleanUrl = url.replace(/[.,;)]+$/, '').trim()
-        if (!cleanUrl.startsWith('http')) continue
-        if (seen.has(cleanUrl)) continue
+        if (!cleanUrl.startsWith('http') || seen.has(cleanUrl)) continue
         seen.add(cleanUrl)
         let name = 'Report'
         const reportUrlMatch = line.match(/^(?:Report URL|Power BI link)\s+for\s+(.+?)(?:\s*\([^)]+\))?\s*:\s*https?:/i)
@@ -715,11 +799,9 @@ function buildFallbackAnswer(query, hits) {
     const urlKeywords = extractUrlKeywords(query)
     const urlRegex = /https?:\/\/[^\s"'<>]+/
     for (const h of hits) {
-      const lines = (h.text || '').split('\n')
-      for (const line of lines) {
+      for (const line of (h.text || '').split('\n')) {
         if (!urlRegex.test(line)) continue
-        const lineLower = line.toLowerCase()
-        const matched = urlKeywords.filter(w => lineLower.includes(w)).length
+        const matched = urlKeywords.filter(w => line.toLowerCase().includes(w)).length
         if (matched > 0) {
           const urlMatch = line.match(urlRegex)
           if (urlMatch) return urlMatch[0].replace(/[.,;)]+$/, '').trim()
@@ -727,9 +809,7 @@ function buildFallbackAnswer(query, hits) {
       }
     }
     for (const h of hits) {
-      const lines = (h.text || '').split('\n')
-      for (const line of lines) {
-        if (!urlRegex.test(line)) continue
+      for (const line of (h.text || '').split('\n')) {
         const urlMatch = line.match(urlRegex)
         if (urlMatch) return urlMatch[0].replace(/[.,;)]+$/, '').trim()
       }
@@ -749,10 +829,8 @@ function buildFallbackAnswer(query, hits) {
       const cap = capFirst(subject)
       let answer = `**${cap}** is ${desc}`
       if (!answer.endsWith('.')) answer += '.'
-      if (formula) answer += `\n\n**Formula:** ${formula}`
-      if (formula && !answer.endsWith('.')) answer += '.'
-      if (additional) answer += `\n\n**Additional Info:** ${additional}`
-      if (additional && !answer.endsWith('.')) answer += '.'
+      if (formula) { answer += `\n\n**Formula:** ${formula}`; if (!answer.endsWith('.')) answer += '.' }
+      if (additional) { answer += `\n\n**Additional Info:** ${additional}`; if (!answer.endsWith('.')) answer += '.' }
       return ensureSinglePeriod(answer)
     }
   }
@@ -762,29 +840,24 @@ function buildFallbackAnswer(query, hits) {
       const m = (h.text || '').match(calcPattern)
       if (m) {
         const cap = capFirst(subject)
-        const formula = trimToCompleteSentence(m[1].trim(), 500)
-        return ensureSinglePeriod(`**How ${cap} is Calculated**\n\n**Formula:** ${formula}.`)
+        return ensureSinglePeriod(`**How ${cap} is Calculated**\n\n**Formula:** ${trimToCompleteSentence(m[1].trim(), 500)}.`)
       }
     }
   }
   const matchingLines = []
   for (const h of hits) {
     for (const line of (h.text || '').split('\n')) {
-      const ll = line.toLowerCase()
-      if (!ll.includes(subjectLower)) continue
+      if (!line.toLowerCase().includes(subjectLower)) continue
       if (line.trim().length <= 20) continue
       if ((line.match(/\|/g) || []).length > 2) continue
       if (/^===\s*Sheet:/.test(line.trim())) continue
-      const cleaned = line.trim()
-        .replace(/\(from\s+[A-Za-z\s]+\)/g, '')
-        .trim()
+      const cleaned = line.trim().replace(/\(from\s+[A-Za-z\s]+\)/g, '').trim()
       if (cleaned.length > 15) matchingLines.push(cleaned)
     }
   }
   if (matchingLines.length > 0) {
-    const unique = [...new Set(matchingLines)].slice(0, 3)
     const cap = capFirst(subject)
-    const joined = trimToCompleteSentence(unique.join(' '), 600)
+    const joined = trimToCompleteSentence([...new Set(matchingLines)].slice(0, 3).join(' '), 600)
     return ensureSinglePeriod(`**${cap}:** ${joined}.`)
   }
   return "I could not find that specific information in your documents."
@@ -806,26 +879,18 @@ function cleanAnswer(rawAnswer) {
 }
 function trimToLastCompleteSentence(text) {
   if (!text) return ''
-  const sentenceEnd = /[.!?]/
-  const lastIdx = Math.max(
-    text.lastIndexOf('. '),
-    text.lastIndexOf('.\n'),
-    text.lastIndexOf('! '),
-    text.lastIndexOf('? '),
-  )
+  const lastIdx = Math.max(text.lastIndexOf('. '), text.lastIndexOf('.\n'), text.lastIndexOf('! '), text.lastIndexOf('? '))
   if (lastIdx > text.length * 0.5) {
     const trimmed = text.slice(0, lastIdx + 1).trim()
     if (trimmed.length > 20) return trimmed
   }
-  if (sentenceEnd.test(text[text.length - 1])) return text
+  if (/[.!?]$/.test(text)) return text
   const periodIdx = text.lastIndexOf('.')
   if (periodIdx > text.length * 0.5) return text.slice(0, periodIdx + 1).trim()
   return text
 }
-async function answerWithPhi4(query, hits, intent) {
-  const systemPrompt = buildSystemPrompt(intent)
-  const userMessage = buildUserMessage(query, hits, intent)
-  return callPhi4(systemPrompt, userMessage, 1024)
+async function generateAnswer(query, hits, intent) {
+  return callBestAvailableEngine(buildSystemPrompt(), buildUserMessage(query, hits, intent), 1024)
 }
 async function extractPdf(buffer) {
   const r = await pdfParse(buffer)
@@ -843,10 +908,7 @@ function extractCsv(buffer, delimiter) {
 }
 async function extractOffice(buffer) {
   return new Promise((resolve, reject) => {
-    parseOffice(buffer, (text, err) => {
-      if (err) reject(err)
-      else resolve(text || '')
-    }, { outputErrorToConsole: false })
+    parseOffice(buffer, (text, err) => { if (err) reject(err); else resolve(text || '') }, { outputErrorToConsole: false })
   })
 }
 function extractHtml(buffer) {
@@ -858,8 +920,7 @@ function extractXml(buffer) { return buffer.toString('utf-8').replace(/<[^>]+>/g
 function extractJson(buffer) { try { return JSON.stringify(JSON.parse(buffer.toString('utf-8')), null, 2) } catch { return buffer.toString('utf-8') } }
 function extractJsonl(buffer) {
   return buffer.toString('utf-8').split('\n').filter(Boolean)
-    .map(line => { try { return JSON.stringify(JSON.parse(line)) } catch { return line } })
-    .join('\n')
+    .map(line => { try { return JSON.stringify(JSON.parse(line)) } catch { return line } }).join('\n')
 }
 function extractYaml(buffer) { try { return JSON.stringify(yaml.load(buffer.toString('utf-8')), null, 2) } catch { return buffer.toString('utf-8') } }
 async function extractEml(buffer) {
@@ -875,9 +936,7 @@ async function extractEml(buffer) {
 }
 async function extractEpub(buffer) {
   return new Promise(resolve => {
-    parseOffice(buffer, (text, err) => {
-      resolve(err || !text ? '[EPUB: convert to PDF for best results]' : text)
-    }, { outputErrorToConsole: false })
+    parseOffice(buffer, (text, err) => { resolve(err || !text ? '[EPUB: convert to PDF for best results]' : text) }, { outputErrorToConsole: false })
   })
 }
 async function extractTextFromBuffer(buffer, fileName) {
@@ -910,9 +969,7 @@ function chunkText(text, sourceFile) {
   let bufferLength = 0
   function flush() {
     const chunkStr = buffer.join('\n\n')
-    if (chunkStr.length >= 30) {
-      chunks.push({ text: chunkStr, source_file: sourceFile, chunk_index: chunkIndex++, embedding: [] })
-    }
+    if (chunkStr.length >= 30) chunks.push({ text: chunkStr, source_file: sourceFile, chunk_index: chunkIndex++, embedding: [] })
     buffer = []
     bufferLength = 0
   }
@@ -984,7 +1041,7 @@ async function _doLoadChunks(clientId) {
     )
     for (const result of results) {
       if (result.status === 'fulfilled') allChunks.push(...result.value)
-      else console.warn('[loadChunks] blob failed:', result.reason?.message)
+      else console.warn('[loadChunks] Blob failed:', result.reason?.message)
     }
   }
   return allChunks
@@ -994,9 +1051,7 @@ async function loadChunksForClient(clientId) {
   const now = Date.now()
   const cached = CHUNK_CACHE.get(clientId)
   if (cached && cached.chunks) {
-    if (now - cached.ts <= CHUNK_CACHE_TTL) {
-      return { chunks: cached.chunks, invertedIndex: cached.invertedIndex }
-    }
+    if (now - cached.ts <= CHUNK_CACHE_TTL) return { chunks: cached.chunks, invertedIndex: cached.invertedIndex }
     if (!cached.loading) {
       const refreshPromise = _doLoadChunks(clientId)
         .then(chunks => {
@@ -1115,9 +1170,7 @@ function requireAdminKey(req, res, next) {
   if (!key || key !== ADMIN_API_KEY) return res.status(401).json({ error: 'Unauthorized' })
   next()
 }
-function generateApiKey() {
-  return `rak_${crypto.randomBytes(32).toString('hex')}`
-}
+function generateApiKey() { return `rak_${crypto.randomBytes(32).toString('hex')}` }
 function generateTitle(query) {
   const cleaned = query.trim().replace(/[?!.]+$/, '')
   return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned
@@ -1125,12 +1178,12 @@ function generateTitle(query) {
 app.get('/health', (req, res) => res.json({
   ok: true,
   service: 'ask-data',
-  model: PHI4_MODEL,
+  engines: { primary: ASKDATA_ENDPOINT ? 'configured' : 'missing', fallback: ASKDATA2_ENDPOINT ? 'configured' : 'missing' },
   embeddings: AZURE_EMBED_ENDPOINT ? 'azure' : 'keyword-only',
   chunkCacheSize: CHUNK_CACHE.size,
   responseCacheSize: RESPONSE_CACHE.size,
-  phiCircuitOpen: phiCircuitOpen(),
-  phiFailures,
+  primaryCircuitOpen: askedataCircuitOpen(),
+  primaryFailures: askedataFailures,
 }))
 app.post('/client/verify', async (req, res) => {
   try {
@@ -1145,11 +1198,8 @@ app.post('/admin/clients', requireAdminKey, async (req, res) => {
   try {
     let { name, clientId, apiKey } = req.body
     if (!name || !clientId) return res.status(400).json({ error: 'name and clientId are required' })
-    if (!apiKey) {
-      apiKey = generateApiKey()
-    } else if (!apiKey.startsWith('rak_')) {
-      return res.status(400).json({ error: 'apiKey must start with "rak_"' })
-    }
+    if (!apiKey) { apiKey = generateApiKey() }
+    else if (!apiKey.startsWith('rak_')) return res.status(400).json({ error: 'apiKey must start with "rak_"' })
     const database = await getDb()
     const col = database.collection('clients')
     const existing = await col.findOne({ $or: [{ clientId }, { apiKey }] })
@@ -1241,9 +1291,7 @@ app.post('/client/login', async (req, res) => {
     if (!apiKey) return res.status(400).json({ error: 'apiKey is required' })
     const client = await verifyApiKey(apiKey)
     if (!client) return res.status(401).json({ error: 'Invalid API key' })
-    if (blobServiceClient) {
-      loadChunksForClient(client.clientId).catch(err => console.warn(`[login warmup] ${client.clientId}: ${err.message}`))
-    }
+    if (blobServiceClient) loadChunksForClient(client.clientId).catch(err => console.warn(`[login warmup] ${client.clientId}: ${err.message}`))
     res.json({ ok: true, client })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -1253,9 +1301,7 @@ app.post('/chat/login', async (req, res) => {
     if (!apiKey) return res.status(400).json({ error: 'apiKey is required' })
     const client = await verifyApiKey(apiKey)
     if (!client) return res.status(401).json({ error: 'Invalid API key' })
-    if (blobServiceClient) {
-      loadChunksForClient(client.clientId).catch(err => console.warn(`[chat/login warmup] ${client.clientId}: ${err.message}`))
-    }
+    if (blobServiceClient) loadChunksForClient(client.clientId).catch(err => console.warn(`[chat/login warmup] ${client.clientId}: ${err.message}`))
     res.json({ ok: true, client })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -1299,7 +1345,11 @@ app.post('/chat/conversations/rename', requireClientKey, async (req, res) => {
     const { conversationId, title } = req.body
     if (!conversationId || !title) return res.status(400).json({ error: 'conversationId and title are required' })
     const database = await getChatDb()
-    const result = await database.collection('conversations').findOneAndUpdate({ _id: new ObjectId(conversationId), clientId: req.client.clientId }, { $set: { title: title.trim(), updatedAt: new Date() } }, { returnDocument: 'after', projection: { messages: 0 } })
+    const result = await database.collection('conversations').findOneAndUpdate(
+      { _id: new ObjectId(conversationId), clientId: req.client.clientId },
+      { $set: { title: title.trim(), updatedAt: new Date() } },
+      { returnDocument: 'after', projection: { messages: 0 } }
+    )
     if (!result) return res.status(404).json({ error: 'Conversation not found' })
     res.json(result)
   } catch (err) { res.status(500).json({ error: err.message }) }
@@ -1319,14 +1369,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
     const { query, topK = 6, conversationId } = req.body
     if (!query?.trim()) return res.status(400).json({ error: 'query is required' })
     const validation = validateQuery(query)
-    if (!validation.valid) {
-      return res.json({
-        answer: validation.message,
-        sources: [],
-        conversationId: conversationId || null,
-        client: req.client,
-      })
-    }
+    if (!validation.valid) return res.json({ answer: validation.message, sources: [], conversationId: conversationId || null, client: req.client })
     const { clientId, name } = req.client
     const intent = detectQueryIntent(query.trim())
     if (intent === 'greeting') {
@@ -1339,9 +1382,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
     }
     const cacheKey = getCacheKey(clientId, query)
     const cached = responseCacheGet(cacheKey)
-    if (cached) {
-      return res.json({ ...cached, cached: true, conversationId: conversationId || cached.conversationId })
-    }
+    if (cached) return res.json({ ...cached, cached: true, conversationId: conversationId || cached.conversationId })
     if (IN_FLIGHT.has(cacheKey)) {
       try {
         const result = await IN_FLIGHT.get(cacheKey)
@@ -1351,25 +1392,13 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
     const requestPromise = (async () => {
       const { chunks, invertedIndex } = await loadChunksForClient(clientId)
       if (chunks.length === 0) {
-        return {
-          answer: 'No documents found for your account. Please ensure your documents have been ingested first.',
-          sources: [],
-          conversationId: conversationId || null,
-          client: { clientId, name },
-        }
+        return { answer: 'No documents found for your account. Please ensure your documents have been ingested first.', sources: [], conversationId: conversationId || null, client: { clientId, name } }
       }
       if (intent === 'all_urls') {
         const urlChunks = chunks.filter(c => /https?:\/\/\S+/.test(c.text || ''))
         const urlEntries = extractAllUrlsFromChunks(urlChunks)
-        const answer = urlEntries.length > 0
-          ? urlEntries.map(e => `**${e.name}:** ${e.url}`).join('\n')
-          : "I could not find any URLs in your documents."
-        const sources = urlChunks.slice(0, 6).map(h => ({
-          source_file: h.source_file || 'unknown',
-          chunk_index: h.chunk_index ?? 0,
-          score: null,
-          preview: (h.text || '').slice(0, 200),
-        }))
+        const answer = urlEntries.length > 0 ? urlEntries.map(e => `**${e.name}:** ${e.url}`).join('\n') : "I could not find any URLs in your documents."
+        const sources = urlChunks.slice(0, 6).map(h => ({ source_file: h.source_file || 'unknown', chunk_index: h.chunk_index ?? 0, score: null, preview: (h.text || '').slice(0, 200) }))
         let activeConversationId = conversationId || null
         try {
           const chatDatabase = await getChatDb()
@@ -1389,40 +1418,29 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
             const result = await col.insertOne({ clientId, title: generateTitle(query.trim()), messages: [userMsg, assistantMsg], createdAt: now, updatedAt: now })
             activeConversationId = result.insertedId.toString()
           }
-        } catch (saveErr) {
-          console.warn('[chat/message] Failed to save conversation:', saveErr.message)
-        }
+        } catch (saveErr) { console.warn('[chat/message] Failed to save conversation:', saveErr.message) }
         return { answer, sources, conversationId: activeConversationId, client: { clientId, name } }
       }
       let hits = await retrieveChunks(query.trim(), chunks, Math.min(topK, 8), invertedIndex)
+      if (hits.length === 0) hits = relaxedKeywordSearch(query.trim(), chunks, 12, invertedIndex)
+      console.log(`[chat/message] "${query.slice(0, 60)}" → intent=${intent}, subject="${extractSubject(query)}", hits=${hits.length}, topScore=${hits[0]?._score?.toFixed(2) || 0}`)
       if (hits.length === 0) {
-        hits = relaxedKeywordSearch(query.trim(), chunks, 12, invertedIndex)
-      }
-      console.log(`[chat/message] "${query.slice(0, 60)}" → intent=${intent}, hits=${hits.length}, topScore=${hits[0]?._score?.toFixed(2) || 0}`)
-      if (hits.length === 0) {
-        return {
-          answer: "I could not find relevant information about this in your documents. Try rephrasing your question.",
-          sources: [],
-          conversationId: conversationId || null,
-          client: { clientId, name },
-        }
+        return { answer: "I could not find relevant information about this in your documents. Try rephrasing your question.", sources: [], conversationId: conversationId || null, client: { clientId, name } }
       }
       let rawAnswer = ''
       if (intent !== 'url_lookup') {
         try {
           rawAnswer = await Promise.race([
-            answerWithPhi4(query.trim(), hits, intent),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Model timeout')), 25000)),
+            generateAnswer(query.trim(), hits, intent),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('All engines timed out')), 55000)),
           ])
         } catch (err) {
-          console.warn(`[phi4] Using fallback: ${err.message}`)
+          console.warn(`[chat/message] All engines failed, using rule-based fallback: ${err.message}`)
         }
       }
       const isBlank = !rawAnswer || rawAnswer.trim().length < 15
-      const answer = isBlank
-        ? buildFallbackAnswer(query.trim(), hits)
-        : cleanAnswer(rawAnswer)
-      if (isBlank) console.warn(`[phi4] Blank response, used fallback for: "${query.slice(0, 60)}"`)
+      const answer = isBlank ? buildFallbackAnswer(query.trim(), hits) : cleanAnswer(rawAnswer)
+      if (isBlank) console.warn(`[chat/message] Blank from all engines, used rule-based fallback for: "${query.slice(0, 60)}"`)
       const sources = hits.map(h => ({
         source_file: h.source_file || 'unknown',
         chunk_index: h.chunk_index ?? 0,
@@ -1448,21 +1466,13 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
           const result = await col.insertOne({ clientId, title: generateTitle(query.trim()), messages: [userMsg, assistantMsg], createdAt: now, updatedAt: now })
           activeConversationId = result.insertedId.toString()
         }
-      } catch (saveErr) {
-        console.warn('[chat/message] Failed to save conversation:', saveErr.message)
-      }
+      } catch (saveErr) { console.warn('[chat/message] Failed to save conversation:', saveErr.message) }
       return { answer, sources, conversationId: activeConversationId, client: { clientId, name } }
     })()
     IN_FLIGHT.set(cacheKey, requestPromise)
     let result
-    try {
-      result = await requestPromise
-    } finally {
-      IN_FLIGHT.delete(cacheKey)
-    }
-    if (result.answer && result.answer.length > 15) {
-      responseCacheSet(cacheKey, result)
-    }
+    try { result = await requestPromise } finally { IN_FLIGHT.delete(cacheKey) }
+    if (result.answer && result.answer.length > 15) responseCacheSet(cacheKey, result)
     res.json(result)
   } catch (err) {
     console.error('[chat/message] Error:', err.message)
@@ -1475,8 +1485,8 @@ app.use((err, req, res, next) => {
 })
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => {
-  console.log(`rag-client-auth running on port ${PORT}`)
-  console.log(`Model: 'Ask Data' | Endpoint: ${PHI4_ENDPOINT ? 'configured' : 'MISSING'}`)
+  console.log(`Service running on port ${PORT}`)
+  console.log(`ASKDATA: ${ASKDATA_ENDPOINT ? 'configured' : 'MISSING'} | ASKDATA2: ${ASKDATA2_ENDPOINT ? 'configured' : 'missing'}`)
   startApiKeyHealthChecker()
   warmupChunkCaches()
 })
