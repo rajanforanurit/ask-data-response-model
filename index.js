@@ -11,6 +11,7 @@ const yaml = require('js-yaml')
 const Papa = require('papaparse')
 const { simpleParser } = require('mailparser')
 const { parseOffice } = require('officeparser')
+const stringSimilarity = require('string-similarity')
 const crypto = require('crypto')
 const app = express()
 const allowedOrigins = [
@@ -62,16 +63,22 @@ const ASKDATA2_MODEL = process.env.ASKDATA2_MODEL || 'ASKDATA2'
 const ASKDATA2_TIMEOUT_MS = parseInt(process.env.ASKDATA2_TIMEOUT_MS || '30000', 10)
 const AZURE_EMBED_ENDPOINT = process.env.AZURE_EMBED_ENDPOINT || ''
 const AZURE_EMBED_KEY = process.env.AZURE_EMBED_KEY || ''
-const AZURE_EMBED_MODEL = process.env.AZURE_EMBED_MODEL || 'text-embedding-ada-002'
+// UPGRADE 6: Use text-embedding-3-small instead of text-embedding-ada-002
+const AZURE_EMBED_MODEL = process.env.AZURE_EMBED_MODEL || 'text-embedding-3-small'
 const EMBED_TIMEOUT_MS = parseInt(process.env.EMBED_TIMEOUT_MS || '10000', 10)
 const EMBED_POOL_LIMIT = parseInt(process.env.EMBED_POOL_LIMIT || '20', 10)
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10)
 const WARMUP_CLIENT_IDS = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
+const RERANKER_ENDPOINT = process.env.RERANKER_ENDPOINT || ''
+const RERANKER_KEY = process.env.RERANKER_KEY || ''
+const RERANKER_TIMEOUT_MS = parseInt(process.env.RERANKER_TIMEOUT_MS || '8000', 10)
 const RAW_PREFIX = 'raw'
 const CHUNK_SIZE = 1200
 const CHUNK_OVERLAP = 2
 const BLOB_CONCURRENCY = parseInt(process.env.BLOB_CONCURRENCY || '8', 10)
 const CHUNK_CACHE_TTL = parseInt(process.env.CHUNK_CACHE_TTL_MS || '300000', 10)
+// UPGRADE 7: Increase MAX_HITS from 20 to 50
+const MAX_HITS_GLOBAL = 50
 const blobServiceClient = AZURE_CONNECTION_STRING
   ? BlobServiceClient.fromConnectionString(AZURE_CONNECTION_STRING)
   : null
@@ -102,8 +109,6 @@ function responseCacheSet(key, value) {
   }
   RESPONSE_CACHE.set(key, { value, ts: Date.now() })
 }
-// SYNONYM MAP: maps alternative phrasings to canonical terms
-// Add domain-specific synonyms here so all user variations resolve to the same subject
 const SYNONYM_MAP = [
   { pattern: /\bapp(lication)?\s+count\b/i, canonical: 'application count' },
   { pattern: /\btotal\s+app(lication)?\s+count\b/i, canonical: 'application count' },
@@ -124,10 +129,12 @@ function applySynonyms(query) {
   }
   return q
 }
+// UPGRADE 2: Week number normalization inside normalizeQueryForCache
 function normalizeQueryForCache(query) {
   return applySynonyms(query)
     .toLowerCase()
     .trim()
+    .replace(/\bweek\s+(\d)\b/g, (_, n) => `week 0${n}`)
     .replace(/^(what\s+is\s+(the\s+)?(definition|meaning)\s+(of|for|to)\s+)/i, '')
     .replace(/^(define\s+(the\s+)?)/i, '')
     .replace(/^(explain\s+(the\s+)?)/i, '')
@@ -239,8 +246,14 @@ function buildInvertedIndex(chunks) {
   }
   return index
 }
+// UPGRADE 2: Week number normalization + synonym normalization in normalizeQuery
 function normalizeQuery(query) {
-  return applySynonyms(query).toLowerCase().trim().replace(/[?!.]+$/, '').replace(/\s+/g, ' ')
+  return applySynonyms(query)
+    .toLowerCase()
+    .trim()
+    .replace(/\bweek\s+(\d)\b/g, (_, n) => `week 0${n}`)
+    .replace(/[?!.]+$/, '')
+    .replace(/\s+/g, ' ')
 }
 function validateQuery(query) {
   if (!query || typeof query !== 'string') return { valid: false, message: 'Please enter a complete question to get an accurate answer.' }
@@ -250,7 +263,6 @@ function validateQuery(query) {
   if (words.length < 2) return { valid: false, message: 'Please enter a more detailed question so I can provide an accurate answer.' }
   return { valid: true }
 }
-// TASK 3: improved intent detection — formula/calculation intent checked BEFORE definition
 function detectQueryIntent(query) {
   const q = normalizeQuery(query)
   if (/^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening)|how\s+are\s+you)\b/.test(q)) return 'greeting'
@@ -276,7 +288,6 @@ function detectQueryIntent(query) {
   return 'general'
 }
 function extractSubject(query) {
-  // Apply synonym normalization before extracting subject
   const normalized = applySynonyms(query)
   const q = normalizeQuery(normalized)
   const patterns = [
@@ -343,7 +354,6 @@ function capFirst(str) {
   if (!str) return ''
   return str.charAt(0).toUpperCase() + str.slice(1)
 }
-// TASK 5: smart formula extraction from any text
 function extractFormulaFromText(text) {
   if (!text) return ''
   const patterns = [
@@ -362,6 +372,104 @@ function extractFormulaFromText(text) {
     if (m && m[1] && m[1].trim().length > 3) return m[1].trim()
   }
   return ''
+}
+// UPGRADE 5: Negative penalty pairs — contradictory prefix detection
+const NEGATIVE_PAIRS = [
+  ['non-recurring', 'recurring'],
+  ['non recurring', 'recurring'],
+  ['denied', 'approved'],
+  ['inactive', 'active'],
+  ['rejected', 'accepted'],
+  ['unapproved', 'approved'],
+  ['unpaid', 'paid'],
+  ['cancelled', 'active'],
+  ['canceled', 'active'],
+  ['delinquent', 'current'],
+  ['non-', ''],
+]
+function computeNegativePenalty(querySubject, chunkText) {
+  const qs = querySubject.toLowerCase()
+  const ct = chunkText.toLowerCase()
+  let penalty = 0
+  for (const [negTerm, posTerm] of NEGATIVE_PAIRS) {
+    if (!posTerm) continue
+    const queryHasPositive = new RegExp(`\\b${escapeRegex(posTerm)}\\b`, 'i').test(qs)
+    const queryHasNegative = new RegExp(`\\b${escapeRegex(negTerm)}\\b`, 'i').test(qs)
+    if (queryHasPositive && !queryHasNegative) {
+      if (new RegExp(`\\b${escapeRegex(negTerm)}\\b`, 'i').test(ct)) {
+        penalty += 30
+      }
+    }
+    if (queryHasNegative) {
+      if (!new RegExp(`\\b${escapeRegex(negTerm)}\\b`, 'i').test(ct) && new RegExp(`\\b${escapeRegex(posTerm)}\\b`, 'i').test(ct)) {
+        penalty += 20
+      }
+    }
+  }
+  return penalty
+}
+// UPGRADE 1: Build vocabulary from chunks for fuzzy correction
+function buildVocabulary(chunks) {
+  const vocab = new Set()
+  const stopWords = new Set(['is', 'the', 'a', 'an', 'of', 'in', 'for', 'to', 'at', 'by', 'as', 'on', 'or', 'and', 'be', 'it', 'its', 'with', 'that', 'this', 'from', 'are', 'was', 'were'])
+  for (const chunk of chunks) {
+    const words = (chunk.text || '').toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/)
+    for (const w of words) {
+      if (w.length >= 3 && !stopWords.has(w)) vocab.add(w)
+    }
+    if (chunk.metadata && chunk.metadata.measure) {
+      const measureWords = chunk.metadata.measure.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/)
+      for (const w of measureWords) {
+        if (w.length >= 3 && !stopWords.has(w)) vocab.add(w)
+      }
+    }
+  }
+  return [...vocab]
+}
+// UPGRADE 1: Fuzzy query correction using string-similarity
+function fuzzyCorrectQuery(query, chunks) {
+  if (!chunks || chunks.length === 0) return query
+  const vocabulary = buildVocabulary(chunks)
+  if (vocabulary.length === 0) return query
+  const words = query.split(/\s+/)
+  const corrected = words.map(word => {
+    const wordLower = word.toLowerCase()
+    if (wordLower.length < 4) return word
+    if (vocabulary.includes(wordLower)) return word
+    const { bestMatch } = stringSimilarity.findBestMatch(wordLower, vocabulary)
+    if (bestMatch.rating >= 0.82 && bestMatch.target !== wordLower) {
+      console.log(`[fuzzyCorrect] "${word}" → "${bestMatch.target}" (score: ${bestMatch.rating.toFixed(3)})`)
+      return bestMatch.target
+    }
+    return word
+  })
+  return corrected.join(' ')
+}
+// UPGRADE 9: Query rewriting via LLM to fix spelling, normalize business terminology, expand abbreviations
+async function rewriteQuery(query) {
+  if (!ASKDATA_ENDPOINT && !ASKDATA2_ENDPOINT) return query
+  const systemPrompt = `You are a query normalization assistant for a real estate analytics data dictionary.
+Your job is to rewrite the user's question to fix:
+1. Spelling mistakes (e.g. "singer" → "signer", "ocupancy" → "occupancy")
+2. Business abbreviations (e.g. "app" → "application", "occ" → "occupancy")
+3. Week number formatting (e.g. "week 5" → "week 05")
+4. Metric name standardization (e.g. "app approval rate" → "application approval rate")
+Return ONLY the rewritten query as plain text. No explanation. No punctuation changes. If the query is already correct, return it unchanged.`
+  const userMessage = `Rewrite this query: "${query}"`
+  try {
+    const rewritten = await callBestAvailableEngine(systemPrompt, userMessage, 100)
+    if (!rewritten || rewritten.trim().length < 3) return query
+    const clean = rewritten.trim().replace(/^["']|["']$/g, '').trim()
+    if (clean.length > 0 && clean.length < query.length * 3) {
+      if (clean.toLowerCase() !== query.toLowerCase()) {
+        console.log(`[rewriteQuery] "${query}" → "${clean}"`)
+      }
+      return clean
+    }
+    return query
+  } catch {
+    return query
+  }
 }
 async function callASKDATA(systemPrompt, userMessage, maxTokens = 1024) {
   if (!ASKDATA_ENDPOINT || !ASKDATA_KEY) throw new Error('ASKDATA_ENDPOINT and ASKDATA_KEY are required')
@@ -494,6 +602,46 @@ async function embedBatch(texts) {
     return (data.data || []).sort((a, b) => a.index - b.index).map(d => d.embedding)
   } catch { return [] }
 }
+// UPGRADE 8: Cross-encoder reranker via external endpoint (e.g. Hugging Face inference or self-hosted)
+async function rerankerScore(query, texts) {
+  if (!RERANKER_ENDPOINT) return null
+  try {
+    const response = await fetchWithTimeout(
+      RERANKER_ENDPOINT,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(RERANKER_KEY ? { 'Authorization': `Bearer ${RERANKER_KEY}` } : {}),
+        },
+        body: JSON.stringify({ query, texts }),
+      },
+      RERANKER_TIMEOUT_MS
+    )
+    if (!response.ok) return null
+    const data = await response.json()
+    if (Array.isArray(data)) return data.map(d => (typeof d === 'number' ? d : d.score ?? 0))
+    if (Array.isArray(data.scores)) return data.scores
+    return null
+  } catch (err) {
+    console.warn(`[reranker] Failed: ${err.message}`)
+    return null
+  }
+}
+async function rerankChunks(query, chunks) {
+  if (!RERANKER_ENDPOINT || chunks.length === 0) return chunks
+  try {
+    const texts = chunks.map(c => (c.text || '').slice(0, 512))
+    const scores = await rerankerScore(query, texts)
+    if (!scores || scores.length !== chunks.length) return chunks
+    return chunks
+      .map((c, i) => ({ ...c, _rerankerScore: scores[i] }))
+      .sort((a, b) => b._rerankerScore - a._rerankerScore)
+  } catch (err) {
+    console.warn(`[rerankChunks] Reranker error, skipping: ${err.message}`)
+    return chunks
+  }
+}
 function scoreHeaderMatch(header, patterns) {
   const h = header.toLowerCase().trim()
   for (const [regex, score] of patterns) {
@@ -549,7 +697,6 @@ function detectColumns(headers) {
   }
   return colIdx
 }
-// TASK 4: extractSpreadsheet returns structured row objects instead of flat text
 function extractSpreadsheet(buffer) {
   const workbook = XLSX.read(buffer, { type: 'buffer', cellNF: true })
   const rows = []
@@ -586,7 +733,6 @@ function extractSpreadsheet(buffer) {
       const descVal = colIdx.description !== undefined ? (cells[colIdx.description] || '').trim() : ''
       const urlVal = colIdx.url !== undefined ? (cells[colIdx.url] || '').trim() : ''
       const additionalVal = colIdx.additional !== undefined ? (cells[colIdx.additional] || '').trim() : ''
-      // TASK 1: try explicit formula column first, then extract from description
       let formulaVal = colIdx.formula !== undefined ? (cells[colIdx.formula] || '').trim() : ''
       if (!formulaVal && descVal) {
         const formulaPatterns = [
@@ -617,7 +763,6 @@ function extractSpreadsheet(buffer) {
         }
         if (additionalVal) synthesis += `. Additional Info: ${additionalVal}`
         if (urlVal) synthesis += `. URL: ${urlVal}`
-        // TASK 4: push as structured row object
         rows.push({
           text: synthesis,
           metadata: {
@@ -629,7 +774,6 @@ function extractSpreadsheet(buffer) {
             sourceSheet: sheetName,
           }
         })
-        // Add extra retrieval-friendly lines as separate rows
         if (formulaVal) {
           rows.push({
             text: `How to calculate ${nameVal}: ${formulaVal}`,
@@ -679,12 +823,13 @@ function extractSpreadsheet(buffer) {
   }
   return rows
 }
-// TASK 2: improved keyword scoring with formula-specific boosts
+// UPGRADE 3 + 4 + 5 + 10: Upgraded keywordSearch with strict word-boundary matching, exact metadata boost, negative penalty
 function keywordSearch(query, chunks, topK, intent, invertedIndex) {
   const subject = extractSubject(query)
   const subjectWords = subject.toLowerCase().split(/\s+/).filter(w => w.length > 1)
   const queryLower = normalizeQuery(query)
   const isMultiWord = subjectWords.length > 1
+  // UPGRADE 3: Use strict word-boundary regex instead of substring includes
   const subjectPhraseRegex = isMultiWord
     ? new RegExp(escapeRegex(subject.toLowerCase()), 'i')
     : new RegExp(`\\b${escapeRegex(subject.toLowerCase())}\\b`, 'i')
@@ -724,31 +869,39 @@ function keywordSearch(query, chunks, topK, intent, invertedIndex) {
         score += matched * 10
         if (text.includes(kws.join(' '))) score += 15
       } else {
+        // UPGRADE 3: strict word-boundary phrase match
         const phraseFound = subjectPhraseRegex.test(c.text || '')
         if (phraseFound) {
           score += subjectWords.length * 6
           if (new RegExp(`\\|\\s*${escapeRegex(subject.toLowerCase())}\\s*\\|`, 'i').test(c.text || '')) score += subjectWords.length * 4
-          if (new RegExp(`${escapeRegex(subject.toLowerCase())}\\s*(is defined as|is calculated as|formula:)`, 'i').test(c.text || '')) score += subjectWords.length * 8
+          if (new RegExp(`\\b${escapeRegex(subject.toLowerCase())}\\b[\\s\\S]{0,30}(is defined as|is calculated as|formula:)`, 'i').test(c.text || '')) score += subjectWords.length * 8
         }
+        // UPGRADE 3: word-boundary individual word matching
         const wordCoverage = subjectWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(c.text || '')).length
         score += wordCoverage * 2
-        if (text.includes(queryLower)) score += 3
-        if (text.includes(subject.toLowerCase())) score += 4
-        // TASK 2: formula-specific scoring boosts
+        if (new RegExp(`\\b${escapeRegex(queryLower)}\\b`, 'i').test(c.text || '')) score += 3
+        if (subjectPhraseRegex.test(c.text || '')) score += 4
         if (intent === 'calculation') {
-          if (text.includes('formula')) score += 15
-          if (text.includes('calculated as')) score += 10
-          if (text.includes('computed as')) score += 10
+          if (/\bformula\b/i.test(text)) score += 15
+          if (/\bcalculated as\b/i.test(text)) score += 10
+          if (/\bcomputed as\b/i.test(text)) score += 10
           if (text.includes('=')) score += 8
           if (text.includes('/')) score += 5
-          if (text.includes('how to calculate')) score += 12
-          if (text.includes('formula for')) score += 12
+          if (/\bhow to calculate\b/i.test(text)) score += 12
+          if (/\bformula for\b/i.test(text)) score += 12
         }
-        // metadata boost: if chunk has formula metadata and subject matches measure
-        if (c.metadata && c.metadata.formula) {
-          const measureLower = (c.metadata.measure || '').toLowerCase()
-          if (subjectWords.some(w => measureLower.includes(w))) score += 10
+        // UPGRADE 4: Exact metadata measure match gets dominant score boost
+        if (c.metadata && c.metadata.measure) {
+          const measureLower = (c.metadata.measure || '').toLowerCase().trim()
+          if (measureLower === subject.toLowerCase().trim()) {
+            score += 100
+          } else if (subjectWords.some(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(measureLower))) {
+            score += 10
+          }
         }
+        // UPGRADE 5: Apply negative penalty for contradictory terms
+        const penalty = computeNegativePenalty(subject, c.text || '')
+        score -= penalty
       }
       return { ...c, _score: score }
     })
@@ -776,36 +929,44 @@ function relaxedKeywordSearch(query, chunks, topK, invertedIndex) {
   return source
     .map(c => {
       const text = (c.text || '').toLowerCase()
-      const matched = uniqueWords.filter(w => text.includes(w)).length
-      const subjectMatch = subject.length > 2 && text.includes(subject.toLowerCase()) ? 5 : 0
-      // metadata measure match boost
+      // UPGRADE 3: Use word-boundary matching in relaxed search too
+      const matched = uniqueWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(text)).length
+      const subjectMatch = subject.length > 2 && new RegExp(`\\b${escapeRegex(subject.toLowerCase())}\\b`, 'i').test(text) ? 5 : 0
       let metaBoost = 0
       if (c.metadata && c.metadata.measure) {
         const ml = c.metadata.measure.toLowerCase()
-        const subjectMatched = uniqueWords.filter(w => ml.includes(w)).length
-        metaBoost = subjectMatched * 3
+        // UPGRADE 4: Exact match in relaxed search also gets big boost
+        if (ml === subject.toLowerCase().trim()) {
+          metaBoost += 50
+        } else {
+          const subjectMatched = uniqueWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(ml)).length
+          metaBoost = subjectMatched * 3
+        }
       }
-      return { ...c, _score: matched + subjectMatch + metaBoost }
+      const penalty = computeNegativePenalty(subject, c.text || '')
+      return { ...c, _score: Math.max(0, matched + subjectMatch + metaBoost - penalty) }
     })
     .filter(c => c._score > 0)
     .sort((a, b) => b._score - a._score)
     .slice(0, topK)
 }
-// TASK 6: increase retrieval depth to 20
+// UPGRADE 7 + 8: Increase MAX_HITS to 50, add reranker pipeline
 async function retrieveChunks(query, chunks, topK, invertedIndex) {
   const intent = detectQueryIntent(query)
   const normalizedQuery = normalizeQuery(query).replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
-  const MAX_HITS = 20
+  // UPGRADE 7: MAX_HITS now 50
+  const MAX_HITS = MAX_HITS_GLOBAL
   if (intent === 'all_urls') {
     return chunks.filter(c => /https?:\/\/\S+/.test(c.text || '')).slice(0, 100)
   }
   const candidates = keywordSearch(normalizedQuery, chunks, Math.min(150, chunks.length), intent, invertedIndex)
   const pool = candidates.length > 0 ? candidates : chunks.slice(0, 150)
   const topScore = pool[0]?._score || 0
-  if (topScore >= 6) return pool.slice(0, Math.min(topK, MAX_HITS))
-  if ((intent === 'definition' || intent === 'calculation') && topScore >= 3) return pool.slice(0, Math.min(topK, MAX_HITS))
-  if (intent === 'url_lookup' && pool.length > 0) return pool.slice(0, Math.min(topK, 6))
-  if (AZURE_EMBED_ENDPOINT && AZURE_EMBED_KEY) {
+  let topCandidates = []
+  if (topScore >= 6) topCandidates = pool.slice(0, Math.min(MAX_HITS, pool.length))
+  else if ((intent === 'definition' || intent === 'calculation') && topScore >= 3) topCandidates = pool.slice(0, Math.min(MAX_HITS, pool.length))
+  else if (intent === 'url_lookup' && pool.length > 0) return pool.slice(0, Math.min(topK, 6))
+  if (topCandidates.length === 0 && AZURE_EMBED_ENDPOINT && AZURE_EMBED_KEY) {
     try {
       const queryVec = await embedQueryAzure(normalizedQuery)
       if (queryVec) {
@@ -825,15 +986,25 @@ async function retrieveChunks(query, chunks, topK, invertedIndex) {
           ...c,
           _score: (typeof c._score === 'number' ? c._score / maxKeyword : 0) * weight.keyword,
         }))
-        const result = [...scored, ...remainder].sort((a, b) => b._score - a._score).slice(0, Math.min(topK, MAX_HITS))
-        if (result.length > 0) return result
+        const result = [...scored, ...remainder].sort((a, b) => b._score - a._score).slice(0, Math.min(MAX_HITS, MAX_HITS_GLOBAL))
+        if (result.length > 0) topCandidates = result
       }
     } catch (err) {
       console.warn('[retrieveChunks] Embedding failed, using keyword fallback:', err.message)
     }
   }
-  if (pool.length > 0) return pool.slice(0, Math.min(topK, MAX_HITS))
-  return relaxedKeywordSearch(normalizedQuery, chunks, Math.min(topK * 2, 32), invertedIndex).slice(0, Math.min(topK, MAX_HITS))
+  if (topCandidates.length === 0 && pool.length > 0) {
+    topCandidates = pool.slice(0, Math.min(MAX_HITS, pool.length))
+  }
+  if (topCandidates.length === 0) {
+    topCandidates = relaxedKeywordSearch(normalizedQuery, chunks, Math.min(topK * 2, 64), invertedIndex).slice(0, Math.min(topK, MAX_HITS))
+  }
+  // UPGRADE 8: Cross-encoder reranker pipeline — top 50 → reranker → top topK
+  if (RERANKER_ENDPOINT && topCandidates.length > 1) {
+    const reranked = await rerankChunks(normalizedQuery, topCandidates)
+    return reranked.slice(0, Math.min(topK, 5))
+  }
+  return topCandidates.slice(0, Math.min(topK, MAX_HITS))
 }
 function buildContext(hits) {
   const seen = new Set()
@@ -927,7 +1098,6 @@ function extractAllUrlsFromChunks(chunks) {
   }
   return results
 }
-// TASK 5: enhanced fallback formula extraction
 function buildFallbackAnswer(query, hits) {
   if (!hits || hits.length === 0) return "I could not find relevant information about this in your documents."
   const intent = detectQueryIntent(query)
@@ -959,11 +1129,11 @@ function buildFallbackAnswer(query, hits) {
     }
     return "I could not find a matching URL in your documents."
   }
-  // Check metadata first (structured spreadsheet rows)
   for (const h of hits) {
     if (h.metadata && h.metadata.measure) {
       const measureLower = h.metadata.measure.toLowerCase()
-      if (measureLower.includes(subjectLower) || subjectLower.includes(measureLower)) {
+      // UPGRADE 3: strict word-boundary comparison
+      if (measureLower === subjectLower || new RegExp(`\\b${escapeRegex(subjectLower)}\\b`, 'i').test(measureLower) || new RegExp(`\\b${escapeRegex(measureLower)}\\b`, 'i').test(subjectLower)) {
         const cap = capFirst(h.metadata.measure)
         let answer = `**${cap}**`
         if (h.metadata.description) answer += ` is defined as: ${h.metadata.description}`
@@ -971,7 +1141,6 @@ function buildFallbackAnswer(query, hits) {
           answer += `\n\n**Formula:** ${h.metadata.formula}`
           if (!answer.endsWith('.')) answer += '.'
         } else if (intent === 'calculation') {
-          // Try extracting formula from description
           const extracted = extractFormulaFromText(h.metadata.description)
           if (extracted) {
             answer += `\n\n**Formula:** ${extracted}`
@@ -993,7 +1162,6 @@ function buildFallbackAnswer(query, hits) {
       const desc = trimToCompleteSentence((m[1] || '').trim(), 600)
       let formula = (m[2] || '').trim().slice(0, 400)
       const additional = (m[3] || '').trim().slice(0, 300)
-      // TASK 5: if no explicit formula, try smart extraction from desc
       if (!formula) formula = extractFormulaFromText(desc)
       const cap = capFirst(subject)
       let answer = `**${cap}** is ${desc}`
@@ -1020,10 +1188,9 @@ function buildFallbackAnswer(query, hits) {
         return ensureSinglePeriod(`**${cap}**\n\n**Formula:** ${trimToCompleteSentence(m[1].trim(), 500)}.`)
       }
     }
-    // TASK 5: try smart formula patterns in any hit text
     for (const h of hits) {
       const text = h.text || ''
-      if (!text.toLowerCase().includes(subjectLower)) continue
+      if (!new RegExp(`\\b${escapeRegex(subjectLower)}\\b`, 'i').test(text)) continue
       const extracted = extractFormulaFromText(text)
       if (extracted) {
         const cap = capFirst(subject)
@@ -1034,7 +1201,8 @@ function buildFallbackAnswer(query, hits) {
   const matchingLines = []
   for (const h of hits) {
     for (const line of (h.text || '').split('\n')) {
-      if (!line.toLowerCase().includes(subjectLower)) continue
+      // UPGRADE 3: strict word-boundary match in fallback line search
+      if (!new RegExp(`\\b${escapeRegex(subjectLower)}\\b`, 'i').test(line)) continue
       if (line.trim().length <= 20) continue
       if ((line.match(/\|/g) || []).length > 2) continue
       if (/^===\s*Sheet:/.test(line.trim())) continue
@@ -1131,7 +1299,7 @@ async function extractTextFromBuffer(buffer, fileName) {
   if (ext === '.pdf') return extractPdf(buffer)
   if (ext === '.docx' || ext === '.doc') return extractWord(buffer)
   if (ext === '.odt' || ext === '.rtf') return extractOffice(buffer)
-  if (['.xlsx', '.xls', '.ods'].includes(ext)) return null // handled separately as structured rows
+  if (['.xlsx', '.xls', '.ods'].includes(ext)) return null
   if (ext === '.csv') return extractCsv(buffer, ',')
   if (ext === '.tsv') return extractCsv(buffer, '\t')
   if (ext === '.pptx' || ext === '.ppt') return extractOffice(buffer)
@@ -1148,7 +1316,6 @@ async function extractTextFromBuffer(buffer, fileName) {
   if (plainText.has(ext)) return buffer.toString('utf-8')
   return ''
 }
-// TASK 4: chunkText preserves metadata from structured spreadsheet rows
 function chunkText(text, sourceFile) {
   const chunks = []
   let chunkIndex = 0
@@ -1224,7 +1391,6 @@ async function _doLoadChunks(clientId) {
         const fileName = blobName.split('/').pop()
         const ext = ('.' + fileName.split('.').pop()).toLowerCase()
         const buffer = await downloadBlobAsBuffer(containerClient, blobName)
-        // TASK 4: spreadsheets get structured row chunking
         if (['.xlsx', '.xls', '.ods'].includes(ext)) {
           const structuredRows = extractSpreadsheet(buffer)
           return structuredRows.map((row, idx) => ({
@@ -1386,11 +1552,13 @@ app.get('/health', (req, res) => res.json({
   ok: true,
   service: 'ask-data',
   engines: { primary: ASKDATA_ENDPOINT ? 'configured' : 'missing', fallback: ASKDATA2_ENDPOINT ? 'configured' : 'missing' },
-  embeddings: AZURE_EMBED_ENDPOINT ? 'azure' : 'keyword-only',
+  embeddings: AZURE_EMBED_ENDPOINT ? `azure (${AZURE_EMBED_MODEL})` : 'keyword-only',
+  reranker: RERANKER_ENDPOINT ? 'configured' : 'disabled',
   chunkCacheSize: CHUNK_CACHE.size,
   responseCacheSize: RESPONSE_CACHE.size,
   primaryCircuitOpen: askedataCircuitOpen(),
   primaryFailures: askedataFailures,
+  maxHits: MAX_HITS_GLOBAL,
 }))
 app.post('/client/verify', async (req, res) => {
   try {
@@ -1601,6 +1769,13 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       if (chunks.length === 0) {
         return { answer: 'No documents found for your account. Please ensure your documents have been ingested first.', sources: [], conversationId: conversationId || null, client: { clientId, name } }
       }
+      // UPGRADE 1 + 9: Apply fuzzy correction and query rewriting BEFORE retrieval
+      let processedQuery = query.trim()
+      processedQuery = fuzzyCorrectQuery(processedQuery, chunks)
+      processedQuery = await rewriteQuery(processedQuery)
+      if (processedQuery !== query.trim()) {
+        console.log(`[preprocessing] Original: "${query.trim()}" → Processed: "${processedQuery}"`)
+      }
       if (intent === 'all_urls') {
         const urlChunks = chunks.filter(c => /https?:\/\/\S+/.test(c.text || ''))
         const urlEntries = extractAllUrlsFromChunks(urlChunks)
@@ -1628,9 +1803,10 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         } catch (saveErr) { console.warn('[chat/message] Failed to save conversation:', saveErr.message) }
         return { answer, sources, conversationId: activeConversationId, client: { clientId, name } }
       }
-      let hits = await retrieveChunks(query.trim(), chunks, Math.min(topK, 20), invertedIndex)
-      if (hits.length === 0) hits = relaxedKeywordSearch(query.trim(), chunks, 24, invertedIndex)
-      console.log(`[chat/message] "${query.slice(0, 60)}" → intent=${intent}, subject="${extractSubject(query)}", hits=${hits.length}, topScore=${hits[0]?._score?.toFixed(2) || 0}`)
+      // UPGRADE 10: Retrieval uses processedQuery for better accuracy
+      let hits = await retrieveChunks(processedQuery, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndex)
+      if (hits.length === 0) hits = relaxedKeywordSearch(processedQuery, chunks, 64, invertedIndex)
+      console.log(`[chat/message] "${query.slice(0, 60)}" → intent=${intent}, subject="${extractSubject(processedQuery)}", hits=${hits.length}, topScore=${hits[0]?._score?.toFixed(2) || 0}`)
       if (hits.length === 0) {
         return { answer: "I could not find relevant information about this in your documents. Try rephrasing your question.", sources: [], conversationId: conversationId || null, client: { clientId, name } }
       }
@@ -1638,7 +1814,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
       if (intent !== 'url_lookup') {
         try {
           rawAnswer = await Promise.race([
-            generateAnswer(query.trim(), hits, intent),
+            generateAnswer(processedQuery, hits, intent),
             new Promise((_, reject) => setTimeout(() => reject(new Error('All engines timed out')), 55000)),
           ])
         } catch (err) {
@@ -1646,7 +1822,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
         }
       }
       const isBlank = !rawAnswer || rawAnswer.trim().length < 15
-      const answer = isBlank ? buildFallbackAnswer(query.trim(), hits) : cleanAnswer(rawAnswer)
+      const answer = isBlank ? buildFallbackAnswer(processedQuery, hits) : cleanAnswer(rawAnswer)
       if (isBlank) console.warn(`[chat/message] Blank from all engines, used rule-based fallback for: "${query.slice(0, 60)}"`)
       const sources = hits.map(h => ({
         source_file: h.source_file || 'unknown',
@@ -1694,6 +1870,7 @@ const PORT = process.env.PORT || 4000
 app.listen(PORT, () => {
   console.log(`Service running on port ${PORT}`)
   console.log(`ASKDATA: ${ASKDATA_ENDPOINT ? 'configured' : 'MISSING'} | ASKDATA2: ${ASKDATA2_ENDPOINT ? 'configured' : 'missing'}`)
+  console.log(`Embedding model: ${AZURE_EMBED_MODEL} | Reranker: ${RERANKER_ENDPOINT ? 'configured' : 'disabled'} | MAX_HITS: ${MAX_HITS_GLOBAL}`)
   startApiKeyHealthChecker()
   warmupChunkCaches()
 })
