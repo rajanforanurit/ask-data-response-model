@@ -1402,29 +1402,38 @@ if (answerB && !answerB.includes('could not find')) parts.push(`**${capFirst(top
 else parts.push(`**${capFirst(topicB)}:** I could not find information about "${capFirst(topicB)}" in your documents.`)
 return parts.join('\n\n')
 }
+
 async function handleMultiTopicQuery(topics, mode, chunks, topK, invertedIndex) {
-const results = await Promise.all(
-topics.map(async (topic) => {
-const answer = await generateAnswerForTopic(topic, chunks, topK, invertedIndex)
-return { topic, answer }
-})
-)
-const parts = results.map(({ topic, answer }) => {
-const cap = capFirst(topic)
-if (!answer || answer.includes('could not find') || answer.includes('not present')) {
-return `**${cap}:**\nI could not find information about "${cap}" in your documents.`
-}
-return `**${cap}:**\n${answer}`
-})
-if (mode === 'comparison' && results.length === 2) {
-const [a, b] = results
-const bothFound = a.answer && !a.answer.includes('could not find') && b.answer && !b.answer.includes('could not find')
-const comparisonNote = bothFound
-? `**Key Difference:**\n${capFirst(a.topic)} tracks a raw count of applications, while ${capFirst(b.topic)} measures the percentage approved.`
-: ''
-return parts.join('\n\n') + (comparisonNote ? '\n\n' + comparisonNote : '')
-}
-return parts.join('\n\n')
+  const results = await Promise.all(
+    topics.map(async (topic) => {
+      const answer = await generateAnswerForTopic(topic, chunks, topK, invertedIndex)
+      return { topic, answer }
+    })
+  )
+  const parts = results.map(({ topic, answer }) => {
+    const cap = capFirst(topic)
+    if (!answer || answer.includes('could not find') || answer.includes('not present')) {
+      return `**${cap}:**\nI could not find information about "${cap}" in your documents.`
+    }
+    return `**${cap}:**\n${answer}`
+  })
+  if (mode === 'comparison' && results.length === 2) {
+    const [a, b] = results
+    const bothFound =
+      a.answer && !a.answer.includes('could not find') &&
+      b.answer && !b.answer.includes('could not find')
+
+    if (bothFound) {
+      const comparisonAnswer = await generateComparisonAnswer(
+        a.topic, b.topic, chunks, topK, invertedIndex
+      )
+      if (comparisonAnswer && !comparisonAnswer.includes('could not find')) {
+        return comparisonAnswer
+      }
+    }
+    return parts.join('\n\n')
+  }
+  return parts.join('\n\n')
 })
 )
 return results.map(({ topic, answer }) => {
