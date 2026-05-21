@@ -477,10 +477,12 @@ if (w.length >= 3 && !stopWords.has(w)) vocab.add(w)
 }
 return [...vocab]
 }
-// fuzzyCorrectQuery: corrects domain-specific words using combined Levenshtein + string-similarity scoring.
-// Threshold lowered to 0.74 so partial typos like "efftive", "applicton" are caught.
-// Words shorter than 4 chars or already in vocabulary are skipped for performance.
-// Question/stop words are NOT corrected here — they are handled by applyTypos() upstream.
+const DOMAIN_SHORT_SAFELIST = new Set([
+'count', 'rate', 'rent', 'cost', 'date', 'type', 'name', 'unit', 'term', 'area',
+'base', 'gross', 'net', 'avg', 'sum', 'min', 'max', 'ytd', 'mtd', 'per', 'fee',
+'tax', 'due', 'paid', 'void', 'open', 'loss', 'gain', 'flow', 'days', 'beds',
+'bath', 'sqft', 'tier', 'band', 'code', 'flag', 'rank', 'sort', 'key', 'ref',
+])
 function fuzzyCorrectQuery(query, chunks) {
 if (!chunks || chunks.length === 0) return query
 const vocabulary = buildVocabulary(chunks)
@@ -489,10 +491,10 @@ const stopWords = new Set(['what', 'is', 'are', 'how', 'the', 'a', 'an', 'of', '
 const words = query.split(/\s+/)
 const corrected = words.map(word => {
 const wordLower = word.toLowerCase()
-if (wordLower.length < 4) return word
 if (stopWords.has(wordLower)) return word
+if (DOMAIN_SHORT_SAFELIST.has(wordLower)) return word
+if (wordLower.length < 6) return word
 if (vocabulary.includes(wordLower)) return word
-// Combined scoring: 60% string-similarity (trigram) + 40% levenshtein similarity
 const { bestMatch } = stringSimilarity.findBestMatch(wordLower, vocabulary)
 const levSim = levenshteinSimilarity(wordLower, bestMatch.target)
 const combinedScore = bestMatch.rating * 0.6 + levSim * 0.4
@@ -504,9 +506,6 @@ return word
 })
 return corrected.join(' ')
 }
-// needsQueryRewrite: decides whether to invoke the LLM-based ASKDATA2 rewriter.
-// Typo correction is now handled locally (applyTypos + fuzzyCorrectQuery) and runs on EVERY query.
-// This function only gates the expensive LLM rewrite call.
 function needsQueryRewrite(query) {
 const trimmed = query.trim()
 const words = trimmed.split(/\s+/).filter(Boolean)
