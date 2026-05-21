@@ -128,10 +128,6 @@ q = q.replace(pattern, canonical)
 }
 return q
 }
-// --- TYPO MAP: fast-path overrides for very common domain-specific misspellings ---
-// This is intentionally small. The heavy lifting is done by Levenshtein fuzzy matching
-// against the domain vocabulary in fuzzyCorrectQuery(). Add here only words whose
-// correct form would NOT be present in domain documents (e.g. question words like "ehat").
 const TYPO_MAP = {
 ehat: 'what',
 waht: 'what',
@@ -147,14 +143,11 @@ deifne: 'define',
 expain: 'explain',
 expalin: 'explain',
 explian: 'explain',
-waht: 'what',
 wht: 'what',
 shwo: 'show',
 lsit: 'list',
 lits: 'list',
 }
-// applyTypos: corrects question/stop words that would never appear in domain vocabulary
-// and therefore cannot be fixed by fuzzyCorrectQuery()'s domain-vocabulary matching.
 function applyTypos(query) {
 return query
 .split(/\s+/)
@@ -164,7 +157,6 @@ return TYPO_MAP[lower] !== undefined ? TYPO_MAP[lower] : w
 })
 .join(' ')
 }
-// levenshteinDistance: true edit distance used for smarter fuzzy correction
 function levenshteinDistance(a, b) {
 const m = a.length
 const n = b.length
@@ -177,7 +169,6 @@ else dp[i][j] = 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1])
 }
 return dp[m][n]
 }
-// levenshteinSimilarity: converts edit distance to 0-1 similarity score
 function levenshteinSimilarity(a, b) {
 if (!a && !b) return 1
 if (!a || !b) return 0
@@ -339,6 +330,42 @@ if (
 if (/\b(vs|versus|difference|compare|between)\b/.test(q)) return 'comparison'
 if (/^(show|list|find|get|fetch|give)\s+(me\s+)?|^how\s+many\s+/.test(q)) return 'lookup'
 return 'general'
+}
+function detectMultiTopicQuery(query) {
+const q = query.trim()
+const andSplitPatterns = [
+/^what\s+is\s+(.+?)\s+and\s+(.+?)[\s?]*$/i,
+/^what\s+are\s+(.+?)\s+and\s+(.+?)[\s?]*$/i,
+/^define\s+(.+?)\s+and\s+(.+?)[\s?]*$/i,
+/^explain\s+(.+?)\s+and\s+(.+?)[\s?]*$/i,
+/^tell\s+me\s+about\s+(.+?)\s+and\s+(.+?)[\s?]*$/i,
+/^(.+?)\s+and\s+(.+?)[\s?]*$/i,
+]
+const diffPatterns = [
+/^(?:what\s+is\s+the\s+)?difference\s+between\s+(.+?)\s+and\s+(.+?)[\s?]*$/i,
+/^compare\s+(.+?)\s+(?:vs\.?|versus|and)\s+(.+?)[\s?]*$/i,
+/^(.+?)\s+vs\.?\s+(.+?)[\s?]*$/i,
+]
+for (const p of diffPatterns) {
+const m = q.match(p)
+if (m) {
+const a = m[1].trim().replace(/^(what\s+is\s+|the\s+)/i, '').trim()
+const b = m[2].trim().replace(/^(what\s+is\s+|the\s+)/i, '').trim()
+if (a.length > 1 && b.length > 1) return { isMulti: true, topics: [a, b], mode: 'comparison' }
+}
+}
+for (const p of andSplitPatterns) {
+const m = q.match(p)
+if (m) {
+const a = m[1].trim().replace(/^(what\s+is\s+|what\s+are\s+|define\s+|the\s+)/i, '').trim()
+const b = m[2].trim().replace(/^(what\s+is\s+|what\s+are\s+|define\s+|the\s+)/i, '').trim()
+const stopWords = new Set(['is', 'are', 'was', 'were', 'it', 'this', 'that', 'its', 'my', 'your'])
+if (a.length > 1 && b.length > 1 && !stopWords.has(a.toLowerCase()) && !stopWords.has(b.toLowerCase())) {
+return { isMulti: true, topics: [a, b], mode: 'multi_definition' }
+}
+}
+}
+return { isMulti: false, topics: [], mode: null }
 }
 function extractSubject(query) {
 const normalized = applySynonyms(query)
@@ -512,7 +539,6 @@ const words = trimmed.split(/\s+/).filter(Boolean)
 if (words.length <= 2) return true
 if (/[^\x00-\x7F]/.test(trimmed) && words.length < 5) return true
 if (/(.)\1{3,}/.test(trimmed)) return true
-// Expanded typo patterns — catches common misspellings that survive applyTypos + fuzzyCorrect
 const commonTypos = /\b(ocupan|occup[ae]ncy|occupncy|appl?ic|applicton|applcation|leas[ei]|tennat|tentant|vacnt|vacanc|porperty|proprty|reveneu|revenu[^e]|anuall|anual|montly|mounthly|efftive|efective|efftiv|ehat|difine|definr)\b/i
 if (commonTypos.test(trimmed)) return true
 if (words.length < 4 && !/\b(what|how|define|explain|formula|calculate|list|show|find|url|link)\b/i.test(trimmed)) return true
@@ -562,8 +588,6 @@ console.warn(`[rewriteQueryWithAskdata2] Bypassed (${err.message}), using origin
 return query
 }
 }
-// preprocessQuery: LLM-based rewrite gate. Local corrections (applyTypos, fuzzyCorrect)
-// run before this and are NOT gated. This only controls the expensive LLM call.
 async function preprocessQuery(query) {
 if (!needsQueryRewrite(query)) return query
 return rewriteQueryWithAskdata2(query)
@@ -1038,9 +1062,6 @@ return { ...c, _score: Math.max(0, matched + subjectMatch + metaBoost - penalty)
 .sort((a, b) => b._score - a._score)
 .slice(0, topK)
 }
-// retrieveChunks: core retrieval with self-healing fallback.
-// If primary retrieval yields zero candidates, it retries with the fuzzy-corrected query.
-// The _isRetry flag prevents infinite recursion.
 async function retrieveChunks(query, chunks, topK, invertedIndex, _isRetry = false) {
 const intent = detectQueryIntent(query)
 const normalizedQuery = normalizeQuery(query).replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
@@ -1085,7 +1106,6 @@ console.warn('[retrieveChunks] Embedding failed, using keyword fallback:', err.m
 if (topCandidates.length === 0 && pool.length > 0) {
 topCandidates = pool.slice(0, Math.min(MAX_HITS, pool.length))
 }
-// Self-healing: if still no results and not already a retry, attempt with fuzzy-corrected query
 if (topCandidates.length === 0 && !_isRetry) {
 const corrected = fuzzyCorrectQuery(query, chunks)
 if (corrected.toLowerCase() !== query.toLowerCase()) {
@@ -1328,6 +1348,48 @@ return text
 }
 async function generateAnswer(query, hits, intent) {
 return callBestAvailableEngine(buildSystemPrompt(intent), buildUserMessage(query, hits, intent), 1024)
+}
+async function generateAnswerForTopic(topic, chunks, topK, invertedIndex) {
+const topicQuery = `what is ${topic}`
+let hits = await retrieveChunks(topicQuery, chunks, topK, invertedIndex)
+if (hits.length === 0) hits = relaxedKeywordSearch(topicQuery, chunks, 32, invertedIndex)
+if (hits.length === 0) return null
+const intent = 'definition'
+let rawAnswer = ''
+try {
+rawAnswer = await Promise.race([
+generateAnswer(topicQuery, hits, intent),
+new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 25000)),
+])
+} catch (err) {
+console.warn(`[generateAnswerForTopic] Engine failed for "${topic}": ${err.message}`)
+}
+const isBlank = !rawAnswer || rawAnswer.trim().length < 15
+return isBlank ? buildFallbackAnswer(topicQuery, hits, intent) : cleanAnswer(rawAnswer)
+}
+async function handleMultiTopicQuery(topics, mode, chunks, topK, invertedIndex) {
+const results = await Promise.all(
+topics.map(async (topic) => {
+const answer = await generateAnswerForTopic(topic, chunks, topK, invertedIndex)
+return { topic, answer }
+})
+)
+const parts = results.map(({ topic, answer }) => {
+const cap = capFirst(topic)
+if (!answer || answer.includes('could not find') || answer.includes('not present')) {
+return `**${cap}:** I could not find information about "${cap}" in your documents.`
+}
+return `**${cap}:** ${answer}`
+})
+if (mode === 'comparison' && results.length === 2) {
+const [a, b] = results
+const bothFound = a.answer && !a.answer.includes('could not find') && b.answer && !b.answer.includes('could not find')
+const comparisonNote = bothFound
+? `\n\n**Key Difference:** ${capFirst(a.topic)} and ${capFirst(b.topic)} are distinct metrics — review their definitions above for the specific distinction.`
+: ''
+return parts.join('\n\n') + comparisonNote
+}
+return parts.join('\n\n')
 }
 async function extractPdf(buffer) {
 const r = await pdfParse(buffer)
@@ -1851,32 +1913,22 @@ const { chunks, invertedIndex } = await loadChunksForClient(clientId)
 if (chunks.length === 0) {
 return { answer: 'No documents found for your account. Please ensure your documents have been ingested first.', sources: [], conversationId: conversationId || null, client: { clientId, name } }
 }
-// --- PRODUCTION QUERY NORMALIZATION PIPELINE ---
-// Step 1: Fix question/stop-word typos (ehat→what, difine→define) via static fast-path map.
-// These words won't appear in domain vocabulary so fuzzy matching can't fix them.
 let processedQuery = applyTypos(query.trim())
 console.log(`[QueryPipeline] Original: "${query.trim()}"`)
 if (processedQuery !== query.trim()) {
 console.log(`[QueryPipeline] After typos: "${processedQuery}"`)
 }
-// Step 2: Normalize domain synonyms (app count → application count, occ rate → occupancy rate).
 processedQuery = applySynonyms(processedQuery)
-// Step 3: Fuzzy-correct domain-specific words against vocabulary extracted from loaded chunks.
-// Runs on EVERY query unconditionally. Uses combined Levenshtein + trigram scoring at threshold 0.74.
-// Fixes: "efftive"→"effective", "applicton"→"application", "ocupancy"→"occupancy", etc.
 const fuzzyResult = fuzzyCorrectQuery(processedQuery, chunks)
 if (fuzzyResult !== processedQuery) {
 console.log(`[QueryPipeline] After fuzzy: "${fuzzyResult}"`)
 }
 processedQuery = fuzzyResult
-// Step 4: LLM-based rewrite via ASKDATA2 — only triggered when needsQueryRewrite() is true.
-// Handles: structural ambiguity, non-English input, extreme abbreviations.
 const rewritten = await preprocessQuery(processedQuery)
 if (rewritten !== processedQuery) {
 console.log(`[QueryPipeline] After rewrite: "${rewritten}"`)
 }
 processedQuery = rewritten
-// --- END PIPELINE ---
 if (intent === 'all_urls') {
 const urlChunks = chunks.filter(c => /https?:\/\/\S+/.test(c.text || ''))
 const urlEntries = extractAllUrlsFromChunks(urlChunks)
@@ -1889,6 +1941,33 @@ const col = chatDatabase.collection('conversations')
 const now = new Date()
 const userMsg = { role: 'user', content: query.trim(), timestamp: now }
 const assistantMsg = { role: 'assistant', content: answer, sources: sources.map(s => ({ source_file: s.source_file, score: s.score })), timestamp: now }
+if (activeConversationId) {
+const updated = await col.findOneAndUpdate(
+{ _id: new ObjectId(activeConversationId), clientId },
+{ $push: { messages: { $each: [userMsg, assistantMsg] } }, $set: { updatedAt: now } },
+{ returnDocument: 'after', projection: { _id: 1 } }
+)
+if (!updated) activeConversationId = null
+}
+if (!activeConversationId) {
+const result = await col.insertOne({ clientId, title: generateTitle(query.trim()), messages: [userMsg, assistantMsg], createdAt: now, updatedAt: now })
+activeConversationId = result.insertedId.toString()
+}
+} catch (saveErr) { console.warn('[chat/message] Failed to save conversation:', saveErr.message) }
+return { answer, sources, conversationId: activeConversationId, client: { clientId, name } }
+}
+const multiTopicCheck = detectMultiTopicQuery(processedQuery)
+if (multiTopicCheck.isMulti) {
+console.log(`[chat/message] Multi-topic detected: ${JSON.stringify(multiTopicCheck.topics)} mode=${multiTopicCheck.mode}`)
+const answer = await handleMultiTopicQuery(multiTopicCheck.topics, multiTopicCheck.mode, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndex)
+const sources = []
+let activeConversationId = conversationId || null
+try {
+const chatDatabase = await getChatDb()
+const col = chatDatabase.collection('conversations')
+const now = new Date()
+const userMsg = { role: 'user', content: query.trim(), timestamp: now }
+const assistantMsg = { role: 'assistant', content: answer, sources: [], timestamp: now }
 if (activeConversationId) {
 const updated = await col.findOneAndUpdate(
 { _id: new ObjectId(activeConversationId), clientId },
