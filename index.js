@@ -1457,8 +1457,6 @@ Now write the comparison strictly in this format:
         return cleanAnswer(rawAnswer)
       }
     }
-
-    // Rule-based fallback only — no generateComparisonAnswer to avoid duplication
     const fallbackA = buildFallbackAnswer(`what is ${topics[0]}`, hitsA, 'definition')
     const fallbackB = buildFallbackAnswer(`what is ${topics[1]}`, hitsB, 'definition')
     const parts = []
@@ -1470,8 +1468,6 @@ Now write the comparison strictly in this format:
       : `**${capFirst(topics[1])}:** I could not find information about "${capFirst(topics[1])}" in your documents.`)
     return parts.join('\n\n')
   }
-
-  // Non-comparison multi-topic (e.g. "what is X and Y")
   const results = await Promise.all(
     topics.map(async (topic) => {
       const topicQuery = `what is ${topic}`
@@ -1490,7 +1486,6 @@ Now write the comparison strictly in this format:
       return { topic, answer }
     })
   )
-
   return results.map(({ topic, answer }) => {
     const cap = capFirst(topic)
     if (!answer || answer.includes('could not find') || answer.includes('not present')) {
@@ -1498,16 +1493,6 @@ Now write the comparison strictly in this format:
     }
     return `**${cap}:**\n${answer}`
   }).join('\n\n')
-}
-          )
-)
-return results.map(({ topic, answer }) => {
-const cap = capFirst(topic)
-if (!answer || answer.includes('could not find') || answer.includes('not present')) {
-return `**${cap}:**\nI could not find information about "${cap}" in your documents.`
-}
-return `**${cap}:**\n${answer}`
-}).join('\n\n')
 }
 async function extractPdf(buffer) {
 const r = await pdfParse(buffer)
