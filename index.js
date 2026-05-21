@@ -61,7 +61,7 @@ const ASKDATA2_ENDPOINT = process.env.ASKDATA2_ENDPOINT || ''
 const ASKDATA2_KEY = process.env.ASKDATA2_KEY || ''
 const ASKDATA2_MODEL = process.env.ASKDATA2_MODEL || 'ASKDATA2'
 const ASKDATA2_TIMEOUT_MS = parseInt(process.env.ASKDATA2_TIMEOUT_MS || '30000', 10)
-const ASKDATA2_REWRITE_TIMEOUT_MS = parseInt(process.env.ASKDATA2_REWRITE_TIMEOUT_MS || '5000', 10)
+const ASKDATA2_REWRITE_TIMEOUT_MS = parseInt(process.env.ASKDATA2_REWRITE_TIMEOUT_MS || '8000', 10)
 const AZURE_EMBED_ENDPOINT = process.env.AZURE_EMBED_ENDPOINT || ''
 const AZURE_EMBED_KEY = process.env.AZURE_EMBED_KEY || ''
 const AZURE_EMBED_MODEL = process.env.AZURE_EMBED_MODEL || 'text-embedding-3-small'
@@ -127,6 +127,62 @@ for (const { pattern, canonical } of SYNONYM_MAP) {
 q = q.replace(pattern, canonical)
 }
 return q
+}
+// --- TYPO MAP: fast-path overrides for very common domain-specific misspellings ---
+// This is intentionally small. The heavy lifting is done by Levenshtein fuzzy matching
+// against the domain vocabulary in fuzzyCorrectQuery(). Add here only words whose
+// correct form would NOT be present in domain documents (e.g. question words like "ehat").
+const TYPO_MAP = {
+ehat: 'what',
+waht: 'what',
+whta: 'what',
+whar: 'what',
+hwo: 'how',
+hoe: 'how',
+difine: 'define',
+definr: 'define',
+defien: 'define',
+defne: 'define',
+deifne: 'define',
+expain: 'explain',
+expalin: 'explain',
+explian: 'explain',
+waht: 'what',
+wht: 'what',
+shwo: 'show',
+lsit: 'list',
+lits: 'list',
+}
+// applyTypos: corrects question/stop words that would never appear in domain vocabulary
+// and therefore cannot be fixed by fuzzyCorrectQuery()'s domain-vocabulary matching.
+function applyTypos(query) {
+return query
+.split(/\s+/)
+.map(w => {
+const lower = w.toLowerCase()
+return TYPO_MAP[lower] !== undefined ? TYPO_MAP[lower] : w
+})
+.join(' ')
+}
+// levenshteinDistance: true edit distance used for smarter fuzzy correction
+function levenshteinDistance(a, b) {
+const m = a.length
+const n = b.length
+const dp = Array.from({ length: m + 1 }, (_, i) => Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0)))
+for (let i = 1; i <= m; i++) {
+for (let j = 1; j <= n; j++) {
+if (a[i - 1] === b[j - 1]) dp[i][j] = dp[i - 1][j - 1]
+else dp[i][j] = 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1])
+}
+}
+return dp[m][n]
+}
+// levenshteinSimilarity: converts edit distance to 0-1 similarity score
+function levenshteinSimilarity(a, b) {
+if (!a && !b) return 1
+if (!a || !b) return 0
+const dist = levenshteinDistance(a.toLowerCase(), b.toLowerCase())
+return 1 - dist / Math.max(a.length, b.length)
 }
 function normalizeQueryForCache(query) {
 return applySynonyms(query)
@@ -421,31 +477,44 @@ if (w.length >= 3 && !stopWords.has(w)) vocab.add(w)
 }
 return [...vocab]
 }
+// fuzzyCorrectQuery: corrects domain-specific words using combined Levenshtein + string-similarity scoring.
+// Threshold lowered to 0.74 so partial typos like "efftive", "applicton" are caught.
+// Words shorter than 4 chars or already in vocabulary are skipped for performance.
+// Question/stop words are NOT corrected here — they are handled by applyTypos() upstream.
 function fuzzyCorrectQuery(query, chunks) {
 if (!chunks || chunks.length === 0) return query
 const vocabulary = buildVocabulary(chunks)
 if (vocabulary.length === 0) return query
+const stopWords = new Set(['what', 'is', 'are', 'how', 'the', 'a', 'an', 'of', 'in', 'for', 'to', 'at', 'by', 'as', 'on', 'or', 'and', 'define', 'explain', 'show', 'find', 'get', 'list', 'give'])
 const words = query.split(/\s+/)
 const corrected = words.map(word => {
 const wordLower = word.toLowerCase()
 if (wordLower.length < 4) return word
+if (stopWords.has(wordLower)) return word
 if (vocabulary.includes(wordLower)) return word
+// Combined scoring: 60% string-similarity (trigram) + 40% levenshtein similarity
 const { bestMatch } = stringSimilarity.findBestMatch(wordLower, vocabulary)
-if (bestMatch.rating >= 0.82 && bestMatch.target !== wordLower) {
-console.log(`[fuzzyCorrect] "${word}" → "${bestMatch.target}" (score: ${bestMatch.rating.toFixed(3)})`)
+const levSim = levenshteinSimilarity(wordLower, bestMatch.target)
+const combinedScore = bestMatch.rating * 0.6 + levSim * 0.4
+if (combinedScore >= 0.72 && bestMatch.target !== wordLower) {
+console.log(`[fuzzyCorrect] "${word}" → "${bestMatch.target}" (combined: ${combinedScore.toFixed(3)}, trigram: ${bestMatch.rating.toFixed(3)}, lev: ${levSim.toFixed(3)})`)
 return bestMatch.target
 }
 return word
 })
 return corrected.join(' ')
 }
+// needsQueryRewrite: decides whether to invoke the LLM-based ASKDATA2 rewriter.
+// Typo correction is now handled locally (applyTypos + fuzzyCorrectQuery) and runs on EVERY query.
+// This function only gates the expensive LLM rewrite call.
 function needsQueryRewrite(query) {
 const trimmed = query.trim()
 const words = trimmed.split(/\s+/).filter(Boolean)
 if (words.length <= 2) return true
 if (/[^\x00-\x7F]/.test(trimmed) && words.length < 5) return true
 if (/(.)\1{3,}/.test(trimmed)) return true
-const commonTypos = /\b(ocupan|occup[ae]ncy|appl?ic|leas[ei]|tennat|tentant|vacnt|vacanc|porperty|proprty|reveneu|revenu[^e]|anuall|anual|montly|mounthly)\b/i
+// Expanded typo patterns — catches common misspellings that survive applyTypos + fuzzyCorrect
+const commonTypos = /\b(ocupan|occup[ae]ncy|occupncy|appl?ic|applicton|applcation|leas[ei]|tennat|tentant|vacnt|vacanc|porperty|proprty|reveneu|revenu[^e]|anuall|anual|montly|mounthly|efftive|efective|efftiv|ehat|difine|definr)\b/i
 if (commonTypos.test(trimmed)) return true
 if (words.length < 4 && !/\b(what|how|define|explain|formula|calculate|list|show|find|url|link)\b/i.test(trimmed)) return true
 const hasNoVerb = !/\b(is|are|was|were|what|how|why|when|where|who|define|explain|calculate|show|list|find|get|give|tell)\b/i.test(trimmed)
@@ -486,7 +555,7 @@ const data = await response.json()
 const rewritten = (data.choices?.[0]?.message?.content || '').trim().replace(/^["']|["']$/g, '').trim()
 if (!rewritten || rewritten.length < 3 || rewritten.length > query.length * 4) return query
 if (rewritten.toLowerCase() !== query.toLowerCase()) {
-console.log(`[rewriteQueryWithAskdata2] "${query}" → "${rewritten}"`)
+console.log(`[QueryPipeline] After rewrite: "${rewritten}"`)
 }
 return rewritten
 } catch (err) {
@@ -494,6 +563,8 @@ console.warn(`[rewriteQueryWithAskdata2] Bypassed (${err.message}), using origin
 return query
 }
 }
+// preprocessQuery: LLM-based rewrite gate. Local corrections (applyTypos, fuzzyCorrect)
+// run before this and are NOT gated. This only controls the expensive LLM call.
 async function preprocessQuery(query) {
 if (!needsQueryRewrite(query)) return query
 return rewriteQueryWithAskdata2(query)
@@ -968,7 +1039,10 @@ return { ...c, _score: Math.max(0, matched + subjectMatch + metaBoost - penalty)
 .sort((a, b) => b._score - a._score)
 .slice(0, topK)
 }
-async function retrieveChunks(query, chunks, topK, invertedIndex) {
+// retrieveChunks: core retrieval with self-healing fallback.
+// If primary retrieval yields zero candidates, it retries with the fuzzy-corrected query.
+// The _isRetry flag prevents infinite recursion.
+async function retrieveChunks(query, chunks, topK, invertedIndex, _isRetry = false) {
 const intent = detectQueryIntent(query)
 const normalizedQuery = normalizeQuery(query).replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
 const MAX_HITS = MAX_HITS_GLOBAL
@@ -1011,6 +1085,14 @@ console.warn('[retrieveChunks] Embedding failed, using keyword fallback:', err.m
 }
 if (topCandidates.length === 0 && pool.length > 0) {
 topCandidates = pool.slice(0, Math.min(MAX_HITS, pool.length))
+}
+// Self-healing: if still no results and not already a retry, attempt with fuzzy-corrected query
+if (topCandidates.length === 0 && !_isRetry) {
+const corrected = fuzzyCorrectQuery(query, chunks)
+if (corrected.toLowerCase() !== query.toLowerCase()) {
+console.log(`[QueryPipeline] Self-healing retry with fuzzy-corrected query: "${corrected}"`)
+return retrieveChunks(corrected, chunks, topK, invertedIndex, true)
+}
 }
 if (topCandidates.length === 0) {
 topCandidates = relaxedKeywordSearch(normalizedQuery, chunks, Math.min(topK * 2, 64), invertedIndex).slice(0, Math.min(topK, MAX_HITS))
@@ -1770,12 +1852,32 @@ const { chunks, invertedIndex } = await loadChunksForClient(clientId)
 if (chunks.length === 0) {
 return { answer: 'No documents found for your account. Please ensure your documents have been ingested first.', sources: [], conversationId: conversationId || null, client: { clientId, name } }
 }
-let processedQuery = query.trim()
-processedQuery = fuzzyCorrectQuery(processedQuery, chunks)
-processedQuery = await preprocessQuery(processedQuery)
+// --- PRODUCTION QUERY NORMALIZATION PIPELINE ---
+// Step 1: Fix question/stop-word typos (ehat→what, difine→define) via static fast-path map.
+// These words won't appear in domain vocabulary so fuzzy matching can't fix them.
+let processedQuery = applyTypos(query.trim())
+console.log(`[QueryPipeline] Original: "${query.trim()}"`)
 if (processedQuery !== query.trim()) {
-console.log(`[preprocessing] Original: "${query.trim()}" → Processed: "${processedQuery}"`)
+console.log(`[QueryPipeline] After typos: "${processedQuery}"`)
 }
+// Step 2: Normalize domain synonyms (app count → application count, occ rate → occupancy rate).
+processedQuery = applySynonyms(processedQuery)
+// Step 3: Fuzzy-correct domain-specific words against vocabulary extracted from loaded chunks.
+// Runs on EVERY query unconditionally. Uses combined Levenshtein + trigram scoring at threshold 0.74.
+// Fixes: "efftive"→"effective", "applicton"→"application", "ocupancy"→"occupancy", etc.
+const fuzzyResult = fuzzyCorrectQuery(processedQuery, chunks)
+if (fuzzyResult !== processedQuery) {
+console.log(`[QueryPipeline] After fuzzy: "${fuzzyResult}"`)
+}
+processedQuery = fuzzyResult
+// Step 4: LLM-based rewrite via ASKDATA2 — only triggered when needsQueryRewrite() is true.
+// Handles: structural ambiguity, non-English input, extreme abbreviations.
+const rewritten = await preprocessQuery(processedQuery)
+if (rewritten !== processedQuery) {
+console.log(`[QueryPipeline] After rewrite: "${rewritten}"`)
+}
+processedQuery = rewritten
+// --- END PIPELINE ---
 if (intent === 'all_urls') {
 const urlChunks = chunks.filter(c => /https?:\/\/\S+/.test(c.text || ''))
 const urlEntries = extractAllUrlsFromChunks(urlChunks)
