@@ -1402,15 +1402,104 @@ else parts.push(`**${capFirst(topicB)}:** I could not find information about "${
 return parts.join('\n\n')
 }
 async function handleMultiTopicQuery(topics, mode, chunks, topK, invertedIndex) {
-if (mode === 'comparison' && topics.length === 2) {
-const answer = await generateComparisonAnswer(topics[0], topics[1], chunks, topK, invertedIndex)
-if (answer) return answer
+  if (mode === 'comparison' && topics.length === 2) {
+    const comparisonQuery = `difference between ${topics[0]} and ${topics[1]}`
+    const hitsA = await retrieveChunks(`what is ${topics[0]}`, chunks, topK, invertedIndex)
+    const hitsB = await retrieveChunks(`what is ${topics[1]}`, chunks, topK, invertedIndex)
+
+    // Deduplicated combined hits
+    const seen = new Set()
+    const deduped = []
+    for (const h of [...hitsA, ...hitsB]) {
+      const fp = (h.text || '').trim().slice(0, 80).toLowerCase()
+      if (!seen.has(fp)) { seen.add(fp); deduped.push(h) }
+    }
+
+    if (deduped.length > 0) {
+      // Build SEPARATE contexts so LLM doesn't mix them
+      const contextA = buildContext(hitsA.slice(0, 3))
+      const contextB = buildContext(hitsB.slice(0, 3))
+
+      const systemPrompt = `You are a data dictionary assistant. Answer ONLY from the context.
+Rules:
+- Bold each name: **Name**
+- ONE definition sentence per metric, no formulas unless asked
+- No repeated headers, no duplicate metric names
+- End with exactly one "**Key Difference:**" sentence
+- No pipe characters, no double periods, no source tags like [1]
+- Strict format:
+  **[A]:** [one sentence].
+  **[B]:** [one sentence].
+  **Key Difference:** [one sentence].`
+
+      const userMessage = `CONTEXT FOR ${topics[0].toUpperCase()}:
+${contextA}
+
+CONTEXT FOR ${topics[1].toUpperCase()}:
+${contextB}
+
+Now write the comparison strictly in this format:
+**${capFirst(topics[0])}:** [definition].
+**${capFirst(topics[1])}:** [definition].
+**Key Difference:** [one sentence from context].`
+
+      let rawAnswer = ''
+      try {
+        rawAnswer = await Promise.race([
+          callBestAvailableEngine(systemPrompt, userMessage, 512),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 25000)),
+        ])
+      } catch (err) {
+        console.warn(`[handleMultiTopicQuery] Engine failed: ${err.message}`)
+      }
+
+      if (rawAnswer && rawAnswer.trim().length >= 15) {
+        return cleanAnswer(rawAnswer)
+      }
+    }
+
+    // Rule-based fallback only — no generateComparisonAnswer to avoid duplication
+    const fallbackA = buildFallbackAnswer(`what is ${topics[0]}`, hitsA, 'definition')
+    const fallbackB = buildFallbackAnswer(`what is ${topics[1]}`, hitsB, 'definition')
+    const parts = []
+    parts.push(fallbackA && !fallbackA.includes('could not find')
+      ? `**${capFirst(topics[0])}:** ${fallbackA}`
+      : `**${capFirst(topics[0])}:** I could not find information about "${capFirst(topics[0])}" in your documents.`)
+    parts.push(fallbackB && !fallbackB.includes('could not find')
+      ? `**${capFirst(topics[1])}:** ${fallbackB}`
+      : `**${capFirst(topics[1])}:** I could not find information about "${capFirst(topics[1])}" in your documents.`)
+    return parts.join('\n\n')
+  }
+
+  // Non-comparison multi-topic (e.g. "what is X and Y")
+  const results = await Promise.all(
+    topics.map(async (topic) => {
+      const topicQuery = `what is ${topic}`
+      let hits = await retrieveChunks(topicQuery, chunks, topK, invertedIndex)
+      if (hits.length === 0) hits = relaxedKeywordSearch(topicQuery, chunks, 32, invertedIndex)
+      if (hits.length === 0) return { topic, answer: null }
+      const rawAnswer = await callBestAvailableEngine(
+        buildSystemPrompt('definition'),
+        buildUserMessage(topicQuery, hits, 'definition'),
+        512
+      ).catch(() => '')
+      const isBlank = !rawAnswer || rawAnswer.trim().length < 15
+      const answer = isBlank
+        ? buildFallbackAnswer(topicQuery, hits, 'definition')
+        : cleanAnswer(rawAnswer)
+      return { topic, answer }
+    })
+  )
+
+  return results.map(({ topic, answer }) => {
+    const cap = capFirst(topic)
+    if (!answer || answer.includes('could not find') || answer.includes('not present')) {
+      return `**${cap}:**\nI could not find information about "${cap}" in your documents.`
+    }
+    return `**${cap}:**\n${answer}`
+  }).join('\n\n')
 }
-const results = await Promise.all(
-topics.map(async (topic) => {
-const answer = await generateAnswerForTopic(topic, chunks, topK, invertedIndex)
-return { topic, answer }
-})
+          )
 )
 return results.map(({ topic, answer }) => {
 const cap = capFirst(topic)
