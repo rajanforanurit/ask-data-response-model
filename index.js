@@ -1434,16 +1434,8 @@ async function handleMultiTopicQuery(topics, mode, chunks, topK, invertedIndex) 
     return parts.join('\n\n')
   }
   return parts.join('\n\n')
-})
-)
-return results.map(({ topic, answer }) => {
-const cap = capFirst(topic)
-if (!answer || answer.includes('could not find') || answer.includes('not present')) {
-return `**${cap}:**\nI could not find information about "${cap}" in your documents.`
 }
-return `**${cap}:**\n${answer}`
-}).join('\n\n')
-}
+
 async function extractPdf(buffer) {
 const r = await pdfParse(buffer)
 return r.text || ''
