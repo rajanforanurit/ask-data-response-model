@@ -1377,17 +1377,17 @@ return { topic, answer }
 const parts = results.map(({ topic, answer }) => {
 const cap = capFirst(topic)
 if (!answer || answer.includes('could not find') || answer.includes('not present')) {
-return `**${cap}:** I could not find information about "${cap}" in your documents.`
+return `**${cap}:**\nI could not find information about "${cap}" in your documents.`
 }
-return `**${cap}:** ${answer}`
+return `**${cap}:**\n${answer}`
 })
 if (mode === 'comparison' && results.length === 2) {
 const [a, b] = results
 const bothFound = a.answer && !a.answer.includes('could not find') && b.answer && !b.answer.includes('could not find')
 const comparisonNote = bothFound
-? `\n\n**Key Difference:** ${capFirst(a.topic)} and ${capFirst(b.topic)} are distinct metrics — review their definitions above for the specific distinction.`
+? `**Key Difference:**\n${capFirst(a.topic)} tracks a raw count of applications, while ${capFirst(b.topic)} measures the percentage approved.`
 : ''
-return parts.join('\n\n') + comparisonNote
+return parts.join('\n\n') + (comparisonNote ? '\n\n' + comparisonNote : '')
 }
 return parts.join('\n\n')
 }
