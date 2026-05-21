@@ -333,6 +333,11 @@ return 'general'
 }
 function detectMultiTopicQuery(query) {
 const q = query.trim()
+const diffPatterns = [
+/^(?:what\s+is\s+the\s+)?difference\s+between\s+(.+?)\s+and\s+(.+?)[\s?]*$/i,
+/^compare\s+(.+?)\s+(?:vs\.?|versus|and)\s+(.+?)[\s?]*$/i,
+/^(.+?)\s+vs\.?\s+(.+?)[\s?]*$/i,
+]
 const andSplitPatterns = [
 /^what\s+is\s+(.+?)\s+and\s+(.+?)[\s?]*$/i,
 /^what\s+are\s+(.+?)\s+and\s+(.+?)[\s?]*$/i,
@@ -340,11 +345,6 @@ const andSplitPatterns = [
 /^explain\s+(.+?)\s+and\s+(.+?)[\s?]*$/i,
 /^tell\s+me\s+about\s+(.+?)\s+and\s+(.+?)[\s?]*$/i,
 /^(.+?)\s+and\s+(.+?)[\s?]*$/i,
-]
-const diffPatterns = [
-/^(?:what\s+is\s+the\s+)?difference\s+between\s+(.+?)\s+and\s+(.+?)[\s?]*$/i,
-/^compare\s+(.+?)\s+(?:vs\.?|versus|and)\s+(.+?)[\s?]*$/i,
-/^(.+?)\s+vs\.?\s+(.+?)[\s?]*$/i,
 ]
 for (const p of diffPatterns) {
 const m = q.match(p)
@@ -471,8 +471,8 @@ const qs = querySubject.toLowerCase()
 const ct = chunkText.toLowerCase()
 let penalty = 0
 for (const [negTerm, posTerm] of NEGATIVE_PAIRS) {
-if (!posTerm) continue
-const queryHasPositive = new RegExp(`\\b${escapeRegex(posTerm)}\\b`, 'i').test(qs)
+if (posTerm === null || posTerm === undefined) continue
+const queryHasPositive = posTerm.length > 0 && new RegExp(`\\b${escapeRegex(posTerm)}\\b`, 'i').test(qs)
 const queryHasNegative = new RegExp(`\\b${escapeRegex(negTerm)}\\b`, 'i').test(qs)
 if (queryHasPositive && !queryHasNegative) {
 if (new RegExp(`\\b${escapeRegex(negTerm)}\\b`, 'i').test(ct)) {
@@ -480,7 +480,7 @@ penalty += 30
 }
 }
 if (queryHasNegative) {
-if (!new RegExp(`\\b${escapeRegex(negTerm)}\\b`, 'i').test(ct) && new RegExp(`\\b${escapeRegex(posTerm)}\\b`, 'i').test(ct)) {
+if (posTerm.length > 0 && !new RegExp(`\\b${escapeRegex(negTerm)}\\b`, 'i').test(ct) && new RegExp(`\\b${escapeRegex(posTerm)}\\b`, 'i').test(ct)) {
 penalty += 20
 }
 }
@@ -878,8 +878,6 @@ if (tableVal && tableVal !== sheetName) synthesis += ` (${tableVal})`
 if (descVal) synthesis += ` is defined as: ${descVal}`
 if (formulaVal && !descVal.toLowerCase().includes(formulaVal.toLowerCase())) {
 synthesis += `. Formula: ${formulaVal}`
-} else if (formulaVal) {
-synthesis += `. Formula: ${formulaVal}`
 }
 if (additionalVal) synthesis += `. Additional Info: ${additionalVal}`
 if (urlVal) synthesis += `. URL: ${urlVal}`
@@ -1140,12 +1138,14 @@ const intentRule = intent === 'definition'
 ? `Definition: Bold measure name, one sentence definition only. No formula or calculation details.`
 : intent === 'calculation'
 ? `Calculation: Output ONLY "**Formula for [Name]:** [formula]." No definition or description.`
+: intent === 'comparison'
+? `Comparison: Bold each name. Write a concise definition for each. End with a "**Key Difference:**" sentence derived strictly from the context. Do not invent differences.`
 : `General: Answer directly in 2-4 sentences. Do not volunteer formulas or definitions unprompted.`
 return `You are a data dictionary assistant for a real estate analytics platform. Answer ONLY from context.
 Rules: Bold the subject with **Name**. Write complete sentences only. No pipe-delimited data. No double periods. No source references like [1]. No sheet references. Keep answers concise.
 If context lacks the answer, say: "I could not find this in your documents."
 Intent rule (highest priority): ${intentRule}
-Formats: Definition: "**[Name]** is [desc]." | Calculation: "**Formula for [Name]:** [formula]." | URL: return URL only. | Comparison: "**[A]:** [desc]. **[B]:** [desc]. **Key Difference:** [one sentence]."`
+Formats: Definition: "**[Name]** is [desc]." | Calculation: "**Formula for [Name]:** [formula]." | URL: return URL only. | Comparison: "**[A]:** [desc]. **[B]:** [desc]. **Key Difference:** [one sentence derived from context]."`
 }
 function buildUserMessage(query, hits, intent) {
 const context = buildContext(hits)
@@ -1160,7 +1160,7 @@ instruction = `\n\nFrom the context, return only the full URL for "${extractUrlK
 } else if (intent === 'all_urls') {
 instruction = `\n\nFrom the context, list ALL URLs. Format: name: URL. One per line.`
 } else if (intent === 'comparison') {
-instruction = `\n\nFrom the context, compare: ${query}. Bold each name. End with a key difference sentence. One period at end.`
+instruction = `\n\nFrom the context, compare: ${query}. Bold each name. Provide a concise definition for each based strictly on the context. End with a "**Key Difference:**" sentence that accurately reflects what the context says about these two items. Do not fabricate or assume differences. One period at end.`
 } else {
 instruction = `\n\nFrom the context, answer in clear sentences: ${query}. Answer only what was asked. No pipe characters. One period at end.`
 }
@@ -1205,6 +1205,7 @@ if (!hits || hits.length === 0) return "I could not find relevant information ab
 const resolvedIntent = intent || detectQueryIntent(query)
 const subject = extractSubject(query)
 const subjectLower = subject.toLowerCase()
+const escapedSubject = escapeRegex(subjectLower)
 if (resolvedIntent === 'all_urls') {
 const urlEntries = extractAllUrlsFromChunks(hits)
 if (urlEntries.length === 0) return "I could not find any URLs in your documents."
@@ -1233,12 +1234,12 @@ return "I could not find a matching URL in your documents."
 }
 if (resolvedIntent === 'calculation') {
 for (const h of hits) {
-if (h.metadata && h.metadata.formula && new RegExp(`\\b${escapeRegex(subjectLower)}\\b`, 'i').test(h.metadata.measure || '')) {
+if (h.metadata && h.metadata.formula && new RegExp(`\\b${escapedSubject}\\b`, 'i').test(h.metadata.measure || '')) {
 const cap = capFirst(h.metadata.measure)
 return ensureSinglePeriod(`**Formula for ${cap}:** ${h.metadata.formula}.`)
 }
 }
-const calcPattern = new RegExp(`how to calculate ${escapeRegex(subjectLower)}:\\s*([^\\n]+)`, 'im')
+const calcPattern = new RegExp(`how to calculate ${escapedSubject}:\\s*([^\\n]+)`, 'im')
 for (const h of hits) {
 const m = (h.text || '').match(calcPattern)
 if (m) {
@@ -1246,7 +1247,7 @@ const cap = capFirst(subject)
 return ensureSinglePeriod(`**Formula for ${cap}:** ${trimToCompleteSentence(m[1].trim(), 500)}.`)
 }
 }
-const formulaPattern = new RegExp(`formula for ${escapeRegex(subjectLower)}:\\s*([^\\n]+)`, 'im')
+const formulaPattern = new RegExp(`formula for ${escapedSubject}:\\s*([^\\n]+)`, 'im')
 for (const h of hits) {
 const m = (h.text || '').match(formulaPattern)
 if (m) {
@@ -1256,7 +1257,7 @@ return ensureSinglePeriod(`**Formula for ${cap}:** ${trimToCompleteSentence(m[1]
 }
 for (const h of hits) {
 const text = h.text || ''
-if (!new RegExp(`\\b${escapeRegex(subjectLower)}\\b`, 'i').test(text)) continue
+if (!new RegExp(`\\b${escapedSubject}\\b`, 'i').test(text)) continue
 const extracted = extractFormulaFromText(text)
 if (extracted) {
 const cap = capFirst(subject)
@@ -1268,7 +1269,7 @@ return `I could not find a formula for ${capFirst(subject)} in your documents.`
 for (const h of hits) {
 if (h.metadata && h.metadata.measure) {
 const measureLower = (h.metadata.measure || '').toLowerCase().trim()
-if (measureLower === subjectLower || new RegExp(`\\b${escapeRegex(subjectLower)}\\b`, 'i').test(measureLower) || new RegExp(`\\b${escapeRegex(measureLower)}\\b`, 'i').test(subjectLower)) {
+if (measureLower === subjectLower || new RegExp(`\\b${escapedSubject}\\b`, 'i').test(measureLower) || new RegExp(`\\b${escapeRegex(measureLower)}\\b`, 'i').test(subjectLower)) {
 const cap = capFirst(h.metadata.measure)
 if (resolvedIntent === 'definition' && h.metadata.description) {
 return ensureSinglePeriod(`**${cap}** is defined as: ${h.metadata.description}.`)
@@ -1281,7 +1282,7 @@ return ensureSinglePeriod(answer)
 }
 }
 const synthesisPattern = new RegExp(
-`${escapeRegex(subjectLower)}[^\\n]*is defined as:\\s*([^.\\n]+(?:\\.[^.\\n]+)?)(?:\\.\\s*Formula:\\s*([^.\\n]+(?:\\.[^.\\n]+)?))?(?:\\.\\s*Additional Info:\\s*([^.\\n]+))?`,
+`${escapedSubject}[^\\n]*is defined as:\\s*([^.\\n]+(?:\\.[^.\\n]+)?)(?:\\.\\s*Formula:\\s*([^.\\n]+(?:\\.[^.\\n]+)?))?(?:\\.\\s*Additional Info:\\s*([^.\\n]+))?`,
 'im'
 )
 for (const h of hits) {
@@ -1303,7 +1304,7 @@ return ensureSinglePeriod(answer)
 const matchingLines = []
 for (const h of hits) {
 for (const line of (h.text || '').split('\n')) {
-if (!new RegExp(`\\b${escapeRegex(subjectLower)}\\b`, 'i').test(line)) continue
+if (!new RegExp(`\\b${escapedSubject}\\b`, 'i').test(line)) continue
 if (line.trim().length <= 20) continue
 if ((line.match(/\|/g) || []).length > 2) continue
 if (/^===\s*Sheet:/.test(line.trim())) continue
@@ -1365,35 +1366,59 @@ new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 25000)
 console.warn(`[generateAnswerForTopic] Engine failed for "${topic}": ${err.message}`)
 }
 const isBlank = !rawAnswer || rawAnswer.trim().length < 15
-let answer = isBlank ? buildFallbackAnswer(topicQuery, hits, intent) : cleanAnswer(rawAnswer)
-answer = answer.replace(/^\*\*[^*]+\*\*\s*(is defined as:?\s*)?/i, '').trim()
-if (answer && !/[.!?]$/.test(answer)) answer += '.'
+const answer = isBlank ? buildFallbackAnswer(topicQuery, hits, intent) : cleanAnswer(rawAnswer)
+if (answer && !/[.!?]$/.test(answer)) return answer + '.'
 return answer
 }
-
+async function generateComparisonAnswer(topicA, topicB, chunks, topK, invertedIndex) {
+const comparisonQuery = `difference between ${topicA} and ${topicB}`
+const hitsA = await retrieveChunks(`what is ${topicA}`, chunks, topK, invertedIndex)
+const hitsB = await retrieveChunks(`what is ${topicB}`, chunks, topK, invertedIndex)
+const allHits = [...hitsA, ...hitsB]
+const seen = new Set()
+const deduped = []
+for (const h of allHits) {
+const fp = (h.text || '').trim().slice(0, 80).toLowerCase()
+if (!seen.has(fp)) { seen.add(fp); deduped.push(h) }
+}
+if (deduped.length === 0) return null
+let rawAnswer = ''
+try {
+rawAnswer = await Promise.race([
+generateAnswer(comparisonQuery, deduped, 'comparison'),
+new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 25000)),
+])
+} catch (err) {
+console.warn(`[generateComparisonAnswer] Engine failed for "${topicA}" vs "${topicB}": ${err.message}`)
+}
+if (rawAnswer && rawAnswer.trim().length >= 15) return cleanAnswer(rawAnswer)
+const answerA = await generateAnswerForTopic(topicA, chunks, topK, invertedIndex)
+const answerB = await generateAnswerForTopic(topicB, chunks, topK, invertedIndex)
+const parts = []
+if (answerA && !answerA.includes('could not find')) parts.push(`**${capFirst(topicA)}:** ${answerA}`)
+else parts.push(`**${capFirst(topicA)}:** I could not find information about "${capFirst(topicA)}" in your documents.`)
+if (answerB && !answerB.includes('could not find')) parts.push(`**${capFirst(topicB)}:** ${answerB}`)
+else parts.push(`**${capFirst(topicB)}:** I could not find information about "${capFirst(topicB)}" in your documents.`)
+return parts.join('\n\n')
+}
 async function handleMultiTopicQuery(topics, mode, chunks, topK, invertedIndex) {
+if (mode === 'comparison' && topics.length === 2) {
+const answer = await generateComparisonAnswer(topics[0], topics[1], chunks, topK, invertedIndex)
+if (answer) return answer
+}
 const results = await Promise.all(
 topics.map(async (topic) => {
 const answer = await generateAnswerForTopic(topic, chunks, topK, invertedIndex)
 return { topic, answer }
 })
 )
-const parts = results.map(({ topic, answer }) => {
+return results.map(({ topic, answer }) => {
 const cap = capFirst(topic)
 if (!answer || answer.includes('could not find') || answer.includes('not present')) {
 return `**${cap}:**\nI could not find information about "${cap}" in your documents.`
 }
 return `**${cap}:**\n${answer}`
-})
-if (mode === 'comparison' && results.length === 2) {
-const [a, b] = results
-const bothFound = a.answer && !a.answer.includes('could not find') && b.answer && !b.answer.includes('could not find')
-const comparisonNote = bothFound
-? `**Key Difference:**\n${capFirst(a.topic)} tracks a raw count of applications, while ${capFirst(b.topic)} measures the percentage approved.`
-: ''
-return parts.join('\n\n') + (comparisonNote ? '\n\n' + comparisonNote : '')
-}
-return parts.join('\n\n')
+}).join('\n\n')
 }
 async function extractPdf(buffer) {
 const r = await pdfParse(buffer)
@@ -1696,6 +1721,32 @@ function generateTitle(query) {
 const cleaned = query.trim().replace(/[?!.]+$/, '')
 return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned
 }
+async function saveConversationMessage(clientId, conversationId, query, answer, sources) {
+try {
+const chatDatabase = await getChatDb()
+const col = chatDatabase.collection('conversations')
+const now = new Date()
+const userMsg = { role: 'user', content: query, timestamp: now }
+const assistantMsg = { role: 'assistant', content: answer, sources: sources.map(s => ({ source_file: s.source_file, score: s.score })), timestamp: now }
+let activeConversationId = conversationId || null
+if (activeConversationId) {
+const updated = await col.findOneAndUpdate(
+{ _id: new ObjectId(activeConversationId), clientId },
+{ $push: { messages: { $each: [userMsg, assistantMsg] } }, $set: { updatedAt: now } },
+{ returnDocument: 'after', projection: { _id: 1 } }
+)
+if (!updated) activeConversationId = null
+}
+if (!activeConversationId) {
+const result = await col.insertOne({ clientId, title: generateTitle(query), messages: [userMsg, assistantMsg], createdAt: now, updatedAt: now })
+activeConversationId = result.insertedId.toString()
+}
+return activeConversationId
+} catch (saveErr) {
+console.warn('[saveConversationMessage] Failed:', saveErr.message)
+return conversationId || null
+}
+}
 app.get('/health', (req, res) => res.json({
 ok: true,
 service: 'ask-data',
@@ -1905,17 +1956,21 @@ client: { clientId, name },
 }
 const cacheKey = getCacheKey(clientId, query)
 const cached = responseCacheGet(cacheKey)
-if (cached) return res.json({ ...cached, cached: true, conversationId: conversationId || cached.conversationId })
+if (cached) {
+const activeConversationId = await saveConversationMessage(clientId, conversationId || null, query.trim(), cached.answer, cached.sources || [])
+return res.json({ ...cached, cached: true, conversationId: activeConversationId })
+}
 if (IN_FLIGHT.has(cacheKey)) {
 try {
 const result = await IN_FLIGHT.get(cacheKey)
-return res.json({ ...result, conversationId: conversationId || result.conversationId })
+const activeConversationId = await saveConversationMessage(clientId, conversationId || null, query.trim(), result.answer, result.sources || [])
+return res.json({ ...result, conversationId: activeConversationId })
 } catch { }
 }
 const requestPromise = (async () => {
 const { chunks, invertedIndex } = await loadChunksForClient(clientId)
 if (chunks.length === 0) {
-return { answer: 'No documents found for your account. Please ensure your documents have been ingested first.', sources: [], conversationId: conversationId || null, client: { clientId, name } }
+return { answer: 'No documents found for your account. Please ensure your documents have been ingested first.', sources: [], client: { clientId, name } }
 }
 let processedQuery = applyTypos(query.trim())
 console.log(`[QueryPipeline] Original: "${query.trim()}"`)
@@ -1938,60 +1993,19 @@ const urlChunks = chunks.filter(c => /https?:\/\/\S+/.test(c.text || ''))
 const urlEntries = extractAllUrlsFromChunks(urlChunks)
 const answer = urlEntries.length > 0 ? urlEntries.map(e => `**${e.name}:** ${e.url}`).join('\n') : "I could not find any URLs in your documents."
 const sources = urlChunks.slice(0, 6).map(h => ({ source_file: h.source_file || 'unknown', chunk_index: h.chunk_index ?? 0, score: null, preview: (h.text || '').slice(0, 200) }))
-let activeConversationId = conversationId || null
-try {
-const chatDatabase = await getChatDb()
-const col = chatDatabase.collection('conversations')
-const now = new Date()
-const userMsg = { role: 'user', content: query.trim(), timestamp: now }
-const assistantMsg = { role: 'assistant', content: answer, sources: sources.map(s => ({ source_file: s.source_file, score: s.score })), timestamp: now }
-if (activeConversationId) {
-const updated = await col.findOneAndUpdate(
-{ _id: new ObjectId(activeConversationId), clientId },
-{ $push: { messages: { $each: [userMsg, assistantMsg] } }, $set: { updatedAt: now } },
-{ returnDocument: 'after', projection: { _id: 1 } }
-)
-if (!updated) activeConversationId = null
-}
-if (!activeConversationId) {
-const result = await col.insertOne({ clientId, title: generateTitle(query.trim()), messages: [userMsg, assistantMsg], createdAt: now, updatedAt: now })
-activeConversationId = result.insertedId.toString()
-}
-} catch (saveErr) { console.warn('[chat/message] Failed to save conversation:', saveErr.message) }
-return { answer, sources, conversationId: activeConversationId, client: { clientId, name } }
+return { answer, sources, client: { clientId, name } }
 }
 const multiTopicCheck = detectMultiTopicQuery(processedQuery)
 if (multiTopicCheck.isMulti) {
 console.log(`[chat/message] Multi-topic detected: ${JSON.stringify(multiTopicCheck.topics)} mode=${multiTopicCheck.mode}`)
 const answer = await handleMultiTopicQuery(multiTopicCheck.topics, multiTopicCheck.mode, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndex)
-const sources = []
-let activeConversationId = conversationId || null
-try {
-const chatDatabase = await getChatDb()
-const col = chatDatabase.collection('conversations')
-const now = new Date()
-const userMsg = { role: 'user', content: query.trim(), timestamp: now }
-const assistantMsg = { role: 'assistant', content: answer, sources: [], timestamp: now }
-if (activeConversationId) {
-const updated = await col.findOneAndUpdate(
-{ _id: new ObjectId(activeConversationId), clientId },
-{ $push: { messages: { $each: [userMsg, assistantMsg] } }, $set: { updatedAt: now } },
-{ returnDocument: 'after', projection: { _id: 1 } }
-)
-if (!updated) activeConversationId = null
-}
-if (!activeConversationId) {
-const result = await col.insertOne({ clientId, title: generateTitle(query.trim()), messages: [userMsg, assistantMsg], createdAt: now, updatedAt: now })
-activeConversationId = result.insertedId.toString()
-}
-} catch (saveErr) { console.warn('[chat/message] Failed to save conversation:', saveErr.message) }
-return { answer, sources, conversationId: activeConversationId, client: { clientId, name } }
+return { answer, sources: [], client: { clientId, name } }
 }
 let hits = await retrieveChunks(processedQuery, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndex)
 if (hits.length === 0) hits = relaxedKeywordSearch(processedQuery, chunks, 64, invertedIndex)
 console.log(`[chat/message] "${query.slice(0, 60)}" → intent=${intent}, subject="${extractSubject(processedQuery)}", hits=${hits.length}, topScore=${hits[0]?._score?.toFixed(2) || 0}`)
 if (hits.length === 0) {
-return { answer: "I could not find relevant information about this in your documents. Try rephrasing your question.", sources: [], conversationId: conversationId || null, client: { clientId, name } }
+return { answer: "I could not find relevant information about this in your documents. Try rephrasing your question.", sources: [], client: { clientId, name } }
 }
 let rawAnswer = ''
 if (intent !== 'url_lookup') {
@@ -2013,33 +2027,14 @@ chunk_index: h.chunk_index ?? 0,
 score: typeof h._score === 'number' ? parseFloat(h._score.toFixed(4)) : null,
 preview: (h.text || '').slice(0, 200),
 }))
-let activeConversationId = conversationId || null
-try {
-const chatDatabase = await getChatDb()
-const col = chatDatabase.collection('conversations')
-const now = new Date()
-const userMsg = { role: 'user', content: query.trim(), timestamp: now }
-const assistantMsg = { role: 'assistant', content: answer, sources: sources.map(s => ({ source_file: s.source_file, score: s.score })), timestamp: now }
-if (activeConversationId) {
-const updated = await col.findOneAndUpdate(
-{ _id: new ObjectId(activeConversationId), clientId },
-{ $push: { messages: { $each: [userMsg, assistantMsg] } }, $set: { updatedAt: now } },
-{ returnDocument: 'after', projection: { _id: 1 } }
-)
-if (!updated) activeConversationId = null
-}
-if (!activeConversationId) {
-const result = await col.insertOne({ clientId, title: generateTitle(query.trim()), messages: [userMsg, assistantMsg], createdAt: now, updatedAt: now })
-activeConversationId = result.insertedId.toString()
-}
-} catch (saveErr) { console.warn('[chat/message] Failed to save conversation:', saveErr.message) }
-return { answer, sources, conversationId: activeConversationId, client: { clientId, name } }
+return { answer, sources, client: { clientId, name } }
 })()
 IN_FLIGHT.set(cacheKey, requestPromise)
 let result
 try { result = await requestPromise } finally { IN_FLIGHT.delete(cacheKey) }
 if (result.answer && result.answer.length > 15) responseCacheSet(cacheKey, result)
-res.json(result)
+const activeConversationId = await saveConversationMessage(clientId, conversationId || null, query.trim(), result.answer, result.sources || [])
+res.json({ ...result, conversationId: activeConversationId })
 } catch (err) {
 console.error('[chat/message] Error:', err.message)
 if (!res.headersSent) res.status(500).json({ error: err.message })
