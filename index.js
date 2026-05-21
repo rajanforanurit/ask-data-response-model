@@ -1365,8 +1365,12 @@ new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 25000)
 console.warn(`[generateAnswerForTopic] Engine failed for "${topic}": ${err.message}`)
 }
 const isBlank = !rawAnswer || rawAnswer.trim().length < 15
-return isBlank ? buildFallbackAnswer(topicQuery, hits, intent) : cleanAnswer(rawAnswer)
+let answer = isBlank ? buildFallbackAnswer(topicQuery, hits, intent) : cleanAnswer(rawAnswer)
+answer = answer.replace(/^\*\*[^*]+\*\*\s*(is defined as:?\s*)?/i, '').trim()
+if (answer && !/[.!?]$/.test(answer)) answer += '.'
+return answer
 }
+
 async function handleMultiTopicQuery(topics, mode, chunks, topK, invertedIndex) {
 const results = await Promise.all(
 topics.map(async (topic) => {
