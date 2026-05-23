@@ -586,6 +586,21 @@ const udChunks = chunks.filter(c => c.docType !== 'data_dictionary' && c.docType
 const idx = invertedIndexes.ud || invertedIndexes.all
 return retrieveChunksUD(processedQuery, udChunks.length > 0 ? udChunks : chunks, topK, idx)
 }
+function computePoolConfidence(hits, docType) {
+if (!hits || hits.length === 0) return 0
+const topScore = hits[0]?._score || 0
+const secondScore = hits[1]?._score || 0
+const gap = topScore - secondScore
+const SF_UD_MIN_THRESHOLD = 8
+const DD_MIN_THRESHOLD = 3
+if (docType === 'data_dictionary' && topScore < DD_MIN_THRESHOLD) return 0
+if ((docType === 'structured' || docType === 'unstructured') && topScore < SF_UD_MIN_THRESHOLD) return 0
+const topN = hits.slice(0, Math.min(5, hits.length))
+const avgScore = topN.reduce((s, h) => s + (h._score || 0), 0) / topN.length
+let confidence = avgScore + gap * 0.5
+if (docType === 'data_dictionary') confidence *= 1.4
+return confidence
+}
 async function retrieveBestHitsAcrossAllTypes(processedQuery, chunks, topK, invertedIndexes, intent) {
 const ddChunks = chunks.filter(c => c.docType === 'data_dictionary')
 const sfChunks = chunks.filter(c => c.docType === 'structured')
@@ -611,9 +626,19 @@ const pools = [
 
 if (pools.length === 0) return {hits: [], docType: 'unstructured'}
 
-pools.sort((a, b) => (b.hits[0]?._score || 0) - (a.hits[0]?._score || 0))
+for (const pool of pools) {
+pool.confidence = computePoolConfidence(pool.hits, pool.docType)
+console.log(`[routing] docType=${pool.docType} topScore=${pool.hits[0]?._score?.toFixed(2)||0} confidence=${pool.confidence.toFixed(2)}`)
+}
 
+const validPools = pools.filter(p => p.confidence > 0)
+if (validPools.length === 0) {
+pools.sort((a, b) => (b.hits[0]?._score || 0) - (a.hits[0]?._score || 0))
 return {hits: pools[0].hits, docType: pools[0].docType}
+}
+
+validPools.sort((a, b) => b.confidence - a.confidence)
+return {hits: validPools[0].hits, docType: validPools[0].docType}
 }
 async function generateAnswerForTopic(topic, chunks, topK, invertedIndexes) {
 const topicQuery = `what is ${topic}`
