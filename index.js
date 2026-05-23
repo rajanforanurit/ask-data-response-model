@@ -591,10 +591,8 @@ if (!hits || hits.length === 0) return 0
 const topScore = hits[0]?._score || 0
 const secondScore = hits[1]?._score || 0
 const gap = topScore - secondScore
-const SF_UD_MIN_THRESHOLD = 8
-const DD_MIN_THRESHOLD = 3
-if (docType === 'data_dictionary' && topScore < DD_MIN_THRESHOLD) return 0
-if ((docType === 'structured' || docType === 'unstructured') && topScore < SF_UD_MIN_THRESHOLD) return 0
+const MIN_THRESHOLD = 3
+if (topScore < MIN_THRESHOLD) return 0
 const topN = hits.slice(0, Math.min(5, hits.length))
 const avgScore = topN.reduce((s, h) => s + (h._score || 0), 0) / topN.length
 let confidence = avgScore + gap * 0.5
