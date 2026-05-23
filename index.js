@@ -62,25 +62,15 @@ const ASKDATA2_KEY = process.env.ASKDATA2_KEY || ''
 const ASKDATA2_MODEL = process.env.ASKDATA2_MODEL || 'ASKDATA2'
 const ASKDATA2_TIMEOUT_MS = parseInt(process.env.ASKDATA2_TIMEOUT_MS || '30000', 10)
 const ASKDATA2_REWRITE_TIMEOUT_MS = parseInt(process.env.ASKDATA2_REWRITE_TIMEOUT_MS || '8000', 10)
-const AZURE_EMBED_ENDPOINT = process.env.AZURE_EMBED_ENDPOINT || ''
-const AZURE_EMBED_KEY = process.env.AZURE_EMBED_KEY || ''
-const AZURE_EMBED_MODEL = process.env.AZURE_EMBED_MODEL || 'text-embedding-3-small'
-const EMBED_TIMEOUT_MS = parseInt(process.env.EMBED_TIMEOUT_MS || '10000', 10)
-const EMBED_POOL_LIMIT = parseInt(process.env.EMBED_POOL_LIMIT || '20', 10)
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10)
 const WARMUP_CLIENT_IDS = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
-const RERANKER_ENDPOINT = process.env.RERANKER_ENDPOINT || ''
-const RERANKER_KEY = process.env.RERANKER_KEY || ''
-const RERANKER_TIMEOUT_MS = parseInt(process.env.RERANKER_TIMEOUT_MS || '8000', 10)
 const RAW_PREFIX = 'raw'
 const CHUNK_SIZE = 1200
 const CHUNK_OVERLAP = 2
 const BLOB_CONCURRENCY = parseInt(process.env.BLOB_CONCURRENCY || '8', 10)
 const CHUNK_CACHE_TTL = parseInt(process.env.CHUNK_CACHE_TTL_MS || '300000', 10)
 const MAX_HITS_GLOBAL = 50
-const blobServiceClient = AZURE_CONNECTION_STRING
-? BlobServiceClient.fromConnectionString(AZURE_CONNECTION_STRING)
-: null
+const blobServiceClient = AZURE_CONNECTION_STRING ? BlobServiceClient.fromConnectionString(AZURE_CONNECTION_STRING) : null
 const SUPPORTED_EXTENSIONS = new Set([
 '.pdf', '.docx', '.doc', '.txt', '.rtf', '.odt',
 '.xlsx', '.xls', '.ods', '.csv', '.tsv',
@@ -103,9 +93,7 @@ if (Date.now() - entry.ts > RESPONSE_CACHE_TTL) { RESPONSE_CACHE.delete(key); re
 return entry.value
 }
 function responseCacheSet(key, value) {
-if (RESPONSE_CACHE.size >= RESPONSE_CACHE_MAX) {
-RESPONSE_CACHE.delete(RESPONSE_CACHE.keys().next().value)
-}
+if (RESPONSE_CACHE.size >= RESPONSE_CACHE_MAX) RESPONSE_CACHE.delete(RESPONSE_CACHE.keys().next().value)
 RESPONSE_CACHE.set(key, { value, ts: Date.now() })
 }
 const SYNONYM_MAP = [
@@ -123,43 +111,24 @@ const SYNONYM_MAP = [
 ]
 function applySynonyms(query) {
 let q = query
-for (const { pattern, canonical } of SYNONYM_MAP) {
-q = q.replace(pattern, canonical)
-}
+for (const { pattern, canonical } of SYNONYM_MAP) q = q.replace(pattern, canonical)
 return q
 }
 const TYPO_MAP = {
-ehat: 'what',
-waht: 'what',
-whta: 'what',
-whar: 'what',
-hwo: 'how',
-hoe: 'how',
-difine: 'define',
-definr: 'define',
-defien: 'define',
-defne: 'define',
-deifne: 'define',
-expain: 'explain',
-expalin: 'explain',
-explian: 'explain',
-wht: 'what',
-shwo: 'show',
-lsit: 'list',
-lits: 'list',
+ehat: 'what', waht: 'what', whta: 'what', whar: 'what',
+hwo: 'how', hoe: 'how',
+difine: 'define', definr: 'define', defien: 'define', defne: 'define', deifne: 'define',
+expain: 'explain', expalin: 'explain', explian: 'explain',
+wht: 'what', shwo: 'show', lsit: 'list', lits: 'list',
 }
 function applyTypos(query) {
-return query
-.split(/\s+/)
-.map(w => {
+return query.split(/\s+/).map(w => {
 const lower = w.toLowerCase()
 return TYPO_MAP[lower] !== undefined ? TYPO_MAP[lower] : w
-})
-.join(' ')
+}).join(' ')
 }
 function levenshteinDistance(a, b) {
-const m = a.length
-const n = b.length
+const m = a.length, n = b.length
 const dp = Array.from({ length: m + 1 }, (_, i) => Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0)))
 for (let i = 1; i <= m; i++) {
 for (let j = 1; j <= n; j++) {
@@ -177,8 +146,7 @@ return 1 - dist / Math.max(a.length, b.length)
 }
 function normalizeQueryForCache(query) {
 return applySynonyms(query)
-.toLowerCase()
-.trim()
+.toLowerCase().trim()
 .replace(/\bweek\s+(\d)\b/g, (_, n) => `week 0${n}`)
 .replace(/^(what\s+is\s+(the\s+)?(definition|meaning)\s+(of|for|to)\s+)/i, '')
 .replace(/^(define\s+(the\s+)?)/i, '')
@@ -189,9 +157,7 @@ return applySynonyms(query)
 .replace(/^(how\s+(do\s+you\s+|is\s+|are\s+)?calculate\s+(the\s+)?)/i, '')
 .replace(/^(describe\s+(the\s+|me\s+)?)/i, '')
 .replace(/^(meaning\s+of\s+(the\s+)?)/i, '')
-.replace(/[?!.]+$/, '')
-.replace(/\s+/g, ' ')
-.trim()
+.replace(/[?!.]+$/, '').replace(/\s+/g, ' ').trim()
 }
 function getCacheKey(clientId, query) {
 return `${clientId}:${normalizeQueryForCache(query)}`
@@ -217,9 +183,7 @@ tryRun()
 })
 }
 function drainAskedataQueue() {
-if (askedataQueue.length > 0 && askedataActiveCount < ASKDATA_MAX_CONCURRENT) {
-askedataQueue.shift()()
-}
+if (askedataQueue.length > 0 && askedataActiveCount < ASKDATA_MAX_CONCURRENT) askedataQueue.shift()()
 }
 let askedataFailures = 0
 let askedataBlockedUntil = 0
@@ -270,15 +234,6 @@ clearTimeout(timer)
 function escapeRegex(str) {
 return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
-function cosineSim(a, b) {
-let dot = 0, normA = 0, normB = 0
-for (let i = 0; i < a.length; i++) {
-dot += a[i] * b[i]
-normA += a[i] * a[i]
-normB += b[i] * b[i]
-}
-return dot / (Math.sqrt(normA) * Math.sqrt(normB) + 1e-9)
-}
 function buildInvertedIndex(chunks) {
 const index = new Map()
 for (let i = 0; i < chunks.length; i++) {
@@ -293,11 +248,9 @@ return index
 }
 function normalizeQuery(query) {
 return applySynonyms(query)
-.toLowerCase()
-.trim()
+.toLowerCase().trim()
 .replace(/\bweek\s+(\d)\b/g, (_, n) => `week 0${n}`)
-.replace(/[?!.]+$/, '')
-.replace(/\s+/g, ' ')
+.replace(/[?!.]+$/, '').replace(/\s+/g, ' ')
 }
 function validateQuery(query) {
 if (!query || typeof query !== 'string') return { valid: false, message: 'Please enter a complete question to get an accurate answer.' }
@@ -475,14 +428,10 @@ if (posTerm === null || posTerm === undefined) continue
 const queryHasPositive = posTerm.length > 0 && new RegExp(`\\b${escapeRegex(posTerm)}\\b`, 'i').test(qs)
 const queryHasNegative = new RegExp(`\\b${escapeRegex(negTerm)}\\b`, 'i').test(qs)
 if (queryHasPositive && !queryHasNegative) {
-if (new RegExp(`\\b${escapeRegex(negTerm)}\\b`, 'i').test(ct)) {
-penalty += 30
-}
+if (new RegExp(`\\b${escapeRegex(negTerm)}\\b`, 'i').test(ct)) penalty += 30
 }
 if (queryHasNegative) {
-if (posTerm.length > 0 && !new RegExp(`\\b${escapeRegex(negTerm)}\\b`, 'i').test(ct) && new RegExp(`\\b${escapeRegex(posTerm)}\\b`, 'i').test(ct)) {
-penalty += 20
-}
+if (posTerm.length > 0 && !new RegExp(`\\b${escapeRegex(negTerm)}\\b`, 'i').test(ct) && new RegExp(`\\b${escapeRegex(posTerm)}\\b`, 'i').test(ct)) penalty += 20
 }
 }
 return penalty
@@ -497,9 +446,7 @@ if (w.length >= 3 && !stopWords.has(w)) vocab.add(w)
 }
 if (chunk.metadata && chunk.metadata.measure) {
 const measureWords = chunk.metadata.measure.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/)
-for (const w of measureWords) {
-if (w.length >= 3 && !stopWords.has(w)) vocab.add(w)
-}
+for (const w of measureWords) { if (w.length >= 3 && !stopWords.has(w)) vocab.add(w) }
 }
 }
 return [...vocab]
@@ -526,7 +473,7 @@ const { bestMatch } = stringSimilarity.findBestMatch(wordLower, vocabulary)
 const levSim = levenshteinSimilarity(wordLower, bestMatch.target)
 const combinedScore = bestMatch.rating * 0.6 + levSim * 0.4
 if (combinedScore >= 0.72 && bestMatch.target !== wordLower) {
-console.log(`[fuzzyCorrect] "${word}" → "${bestMatch.target}" (combined: ${combinedScore.toFixed(3)}, trigram: ${bestMatch.rating.toFixed(3)}, lev: ${levSim.toFixed(3)})`)
+console.log(`[fuzzyCorrect] "${word}" -> "${bestMatch.target}" (combined: ${combinedScore.toFixed(3)}, trigram: ${bestMatch.rating.toFixed(3)}, lev: ${levSim.toFixed(3)})`)
 return bestMatch.target
 }
 return word
@@ -553,18 +500,11 @@ const response = await fetchWithTimeout(
 ASKDATA2_ENDPOINT,
 {
 method: 'POST',
-headers: {
-'Content-Type': 'application/json',
-'Authorization': `Bearer ${ASKDATA2_KEY}`,
-'Accept': 'application/json',
-},
+headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${ASKDATA2_KEY}`, 'Accept': 'application/json' },
 body: JSON.stringify({
 model: ASKDATA2_MODEL,
 messages: [
-{
-role: 'system',
-content: 'You are a query rewriter for a real estate analytics data dictionary RAG system. Fix spelling, grammar, ambiguity, and structure. Expand abbreviations (app→application, occ→occupancy). Normalize week numbers (week 5→week 05). Return ONLY the rewritten query as plain text. No explanation. If already correct, return unchanged.',
-},
+{ role: 'system', content: 'You are a query rewriter for a real estate analytics data dictionary RAG system. Fix spelling, grammar, ambiguity, and structure. Expand abbreviations (app->application, occ->occupancy). Normalize week numbers (week 5->week 05). Return ONLY the rewritten query as plain text. No explanation. If already correct, return unchanged.' },
 { role: 'user', content: query },
 ],
 max_tokens: 120,
@@ -579,9 +519,7 @@ if (!response.ok) return query
 const data = await response.json()
 const rewritten = (data.choices?.[0]?.message?.content || '').trim().replace(/^["']|["']$/g, '').trim()
 if (!rewritten || rewritten.length < 3 || rewritten.length > query.length * 4) return query
-if (rewritten.toLowerCase() !== query.toLowerCase()) {
-console.log(`[QueryPipeline] After rewrite: "${rewritten}"`)
-}
+if (rewritten.toLowerCase() !== query.toLowerCase()) console.log(`[QueryPipeline] After rewrite: "${rewritten}"`)
 return rewritten
 } catch (err) {
 console.warn(`[rewriteQueryWithAskdata2] Bypassed (${err.message}), using original query`)
@@ -604,10 +542,7 @@ method: 'POST',
 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${ASKDATA_KEY}` },
 body: JSON.stringify({
 model: ASKDATA_MODEL,
-messages: [
-{ role: 'system', content: systemPrompt },
-{ role: 'user', content: userMessage },
-],
+messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
 temperature: 0.1,
 max_tokens: maxTokens,
 }),
@@ -634,17 +569,10 @@ const response = await fetchWithTimeout(
 ASKDATA2_ENDPOINT,
 {
 method: 'POST',
-headers: {
-'Content-Type': 'application/json',
-'Authorization': `Bearer ${ASKDATA2_KEY}`,
-'Accept': 'application/json',
-},
+headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${ASKDATA2_KEY}`, 'Accept': 'application/json' },
 body: JSON.stringify({
 model: ASKDATA2_MODEL,
-messages: [
-{ role: 'system', content: systemPrompt },
-{ role: 'user', content: userMessage },
-],
+messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
 max_tokens: maxTokens,
 temperature: 0.1,
 top_p: 1.0,
@@ -689,79 +617,6 @@ console.error(`[ASKDATA2] Also failed: ${err.message}`)
 }
 return ''
 }
-async function embedQueryAzure(query) {
-if (!AZURE_EMBED_ENDPOINT || !AZURE_EMBED_KEY) return null
-try {
-const response = await fetchWithTimeout(
-AZURE_EMBED_ENDPOINT,
-{
-method: 'POST',
-headers: { 'Content-Type': 'application/json', 'api-key': AZURE_EMBED_KEY },
-body: JSON.stringify({ input: query, model: AZURE_EMBED_MODEL }),
-},
-EMBED_TIMEOUT_MS
-)
-if (!response.ok) return null
-const data = await response.json()
-return data.data?.[0]?.embedding || null
-} catch { return null }
-}
-async function embedBatch(texts) {
-if (!AZURE_EMBED_ENDPOINT || !AZURE_EMBED_KEY || !texts.length) return []
-try {
-const response = await fetchWithTimeout(
-AZURE_EMBED_ENDPOINT,
-{
-method: 'POST',
-headers: { 'Content-Type': 'application/json', 'api-key': AZURE_EMBED_KEY },
-body: JSON.stringify({ input: texts, model: AZURE_EMBED_MODEL }),
-},
-EMBED_TIMEOUT_MS
-)
-if (!response.ok) return []
-const data = await response.json()
-return (data.data || []).sort((a, b) => a.index - b.index).map(d => d.embedding)
-} catch { return [] }
-}
-async function rerankerScore(query, texts) {
-if (!RERANKER_ENDPOINT) return null
-try {
-const response = await fetchWithTimeout(
-RERANKER_ENDPOINT,
-{
-method: 'POST',
-headers: {
-'Content-Type': 'application/json',
-...(RERANKER_KEY ? { 'Authorization': `Bearer ${RERANKER_KEY}` } : {}),
-},
-body: JSON.stringify({ query, texts }),
-},
-RERANKER_TIMEOUT_MS
-)
-if (!response.ok) return null
-const data = await response.json()
-if (Array.isArray(data)) return data.map(d => (typeof d === 'number' ? d : d.score ?? 0))
-if (Array.isArray(data.scores)) return data.scores
-return null
-} catch (err) {
-console.warn(`[reranker] Failed: ${err.message}`)
-return null
-}
-}
-async function rerankChunks(query, chunks) {
-if (!RERANKER_ENDPOINT || chunks.length === 0) return chunks
-try {
-const texts = chunks.map(c => (c.text || '').slice(0, 512))
-const scores = await rerankerScore(query, texts)
-if (!scores || scores.length !== chunks.length) return chunks
-return chunks
-.map((c, i) => ({ ...c, _rerankerScore: scores[i] }))
-.sort((a, b) => b._rerankerScore - a._rerankerScore)
-} catch (err) {
-console.warn(`[rerankChunks] Reranker error, skipping: ${err.message}`)
-return chunks
-}
-}
 function scoreHeaderMatch(header, patterns) {
 const h = header.toLowerCase().trim()
 for (const [regex, score] of patterns) {
@@ -789,12 +644,8 @@ const FORMULA_PATTERNS = [
 [/\b(formula|calculation|calc|how\s+calculated|computed\s+as)\b/, 100],
 [/^formula$/, 90],
 ]
-const URL_PATTERNS = [
-[/\b(url|link|href|report\s+link|dashboard)\b/, 100],
-]
-const ADDITIONAL_PATTERNS = [
-[/\b(additional|extra|notes?|info|configuration|config|mdm)\b/, 100],
-]
+const URL_PATTERNS = [[/\b(url|link|href|report\s+link|dashboard)\b/, 100]]
+const ADDITIONAL_PATTERNS = [[/\b(additional|extra|notes?|info|configuration|config|mdm)\b/, 100]]
 const colIdx = {}
 const scored = headers.map((h, i) => ({
 i,
@@ -820,7 +671,6 @@ return colIdx
 function extractSpreadsheet(buffer) {
 const workbook = XLSX.read(buffer, { type: 'buffer', cellNF: true })
 const rows = []
-const headerParts = []
 for (const sheetName of workbook.SheetNames) {
 const sheet = workbook.Sheets[sheetName]
 const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: '', header: 1, raw: false })
@@ -842,7 +692,6 @@ if (h !== '') { lastNonBlank = h; headers.push(h) }
 else headers.push(lastNonBlank || `Col${headers.length + 1}`)
 }
 const colIdx = detectColumns(headers)
-headerParts.push(`=== Sheet: ${sheetName} ===`)
 let rowsEmitted = 0
 for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
 const row = rawRows[i]
@@ -855,91 +704,67 @@ const urlVal = colIdx.url !== undefined ? (cells[colIdx.url] || '').trim() : ''
 const additionalVal = colIdx.additional !== undefined ? (cells[colIdx.additional] || '').trim() : ''
 let formulaVal = colIdx.formula !== undefined ? (cells[colIdx.formula] || '').trim() : ''
 if (!formulaVal && descVal) {
-const formulaPatterns = [
-/(.*?\/.*?)/i,
-/(=.*?)/i,
-/(calculated\s+as.*)/i,
-/(computed\s+as.*)/i,
-/(divided\s+by.*)/i,
-/(multiplied\s+by.*)/i,
-/(sum\s+of.*)/i,
-]
+const formulaPatterns = [/(.*?\/.*?)/i, /(=.*?)/i, /(calculated\s+as.*)/i, /(computed\s+as.*)/i, /(divided\s+by.*)/i, /(multiplied\s+by.*)/i, /(sum\s+of.*)/i]
 for (const pattern of formulaPatterns) {
 const match = descVal.match(pattern)
-if (match && match[0].trim().length > 3) {
-formulaVal = match[0].trim()
-break
-}
+if (match && match[0].trim().length > 3) { formulaVal = match[0].trim(); break }
 }
 }
 if (nameVal) {
 let synthesis = `${nameVal}`
 if (tableVal && tableVal !== sheetName) synthesis += ` (${tableVal})`
 if (descVal) synthesis += ` is defined as: ${descVal}`
-if (formulaVal && !descVal.toLowerCase().includes(formulaVal.toLowerCase())) {
-synthesis += `. Formula: ${formulaVal}`
-}
+if (formulaVal && !descVal.toLowerCase().includes(formulaVal.toLowerCase())) synthesis += `. Formula: ${formulaVal}`
 if (additionalVal) synthesis += `. Additional Info: ${additionalVal}`
 if (urlVal) synthesis += `. URL: ${urlVal}`
-rows.push({
-text: synthesis,
-metadata: {
-measure: nameVal,
-table: tableVal || sheetName,
-formula: formulaVal || '',
-description: descVal || '',
-url: urlVal || '',
-sourceSheet: sheetName,
-}
-})
+rows.push({ text: synthesis, metadata: { measure: nameVal, table: tableVal || sheetName, formula: formulaVal || '', description: descVal || '', url: urlVal || '', sourceSheet: sheetName } })
 if (formulaVal) {
-rows.push({
-text: `How to calculate ${nameVal}: ${formulaVal}`,
-metadata: { measure: nameVal, table: tableVal || sheetName, formula: formulaVal, description: descVal || '', url: '', sourceSheet: sheetName }
-})
-rows.push({
-text: `Formula for ${nameVal}: ${formulaVal}`,
-metadata: { measure: nameVal, table: tableVal || sheetName, formula: formulaVal, description: descVal || '', url: '', sourceSheet: sheetName }
-})
+rows.push({ text: `How to calculate ${nameVal}: ${formulaVal}`, metadata: { measure: nameVal, table: tableVal || sheetName, formula: formulaVal, description: descVal || '', url: '', sourceSheet: sheetName } })
+rows.push({ text: `Formula for ${nameVal}: ${formulaVal}`, metadata: { measure: nameVal, table: tableVal || sheetName, formula: formulaVal, description: descVal || '', url: '', sourceSheet: sheetName } })
 }
 if (urlVal) {
-rows.push({
-text: `Report URL for ${nameVal}: ${urlVal}`,
-metadata: { measure: nameVal, table: tableVal || sheetName, formula: '', description: '', url: urlVal, sourceSheet: sheetName }
-})
-rows.push({
-text: `Power BI link for ${nameVal}: ${urlVal}`,
-metadata: { measure: nameVal, table: tableVal || sheetName, formula: '', description: '', url: urlVal, sourceSheet: sheetName }
-})
-if (tableVal && tableVal !== sheetName) {
-rows.push({
-text: `Report URL for ${nameVal} (${tableVal}): ${urlVal}`,
-metadata: { measure: nameVal, table: tableVal, formula: '', description: '', url: urlVal, sourceSheet: sheetName }
-})
-}
+rows.push({ text: `Report URL for ${nameVal}: ${urlVal}`, metadata: { measure: nameVal, table: tableVal || sheetName, formula: '', description: '', url: urlVal, sourceSheet: sheetName } })
+rows.push({ text: `Power BI link for ${nameVal}: ${urlVal}`, metadata: { measure: nameVal, table: tableVal || sheetName, formula: '', description: '', url: urlVal, sourceSheet: sheetName } })
+if (tableVal && tableVal !== sheetName) rows.push({ text: `Report URL for ${nameVal} (${tableVal}): ${urlVal}`, metadata: { measure: nameVal, table: tableVal, formula: '', description: '', url: urlVal, sourceSheet: sheetName } })
 }
 rowsEmitted++
 } else if (descVal) {
-rows.push({
-text: descVal,
-metadata: { measure: '', table: tableVal || sheetName, formula: '', description: descVal, url: '', sourceSheet: sheetName }
-})
+rows.push({ text: descVal, metadata: { measure: '', table: tableVal || sheetName, formula: '', description: descVal, url: '', sourceSheet: sheetName } })
 }
 }
 if (rowsEmitted === 0) {
 for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
 const row = rawRows[i]
 const cells = row.map(c => String(c || '').trim()).filter(Boolean)
-if (cells.length) {
-rows.push({
-text: cells.join(' | '),
-metadata: { measure: '', table: sheetName, formula: '', description: '', url: '', sourceSheet: sheetName }
-})
-}
+if (cells.length) rows.push({ text: cells.join(' | '), metadata: { measure: '', table: sheetName, formula: '', description: '', url: '', sourceSheet: sheetName } })
 }
 }
 }
 return rows
+}
+function classifyDocumentType(chunks, fileName) {
+const ext = ('.' + fileName.split('.').pop()).toLowerCase()
+const codeExts = new Set(['.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.cpp', '.c', '.h', '.cs', '.go', '.rb', '.php', '.swift', '.kt', '.r', '.sql', '.sh', '.bash', '.ps1'])
+const spreadsheetExts = new Set(['.xlsx', '.xls', '.ods', '.csv', '.tsv'])
+if (codeExts.has(ext)) return 'code'
+if (spreadsheetExts.has(ext)) return 'data_dictionary'
+if (!chunks || chunks.length === 0) return 'unstructured'
+const metaChunks = chunks.filter(c => c.metadata && c.metadata.measure).length
+if (metaChunks / Math.max(chunks.length, 1) > 0.4) return 'data_dictionary'
+const sample = chunks.slice(0, 10).map(c => c.text || '').join('\n')
+const ddSignals = [/is defined as:/i, /formula\s*:/i, /how to calculate/i, /report url for/i, /power bi link for/i].filter(p => p.test(sample)).length
+if (ddSignals >= 2) return 'data_dictionary'
+const codeSignals = [/^(function|class|def|import|const|let|var|async)\s/m, /=>\s*{/, /\bpublic\s+(static\s+)?\w+\s+\w+\s*\(/m].filter(p => p.test(sample)).length
+if (codeSignals >= 2) return 'code'
+const tableSignals = [/\|.*\|.*\|/, /^\s*[-|]+\s*$/m].filter(p => p.test(sample)).length
+if (tableSignals >= 2) return 'tabular'
+return 'unstructured'
+}
+function detectDocTypeFromChunks(chunks) {
+if (!chunks || chunks.length === 0) return 'unstructured'
+const ddCount = chunks.filter(c => c.metadata && c.metadata.measure).length
+if (ddCount / Math.max(chunks.length, 1) > 0.4) return 'data_dictionary'
+return 'unstructured'
 }
 function keywordSearch(query, chunks, topK, intent, invertedIndex) {
 const subject = extractSubject(query)
@@ -966,11 +791,8 @@ for (const idx of (invertedIndex.get(w) || new Set())) union.add(idx)
 }
 candidateIndices = union
 }
-const source = candidateIndices
-? [...candidateIndices].map(i => chunks[i]).filter(Boolean)
-: chunks.slice(0, 200)
-return source
-.map(c => {
+const source = candidateIndices ? [...candidateIndices].map(i => chunks[i]).filter(Boolean) : chunks.slice(0, 200)
+return source.map(c => {
 const text = (c.text || '').toLowerCase()
 let score = 0
 if (intent === 'all_urls') {
@@ -1006,20 +828,14 @@ if (/\bformula for\b/i.test(text)) score += 12
 }
 if (c.metadata && c.metadata.measure) {
 const measureLower = (c.metadata.measure || '').toLowerCase().trim()
-if (measureLower === subject.toLowerCase().trim()) {
-score += 100
-} else if (subjectWords.some(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(measureLower))) {
-score += 10
-}
+if (measureLower === subject.toLowerCase().trim()) score += 100
+else if (subjectWords.some(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(measureLower))) score += 10
 }
 const penalty = computeNegativePenalty(subject, c.text || '')
 score -= penalty
 }
 return { ...c, _score: score }
-})
-.filter(c => c._score > 0)
-.sort((a, b) => b._score - a._score)
-.slice(0, topK)
+}).filter(c => c._score > 0).sort((a, b) => b._score - a._score).slice(0, topK)
 }
 function relaxedKeywordSearch(query, chunks, topK, invertedIndex) {
 const subject = extractSubject(query)
@@ -1038,72 +854,35 @@ for (const idx of (invertedIndex.get(variant) || new Set())) union.add(idx)
 }
 }
 const source = union.size > 0 ? [...union].map(i => chunks[i]).filter(Boolean) : chunks.slice(0, 300)
-return source
-.map(c => {
+return source.map(c => {
 const text = (c.text || '').toLowerCase()
 const matched = uniqueWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(text)).length
 const subjectMatch = subject.length > 2 && new RegExp(`\\b${escapeRegex(subject.toLowerCase())}\\b`, 'i').test(text) ? 5 : 0
 let metaBoost = 0
 if (c.metadata && c.metadata.measure) {
 const ml = c.metadata.measure.toLowerCase()
-if (ml === subject.toLowerCase().trim()) {
-metaBoost += 50
-} else {
+if (ml === subject.toLowerCase().trim()) metaBoost += 50
+else {
 const subjectMatched = uniqueWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(ml)).length
 metaBoost = subjectMatched * 3
 }
 }
 const penalty = computeNegativePenalty(subject, c.text || '')
 return { ...c, _score: Math.max(0, matched + subjectMatch + metaBoost - penalty) }
-})
-.filter(c => c._score > 0)
-.sort((a, b) => b._score - a._score)
-.slice(0, topK)
+}).filter(c => c._score > 0).sort((a, b) => b._score - a._score).slice(0, topK)
 }
 async function retrieveChunks(query, chunks, topK, invertedIndex, _isRetry = false) {
 const intent = detectQueryIntent(query)
 const normalizedQuery = normalizeQuery(query).replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
-const MAX_HITS = MAX_HITS_GLOBAL
-if (intent === 'all_urls') {
-return chunks.filter(c => /https?:\/\/\S+/.test(c.text || '')).slice(0, 100)
-}
+if (intent === 'all_urls') return chunks.filter(c => /https?:\/\/\S+/.test(c.text || '')).slice(0, 100)
 const candidates = keywordSearch(normalizedQuery, chunks, Math.min(150, chunks.length), intent, invertedIndex)
 const pool = candidates.length > 0 ? candidates : chunks.slice(0, 150)
 const topScore = pool[0]?._score || 0
 let topCandidates = []
-if (topScore >= 6) topCandidates = pool.slice(0, Math.min(MAX_HITS, pool.length))
-else if ((intent === 'definition' || intent === 'calculation') && topScore >= 3) topCandidates = pool.slice(0, Math.min(MAX_HITS, pool.length))
+if (topScore >= 6) topCandidates = pool.slice(0, Math.min(MAX_HITS_GLOBAL, pool.length))
+else if ((intent === 'definition' || intent === 'calculation') && topScore >= 3) topCandidates = pool.slice(0, Math.min(MAX_HITS_GLOBAL, pool.length))
 else if (intent === 'url_lookup' && pool.length > 0) return pool.slice(0, Math.min(topK, 6))
-if (topCandidates.length === 0 && AZURE_EMBED_ENDPOINT && AZURE_EMBED_KEY) {
-try {
-const queryVec = await embedQueryAzure(normalizedQuery)
-if (queryVec) {
-const poolSlice = pool.slice(0, EMBED_POOL_LIMIT)
-const embeddings = await embedBatch(poolSlice.map(c => (c.text || '').slice(0, 512)))
-const maxKeyword = pool[0]?._score || 1
-const weight = (intent === 'definition' || intent === 'calculation')
-? { semantic: 0.35, keyword: 0.65 }
-: { semantic: 0.70, keyword: 0.30 }
-const scored = poolSlice.map((c, i) => {
-if (!embeddings[i]) return c
-const semanticScore = cosineSim(queryVec, embeddings[i])
-const keywordNorm = typeof c._score === 'number' ? c._score / maxKeyword : 0
-return { ...c, _score: semanticScore * weight.semantic + keywordNorm * weight.keyword }
-})
-const remainder = pool.slice(EMBED_POOL_LIMIT).map(c => ({
-...c,
-_score: (typeof c._score === 'number' ? c._score / maxKeyword : 0) * weight.keyword,
-}))
-const result = [...scored, ...remainder].sort((a, b) => b._score - a._score).slice(0, Math.min(MAX_HITS, MAX_HITS_GLOBAL))
-if (result.length > 0) topCandidates = result
-}
-} catch (err) {
-console.warn('[retrieveChunks] Embedding failed, using keyword fallback:', err.message)
-}
-}
-if (topCandidates.length === 0 && pool.length > 0) {
-topCandidates = pool.slice(0, Math.min(MAX_HITS, pool.length))
-}
+if (topCandidates.length === 0 && pool.length > 0) topCandidates = pool.slice(0, Math.min(MAX_HITS_GLOBAL, pool.length))
 if (topCandidates.length === 0 && !_isRetry) {
 const corrected = fuzzyCorrectQuery(query, chunks)
 if (corrected.toLowerCase() !== query.toLowerCase()) {
@@ -1111,14 +890,8 @@ console.log(`[QueryPipeline] Self-healing retry with fuzzy-corrected query: "${c
 return retrieveChunks(corrected, chunks, topK, invertedIndex, true)
 }
 }
-if (topCandidates.length === 0) {
-topCandidates = relaxedKeywordSearch(normalizedQuery, chunks, Math.min(topK * 2, 64), invertedIndex).slice(0, Math.min(topK, MAX_HITS))
-}
-if (RERANKER_ENDPOINT && topCandidates.length > 1) {
-const reranked = await rerankChunks(normalizedQuery, topCandidates)
-return reranked.slice(0, Math.min(topK, 5))
-}
-return topCandidates.slice(0, Math.min(topK, MAX_HITS))
+if (topCandidates.length === 0) topCandidates = relaxedKeywordSearch(normalizedQuery, chunks, Math.min(topK * 2, 64), invertedIndex).slice(0, Math.min(topK, MAX_HITS_GLOBAL))
+return topCandidates.slice(0, Math.min(topK, MAX_HITS_GLOBAL))
 }
 function buildContext(hits) {
 const seen = new Set()
@@ -1133,7 +906,7 @@ const limit = i === 0 ? 1200 : 900
 return `[Source ${i + 1}]\n${(h.text || '').trim().slice(0, limit)}`
 }).join('\n\n---\n\n')
 }
-function buildSystemPrompt(intent) {
+function buildSystemPrompt(intent, docType) {
 const intentRule = intent === 'definition'
 ? `Definition: Bold measure name, one sentence definition only. No formula or calculation details.`
 : intent === 'calculation'
@@ -1141,6 +914,15 @@ const intentRule = intent === 'definition'
 : intent === 'comparison'
 ? `Comparison: Bold each name. Write a concise definition for each. End with a "**Key Difference:**" sentence derived strictly from the context. Do not invent differences.`
 : `General: Answer directly in 2-4 sentences. Do not volunteer formulas or definitions unprompted.`
+if (docType === 'code') {
+return `You are a code assistant. Answer questions about the provided code accurately using ONLY the context. Reference specific functions or classes when relevant. Do not fabricate logic not shown. If context lacks the answer, say: "I could not find this in your documents."`
+}
+if (docType === 'tabular') {
+return `You are a tabular data assistant. Answer questions using only the table data provided. Refer to specific rows and columns when relevant. Do not invent data. If context lacks the answer, say: "I could not find this in your documents."`
+}
+if (docType === 'unstructured') {
+return `You are a helpful document assistant. Answer questions accurately using ONLY the provided context. Write complete, clear sentences. Do not hallucinate facts. Be concise. If context lacks the answer, say: "I could not find this in your documents."`
+}
 return `You are a data dictionary assistant for a real estate analytics platform. Answer ONLY from context.
 Rules: Bold the subject with **Name**. Write complete sentences only. No pipe-delimited data. No double periods. No source references like [1]. No sheet references. Keep answers concise.
 If context lacks the answer, say: "I could not find this in your documents."
@@ -1186,11 +968,7 @@ name = reportUrlMatch[1].trim()
 } else {
 const beforeUrl = line.slice(0, line.indexOf('http')).trim()
 if (beforeUrl) {
-const cleaned = beforeUrl
-.replace(/\.\s*URL\s*:?\s*$/i, '')
-.replace(/\s*:\s*$/, '')
-.replace(/^(URL|Link|Dashboard|Report)\s*:?\s*/i, '')
-.trim()
+const cleaned = beforeUrl.replace(/\.\s*URL\s*:?\s*$/i, '').replace(/\s*:\s*$/, '').replace(/^(URL|Link|Dashboard|Report)\s*:?\s*/i, '').trim()
 if (cleaned.length > 1 && cleaned.length < 120) name = cleaned
 }
 }
@@ -1201,14 +979,14 @@ results.push({ name, url: cleanUrl })
 return results
 }
 function buildFallbackAnswer(query, hits, intent) {
-if (!hits || hits.length === 0) return "I could not find relevant information about this in your documents."
+if (!hits || hits.length === 0) return 'I could not find relevant information about this in your documents.'
 const resolvedIntent = intent || detectQueryIntent(query)
 const subject = extractSubject(query)
 const subjectLower = subject.toLowerCase()
 const escapedSubject = escapeRegex(subjectLower)
 if (resolvedIntent === 'all_urls') {
 const urlEntries = extractAllUrlsFromChunks(hits)
-if (urlEntries.length === 0) return "I could not find any URLs in your documents."
+if (urlEntries.length === 0) return 'I could not find any URLs in your documents.'
 return urlEntries.map(e => `**${e.name}:** ${e.url}`).join('\n')
 }
 if (resolvedIntent === 'url_lookup') {
@@ -1230,39 +1008,29 @@ const urlMatch = line.match(urlRegex)
 if (urlMatch) return urlMatch[0].replace(/[.,;)]+$/, '').trim()
 }
 }
-return "I could not find a matching URL in your documents."
+return 'I could not find a matching URL in your documents.'
 }
 if (resolvedIntent === 'calculation') {
 for (const h of hits) {
 if (h.metadata && h.metadata.formula && new RegExp(`\\b${escapedSubject}\\b`, 'i').test(h.metadata.measure || '')) {
-const cap = capFirst(h.metadata.measure)
-return ensureSinglePeriod(`**Formula for ${cap}:** ${h.metadata.formula}.`)
+return ensureSinglePeriod(`**Formula for ${capFirst(h.metadata.measure)}:** ${h.metadata.formula}.`)
 }
 }
 const calcPattern = new RegExp(`how to calculate ${escapedSubject}:\\s*([^\\n]+)`, 'im')
 for (const h of hits) {
 const m = (h.text || '').match(calcPattern)
-if (m) {
-const cap = capFirst(subject)
-return ensureSinglePeriod(`**Formula for ${cap}:** ${trimToCompleteSentence(m[1].trim(), 500)}.`)
-}
+if (m) return ensureSinglePeriod(`**Formula for ${capFirst(subject)}:** ${trimToCompleteSentence(m[1].trim(), 500)}.`)
 }
 const formulaPattern = new RegExp(`formula for ${escapedSubject}:\\s*([^\\n]+)`, 'im')
 for (const h of hits) {
 const m = (h.text || '').match(formulaPattern)
-if (m) {
-const cap = capFirst(subject)
-return ensureSinglePeriod(`**Formula for ${cap}:** ${trimToCompleteSentence(m[1].trim(), 500)}.`)
-}
+if (m) return ensureSinglePeriod(`**Formula for ${capFirst(subject)}:** ${trimToCompleteSentence(m[1].trim(), 500)}.`)
 }
 for (const h of hits) {
 const text = h.text || ''
 if (!new RegExp(`\\b${escapedSubject}\\b`, 'i').test(text)) continue
 const extracted = extractFormulaFromText(text)
-if (extracted) {
-const cap = capFirst(subject)
-return ensureSinglePeriod(`**Formula for ${cap}:** ${extracted}.`)
-}
+if (extracted) return ensureSinglePeriod(`**Formula for ${capFirst(subject)}:** ${extracted}.`)
 }
 return `I could not find a formula for ${capFirst(subject)} in your documents.`
 }
@@ -1271,9 +1039,7 @@ if (h.metadata && h.metadata.measure) {
 const measureLower = (h.metadata.measure || '').toLowerCase().trim()
 if (measureLower === subjectLower || new RegExp(`\\b${escapedSubject}\\b`, 'i').test(measureLower) || new RegExp(`\\b${escapeRegex(measureLower)}\\b`, 'i').test(subjectLower)) {
 const cap = capFirst(h.metadata.measure)
-if (resolvedIntent === 'definition' && h.metadata.description) {
-return ensureSinglePeriod(`**${cap}** is defined as: ${h.metadata.description}.`)
-}
+if (resolvedIntent === 'definition' && h.metadata.description) return ensureSinglePeriod(`**${cap}** is defined as: ${h.metadata.description}.`)
 let answer = `**${cap}**`
 if (h.metadata.description) answer += ` is defined as: ${h.metadata.description}`
 if (!answer.endsWith('.')) answer += '.'
@@ -1314,11 +1080,10 @@ if (cleaned.length > 15) matchingLines.push(cleaned)
 }
 }
 if (matchingLines.length > 0) {
-const cap = capFirst(subject)
 const joined = trimToCompleteSentence([...new Set(matchingLines)].slice(0, 3).join(' '), 600)
-return ensureSinglePeriod(`**${cap}:** ${joined}.`)
+return ensureSinglePeriod(`**${capFirst(subject)}:** ${joined}.`)
 }
-return "I could not find that specific information in your documents."
+return 'I could not find that specific information in your documents.'
 }
 function cleanAnswer(rawAnswer) {
 if (!rawAnswer) return ''
@@ -1347,8 +1112,8 @@ const periodIdx = text.lastIndexOf('.')
 if (periodIdx > text.length * 0.5) return text.slice(0, periodIdx + 1).trim()
 return text
 }
-async function generateAnswer(query, hits, intent) {
-return callBestAvailableEngine(buildSystemPrompt(intent), buildUserMessage(query, hits, intent), 1024)
+async function generateAnswer(query, hits, intent, docType) {
+return callBestAvailableEngine(buildSystemPrompt(intent, docType), buildUserMessage(query, hits, intent), 1024)
 }
 async function generateAnswerForTopic(topic, chunks, topK, invertedIndex) {
 const topicQuery = `what is ${topic}`
@@ -1356,10 +1121,11 @@ let hits = await retrieveChunks(topicQuery, chunks, topK, invertedIndex)
 if (hits.length === 0) hits = relaxedKeywordSearch(topicQuery, chunks, 32, invertedIndex)
 if (hits.length === 0) return null
 const intent = 'definition'
+const docType = detectDocTypeFromChunks(chunks)
 let rawAnswer = ''
 try {
 rawAnswer = await Promise.race([
-generateAnswer(topicQuery, hits, intent),
+generateAnswer(topicQuery, hits, intent, docType),
 new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 25000)),
 ])
 } catch (err) {
@@ -1383,10 +1149,11 @@ const fp = (h.text || '').trim().slice(0, 80).toLowerCase()
 if (!seen.has(fp)) { seen.add(fp); deduped.push(h) }
 }
 if (deduped.length === 0) return null
+const docType = detectDocTypeFromChunks(chunks)
 let rawAnswer = ''
 try {
 rawAnswer = await Promise.race([
-generateAnswer(comparisonQuery, deduped, 'comparison'),
+generateAnswer(comparisonQuery, deduped, 'comparison', docType),
 new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 25000)),
 ])
 } catch (err) {
@@ -1402,40 +1169,29 @@ if (answerB && !answerB.includes('could not find')) parts.push(`**${capFirst(top
 else parts.push(`**${capFirst(topicB)}:** I could not find information about "${capFirst(topicB)}" in your documents.`)
 return parts.join('\n\n')
 }
-
 async function handleMultiTopicQuery(topics, mode, chunks, topK, invertedIndex) {
-  const results = await Promise.all(
-    topics.map(async (topic) => {
-      const answer = await generateAnswerForTopic(topic, chunks, topK, invertedIndex)
-      return { topic, answer }
-    })
-  )
-  const parts = results.map(({ topic, answer }) => {
-    const cap = capFirst(topic)
-    if (!answer || answer.includes('could not find') || answer.includes('not present')) {
-      return `**${cap}:**\nI could not find information about "${cap}" in your documents.`
-    }
-    return `**${cap}:**\n${answer}`
-  })
-  if (mode === 'comparison' && results.length === 2) {
-    const [a, b] = results
-    const bothFound =
-      a.answer && !a.answer.includes('could not find') &&
-      b.answer && !b.answer.includes('could not find')
-
-    if (bothFound) {
-      const comparisonAnswer = await generateComparisonAnswer(
-        a.topic, b.topic, chunks, topK, invertedIndex
-      )
-      if (comparisonAnswer && !comparisonAnswer.includes('could not find')) {
-        return comparisonAnswer
-      }
-    }
-    return parts.join('\n\n')
-  }
-  return parts.join('\n\n')
+const results = await Promise.all(topics.map(async (topic) => {
+const answer = await generateAnswerForTopic(topic, chunks, topK, invertedIndex)
+return { topic, answer }
+}))
+const parts = results.map(({ topic, answer }) => {
+const cap = capFirst(topic)
+if (!answer || answer.includes('could not find') || answer.includes('not present')) {
+return `**${cap}:**\nI could not find information about "${cap}" in your documents.`
 }
-
+return `**${cap}:**\n${answer}`
+})
+if (mode === 'comparison' && results.length === 2) {
+const [a, b] = results
+const bothFound = a.answer && !a.answer.includes('could not find') && b.answer && !b.answer.includes('could not find')
+if (bothFound) {
+const comparisonAnswer = await generateComparisonAnswer(a.topic, b.topic, chunks, topK, invertedIndex)
+if (comparisonAnswer && !comparisonAnswer.includes('could not find')) return comparisonAnswer
+}
+return parts.join('\n\n')
+}
+return parts.join('\n\n')
+}
 async function extractPdf(buffer) {
 const r = await pdfParse(buffer)
 return r.text || ''
@@ -1463,8 +1219,7 @@ return root.structuredText || root.innerText || root.rawText || ''
 function extractXml(buffer) { return buffer.toString('utf-8').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() }
 function extractJson(buffer) { try { return JSON.stringify(JSON.parse(buffer.toString('utf-8')), null, 2) } catch { return buffer.toString('utf-8') } }
 function extractJsonl(buffer) {
-return buffer.toString('utf-8').split('\n').filter(Boolean)
-.map(line => { try { return JSON.stringify(JSON.parse(line)) } catch { return line } }).join('\n')
+return buffer.toString('utf-8').split('\n').filter(Boolean).map(line => { try { return JSON.stringify(JSON.parse(line)) } catch { return line } }).join('\n')
 }
 function extractYaml(buffer) { try { return JSON.stringify(yaml.load(buffer.toString('utf-8')), null, 2) } catch { return buffer.toString('utf-8') } }
 async function extractEml(buffer) {
@@ -1575,8 +1330,7 @@ const allChunks = []
 let chunkIndexOffset = 0
 for (let i = 0; i < blobNames.length; i += BLOB_CONCURRENCY) {
 const batch = blobNames.slice(i, i + BLOB_CONCURRENCY)
-const results = await Promise.allSettled(
-batch.map(async (blobName) => {
+const results = await Promise.allSettled(batch.map(async (blobName) => {
 const fileName = blobName.split('/').pop()
 const ext = ('.' + fileName.split('.').pop()).toLowerCase()
 const buffer = await downloadBlobAsBuffer(containerClient, blobName)
@@ -1588,13 +1342,15 @@ source_file: fileName,
 chunk_index: idx,
 embedding: [],
 metadata: row.metadata || null,
+docType: 'data_dictionary',
 }))
 }
 const text = await extractTextFromBuffer(buffer, fileName)
 if (!text?.trim()) return []
-return chunkText(text, fileName)
-})
-)
+const rawChunks = chunkText(text, fileName)
+const docType = classifyDocumentType(rawChunks, fileName)
+return rawChunks.map(c => ({ ...c, docType }))
+}))
 for (const result of results) {
 if (result.status === 'fulfilled') {
 const fileChunks = result.value
@@ -1660,8 +1416,8 @@ if (!WARMUP_CLIENT_IDS.length || !blobServiceClient) return
 console.log(`[warmup] Pre-loading chunks for: ${WARMUP_CLIENT_IDS.join(', ')}`)
 for (const clientId of WARMUP_CLIENT_IDS) {
 loadChunksForClient(clientId)
-.then(({ chunks }) => console.log(`[warmup] ${clientId} — ${chunks.length} chunks ready`))
-.catch(err => console.warn(`[warmup] ${clientId} — ${err.message}`))
+.then(({ chunks }) => console.log(`[warmup] ${clientId} -- ${chunks.length} chunks ready`))
+.catch(err => console.warn(`[warmup] ${clientId} -- ${err.message}`))
 }
 }
 let db = null
@@ -1712,7 +1468,7 @@ const database = await getDb()
 const validDocs = await database.collection('clients').find({ apiKey: { $in: keys } }, { projection: { apiKey: 1, _id: 0 } }).toArray()
 const validSet = new Set(validDocs.map(d => d.apiKey))
 for (const key of keys) if (!validSet.has(key)) evictCache(key)
-} catch { }
+} catch {}
 }, KEY_CHECK_INTERVAL_MS)
 }
 function extractApiKey(req) {
@@ -1735,7 +1491,7 @@ next()
 function generateApiKey() { return `rak_${crypto.randomBytes(32).toString('hex')}` }
 function generateTitle(query) {
 const cleaned = query.trim().replace(/[?!.]+$/, '')
-return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned
+return cleaned.length > 50 ? cleaned.slice(0, 50) + '...' : cleaned
 }
 async function saveConversationMessage(clientId, conversationId, query, answer, sources) {
 try {
@@ -1767,8 +1523,6 @@ app.get('/health', (req, res) => res.json({
 ok: true,
 service: 'ask-data',
 engines: { primary: ASKDATA_ENDPOINT ? 'configured' : 'missing', fallback: ASKDATA2_ENDPOINT ? 'configured' : 'missing' },
-embeddings: AZURE_EMBED_ENDPOINT ? `azure (${AZURE_EMBED_MODEL})` : 'keyword-only',
-reranker: RERANKER_ENDPOINT ? 'configured' : 'disabled',
 chunkCacheSize: CHUNK_CACHE.size,
 responseCacheSize: RESPONSE_CACHE.size,
 primaryCircuitOpen: askedataCircuitOpen(),
@@ -1981,33 +1735,25 @@ try {
 const result = await IN_FLIGHT.get(cacheKey)
 const activeConversationId = await saveConversationMessage(clientId, conversationId || null, query.trim(), result.answer, result.sources || [])
 return res.json({ ...result, conversationId: activeConversationId })
-} catch { }
+} catch {}
 }
 const requestPromise = (async () => {
 const { chunks, invertedIndex } = await loadChunksForClient(clientId)
-if (chunks.length === 0) {
-return { answer: 'No documents found for your account. Please ensure your documents have been ingested first.', sources: [], client: { clientId, name } }
-}
+if (chunks.length === 0) return { answer: 'No documents found for your account. Please ensure your documents have been ingested first.', sources: [], client: { clientId, name } }
 let processedQuery = applyTypos(query.trim())
 console.log(`[QueryPipeline] Original: "${query.trim()}"`)
-if (processedQuery !== query.trim()) {
-console.log(`[QueryPipeline] After typos: "${processedQuery}"`)
-}
+if (processedQuery !== query.trim()) console.log(`[QueryPipeline] After typos: "${processedQuery}"`)
 processedQuery = applySynonyms(processedQuery)
 const fuzzyResult = fuzzyCorrectQuery(processedQuery, chunks)
-if (fuzzyResult !== processedQuery) {
-console.log(`[QueryPipeline] After fuzzy: "${fuzzyResult}"`)
-}
+if (fuzzyResult !== processedQuery) console.log(`[QueryPipeline] After fuzzy: "${fuzzyResult}"`)
 processedQuery = fuzzyResult
 const rewritten = await preprocessQuery(processedQuery)
-if (rewritten !== processedQuery) {
-console.log(`[QueryPipeline] After rewrite: "${rewritten}"`)
-}
+if (rewritten !== processedQuery) console.log(`[QueryPipeline] After rewrite: "${rewritten}"`)
 processedQuery = rewritten
 if (intent === 'all_urls') {
 const urlChunks = chunks.filter(c => /https?:\/\/\S+/.test(c.text || ''))
 const urlEntries = extractAllUrlsFromChunks(urlChunks)
-const answer = urlEntries.length > 0 ? urlEntries.map(e => `**${e.name}:** ${e.url}`).join('\n') : "I could not find any URLs in your documents."
+const answer = urlEntries.length > 0 ? urlEntries.map(e => `**${e.name}:** ${e.url}`).join('\n') : 'I could not find any URLs in your documents.'
 const sources = urlChunks.slice(0, 6).map(h => ({ source_file: h.source_file || 'unknown', chunk_index: h.chunk_index ?? 0, score: null, preview: (h.text || '').slice(0, 200) }))
 return { answer, sources, client: { clientId, name } }
 }
@@ -2019,15 +1765,14 @@ return { answer, sources: [], client: { clientId, name } }
 }
 let hits = await retrieveChunks(processedQuery, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndex)
 if (hits.length === 0) hits = relaxedKeywordSearch(processedQuery, chunks, 64, invertedIndex)
-console.log(`[chat/message] "${query.slice(0, 60)}" → intent=${intent}, subject="${extractSubject(processedQuery)}", hits=${hits.length}, topScore=${hits[0]?._score?.toFixed(2) || 0}`)
-if (hits.length === 0) {
-return { answer: "I could not find relevant information about this in your documents. Try rephrasing your question.", sources: [], client: { clientId, name } }
-}
+const docType = detectDocTypeFromChunks(hits.length > 0 ? hits : chunks)
+console.log(`[chat/message] "${query.slice(0, 60)}" -> intent=${intent}, docType=${docType}, subject="${extractSubject(processedQuery)}", hits=${hits.length}, topScore=${hits[0]?._score?.toFixed(2) || 0}`)
+if (hits.length === 0) return { answer: 'I could not find relevant information about this in your documents. Try rephrasing your question.', sources: [], client: { clientId, name } }
 let rawAnswer = ''
 if (intent !== 'url_lookup') {
 try {
 rawAnswer = await Promise.race([
-generateAnswer(processedQuery, hits, intent),
+generateAnswer(processedQuery, hits, intent, docType),
 new Promise((_, reject) => setTimeout(() => reject(new Error('All engines timed out')), 55000)),
 ])
 } catch (err) {
@@ -2064,7 +1809,7 @@ const PORT = process.env.PORT || 4000
 app.listen(PORT, () => {
 console.log(`Service running on port ${PORT}`)
 console.log(`ASKDATA: ${ASKDATA_ENDPOINT ? 'configured' : 'MISSING'} | ASKDATA2: ${ASKDATA2_ENDPOINT ? 'configured' : 'missing'}`)
-console.log(`Embedding model: ${AZURE_EMBED_MODEL} | Reranker: ${RERANKER_ENDPOINT ? 'configured' : 'disabled'} | MAX_HITS: ${MAX_HITS_GLOBAL}`)
+console.log(`MAX_HITS: ${MAX_HITS_GLOBAL}`)
 startApiKeyHealthChecker()
 warmupChunkCaches()
 })
