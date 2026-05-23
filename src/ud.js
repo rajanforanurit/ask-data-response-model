@@ -240,12 +240,25 @@ return top
 }
 function buildSystemPromptUD(intent) {
 if (intent === 'definition') {
-return `You are a document assistant. Extract and explain what the user asked about using ONLY the provided context. Write a clear, plain-language definition in 1-3 sentences. Bold the key term. Do not add information not in the context. If the context lacks the answer, say: "I could not find this in your documents."`
+return `You are a precise document assistant. Your job is to answer ONLY what was asked using the provided context.
+Rules:
+- Answer in 1-2 sentences maximum.
+- Bold the key term.
+- Extract only the specific fact requested. Do not include surrounding context, document titles, or unrelated information.
+- If the context lacks the answer, say: "I could not find this in your documents."`
 }
 if (intent === 'calculation') {
-return `You are a document assistant. Extract the formula, calculation, or quantitative method from the context. Present it clearly. If the context lacks the answer, say: "I could not find this in your documents."`
+return `You are a precise document assistant. Extract only the formula or calculation method from the context.
+Rules:
+- Return only the formula or calculation. Nothing else.
+- If the context lacks the answer, say: "I could not find this in your documents."`
 }
-return `You are a helpful document assistant. Answer the user's question using ONLY the provided context. Synthesize information from multiple passages if needed. Write in clear, concise sentences. Avoid inventing facts not in the context. If the context lacks the answer, say: "I could not find this in your documents."`
+return `You are a precise document assistant. Answer ONLY the specific question asked using the provided context.
+Rules:
+- Be direct and concise. Answer in 1-3 sentences.
+- Extract only the fact that answers the question. Do not include document titles, greetings, preambles, or unrelated clauses.
+- Do not repeat or summarize the entire document section.
+- If the context lacks the answer, say: "I could not find this in your documents."`
 }
 function buildContextUD(hits) {
 const seen = new Set()
@@ -253,10 +266,10 @@ const deduped = []
 for (const h of hits) {
 const fp = (h.text || '').trim().slice(0,80).toLowerCase()
 if (!seen.has(fp)) {seen.add(fp);deduped.push(h)}
-if (deduped.length >= 12) break
+if (deduped.length >= 6) break
 }
 return deduped.map((h,i) => {
-const limit = i < 3 ? 900 : 600
+const limit = i < 2 ? 600 : 400
 return (h.text || '').trim().slice(0,limit)
 }).join('\n\n---\n\n')
 }
@@ -265,11 +278,11 @@ const context = buildContextUD(hits)
 const subject = extractSubject(query)
 let instruction = ''
 if (intent === 'definition') {
-instruction = `\n\nUsing only the context above, what is "${subject}"? Write 1-3 clear sentences. Bold the key term. Stay within the document content.`
+instruction = `\n\nUsing only the context above, what is "${subject}"? Write 1-2 sentences. Bold the key term. Return only the definition, nothing else.`
 } else if (intent === 'calculation') {
-instruction = `\n\nUsing only the context above, how is "${subject}" calculated? Extract the formula or method clearly.`
+instruction = `\n\nUsing only the context above, how is "${subject}" calculated? Return only the formula or method.`
 } else {
-instruction = `\n\nUsing only the context above, answer this question: ${query}\n\nSynthesize information from the passages as needed. Be direct and specific.`
+instruction = `\n\nUsing only the context above, answer this specific question in 1-3 sentences: ${query}\n\nReturn only the direct answer. Do not include document titles, names, or unrelated content.`
 }
 return `CONTEXT:\n${context}${instruction}`
 }
@@ -277,23 +290,27 @@ function buildFallbackAnswerUD(query, hits) {
 if (!hits || hits.length === 0) return 'I could not find relevant information in your documents.'
 const subject = extractSubject(query)
 const subjectWords = subject.toLowerCase().split(/\s+/).filter(w => w.length > 1)
-const relevantPassages = []
-for (const h of hits.slice(0,6)) {
+const queryLower = query.toLowerCase()
+const scoredSentences = []
+for (const h of hits.slice(0,4)) {
 const text = (h.text || '').trim()
-if (text.length < 40) continue
-const matchCount = subjectWords.filter(w => text.toLowerCase().includes(w)).length
-if (matchCount > 0) {
-const sentences = splitIntoSentences(text).filter(s => subjectWords.some(w => s.toLowerCase().includes(w)))
-if (sentences.length > 0) relevantPassages.push(...sentences.slice(0,2))
+if (text.length < 20) continue
+const sentences = splitIntoSentences(text)
+for (const sent of sentences) {
+const sentLower = sent.toLowerCase()
+const matchCount = subjectWords.filter(w => sentLower.includes(w)).length
+const isHeader = /^(dear|letter|appointment|designation|department|offer details|compensation|bonus terms|other terms|notice period|employee|sincerely|we are pleased)/i.test(sent.trim())
+if (matchCount > 0 && !isHeader && sent.length > 15) {
+scoredSentences.push({sent, score: matchCount + (sentLower.includes(queryLower) ? 5 : 0)})
 }
-if (relevantPassages.length >= 4) break
 }
-if (relevantPassages.length > 0) {
-const combined = [...new Set(relevantPassages)].join(' ').slice(0,700)
-return ensureSinglePeriod(`**${capFirst(subject)}:** ${combined}.`)
 }
-const firstHit = (hits[0].text || '').trim()
-return ensureSinglePeriod(trimToCompleteSentence(firstHit, 400) + '.')
+scoredSentences.sort((a, b) => b.score - a.score)
+const best = [...new Set(scoredSentences.slice(0,2).map(s => s.sent))]
+if (best.length > 0) {
+return ensureSinglePeriod(best.join(' '))
+}
+return 'I could not find relevant information in your documents.'
 }
 module.exports = {
 slidingWindowChunk,buildInvertedIndexUD,retrieveChunksUD,preprocessQueryUD,
