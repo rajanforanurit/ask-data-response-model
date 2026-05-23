@@ -586,6 +586,35 @@ const udChunks = chunks.filter(c => c.docType !== 'data_dictionary' && c.docType
 const idx = invertedIndexes.ud || invertedIndexes.all
 return retrieveChunksUD(processedQuery, udChunks.length > 0 ? udChunks : chunks, topK, idx)
 }
+async function retrieveBestHitsAcrossAllTypes(processedQuery, chunks, topK, invertedIndexes, intent) {
+const ddChunks = chunks.filter(c => c.docType === 'data_dictionary')
+const sfChunks = chunks.filter(c => c.docType === 'structured')
+const udChunks = chunks.filter(c => c.docType !== 'data_dictionary' && c.docType !== 'structured')
+
+const [ddHits, sfHits, udHits] = await Promise.all([
+ddChunks.length > 0
+? retrieveChunksDD(processedQuery, ddChunks, topK, invertedIndexes.dd).catch(() => [])
+: Promise.resolve([]),
+sfChunks.length > 0
+? Promise.resolve(retrieveChunksSF(processedQuery, sfChunks, topK, invertedIndexes.sf || invertedIndexes.all))
+: Promise.resolve([]),
+udChunks.length > 0
+? Promise.resolve(retrieveChunksUD(processedQuery, udChunks, topK, invertedIndexes.ud || invertedIndexes.all))
+: Promise.resolve([]),
+])
+
+const pools = [
+{hits: ddHits, docType: 'data_dictionary'},
+{hits: sfHits, docType: 'structured'},
+{hits: udHits, docType: 'unstructured'},
+].filter(p => p.hits && p.hits.length > 0)
+
+if (pools.length === 0) return {hits: [], docType: 'unstructured'}
+
+pools.sort((a, b) => (b.hits[0]?._score || 0) - (a.hits[0]?._score || 0))
+
+return {hits: pools[0].hits, docType: pools[0].docType}
+}
 async function generateAnswerForTopic(topic, chunks, topK, invertedIndexes) {
 const topicQuery = `what is ${topic}`
 const docType = detectDocTypeFromChunks(chunks)
@@ -911,8 +940,11 @@ let processedQuery = applyTypos(query.trim())
 console.log(`[QueryPipeline] Original: "${query.trim()}"`)
 if (processedQuery !== query.trim()) console.log(`[QueryPipeline] After typos: "${processedQuery}"`)
 processedQuery = applySynonyms(processedQuery)
-const dominantDocType = detectDocTypeFromChunks(chunks)
-if (dominantDocType === 'unstructured' || dominantDocType === 'structured') {
+
+const hasSFChunks = chunks.some(c => c.docType === 'structured')
+const hasUDChunks = chunks.some(c => c.docType !== 'data_dictionary' && c.docType !== 'structured')
+
+if (hasSFChunks || hasUDChunks) {
 const rewritten = await preprocessQueryUD(processedQuery)
 if (rewritten !== processedQuery) console.log(`[QueryPipeline] After UD rewrite: "${rewritten}"`)
 processedQuery = rewritten
@@ -921,6 +953,7 @@ const corrected = fuzzyCorrectQuery(processedQuery, chunks.filter(c => c.docType
 if (corrected !== processedQuery) console.log(`[QueryPipeline] After DD fuzzy: "${corrected}"`)
 processedQuery = corrected
 }
+
 if (intent === 'all_urls') {
 const urlChunks = chunks.filter(c => /https?:\/\/\S+/.test(c.text || ''))
 const urlEntries = extractAllUrlsFromChunks(urlChunks)
@@ -934,19 +967,25 @@ console.log(`[chat/message] Multi-topic detected: ${JSON.stringify(multiTopicChe
 const answer = await handleMultiTopicQuery(multiTopicCheck.topics, multiTopicCheck.mode, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndexes)
 return {answer,sources:[],client:{clientId,name}}
 }
-let hits = await retrieveHitsForDocType(processedQuery, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndexes, dominantDocType, intent)
-if (hits.length === 0 && dominantDocType !== 'data_dictionary') {
-hits = await retrieveHitsForDocType(processedQuery, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndexes, 'data_dictionary', intent)
+
+const {hits, docType: routedDocType} = await retrieveBestHitsAcrossAllTypes(processedQuery, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndexes, intent)
+
+let finalHits = hits
+let finalDocType = routedDocType
+
+if (finalHits.length === 0) {
+finalHits = relaxedKeywordSearchDD(processedQuery, chunks, 64, invertedIndexes.all)
+finalDocType = detectDocTypeFromChunks(finalHits.length > 0 ? finalHits : chunks)
 }
-if (hits.length === 0) hits = relaxedKeywordSearchDD(processedQuery, chunks, 64, invertedIndexes.all)
-const finalDocType = detectDocTypeFromChunks(hits.length > 0 ? hits : chunks)
-console.log(`[chat/message] "${query.slice(0,60)}" -> intent=${intent}, docType=${finalDocType}, hits=${hits.length}, topScore=${hits[0]?._score?.toFixed(2)||0}`)
-if (hits.length === 0) return {answer:'I could not find relevant information about this in your documents. Try rephrasing your question.',sources:[],client:{clientId,name}}
+
+console.log(`[chat/message] "${query.slice(0,60)}" -> intent=${intent}, docType=${finalDocType}, hits=${finalHits.length}, topScore=${finalHits[0]?._score?.toFixed(2)||0}`)
+
+if (finalHits.length === 0) return {answer:'I could not find relevant information about this in your documents. Try rephrasing your question.',sources:[],client:{clientId,name}}
 let rawAnswer = ''
 if (intent !== 'url_lookup') {
 try {
 rawAnswer = await Promise.race([
-generateAnswer(processedQuery, hits, intent, finalDocType),
+generateAnswer(processedQuery, finalHits, intent, finalDocType),
 new Promise((_,reject) => setTimeout(() => reject(new Error('All engines timed out')),55000)),
 ])
 } catch (err) {
@@ -954,9 +993,9 @@ console.warn(`[chat/message] All engines failed, using rule-based fallback: ${er
 }
 }
 const isBlank = !rawAnswer || rawAnswer.trim().length < 15
-const answer = isBlank ? buildFallbackAnswer(processedQuery, hits, intent, finalDocType) : cleanAnswer(rawAnswer)
+const answer = isBlank ? buildFallbackAnswer(processedQuery, finalHits, intent, finalDocType) : cleanAnswer(rawAnswer)
 if (isBlank) console.warn(`[chat/message] Blank from all engines, used rule-based fallback for: "${query.slice(0,60)}"`)
-const sources = hits.map(h => ({
+const sources = finalHits.map(h => ({
 source_file:h.source_file||'unknown',
 chunk_index:h.chunk_index??0,
 score:typeof h._score === 'number' ? parseFloat(h._score.toFixed(4)) : null,
