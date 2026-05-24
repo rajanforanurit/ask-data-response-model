@@ -38,6 +38,7 @@ const {
 slidingWindowChunk,buildInvertedIndexUD,retrieveChunksUD,preprocessQueryUD,
 buildSystemPromptUD,buildUserMessageUD,buildFallbackAnswerUD,cleanOcrNoise,
 } = require('./src/ud')
+
 const app = express()
 const allowedOrigins = [
 'http://localhost:8080','http://localhost:3000',
@@ -66,7 +67,9 @@ allowedHeaders:['Content-Type','Authorization','x-session-id'],
 credentials:true,
 }))
 app.use(express.json())
+
 const blobServiceClient = AZURE_CONNECTION_STRING ? BlobServiceClient.fromConnectionString(AZURE_CONNECTION_STRING) : null
+
 let askedataActiveCount = 0
 const ASKDATA_MAX_CONCURRENT = 3
 const askedataQueue = []
@@ -76,8 +79,8 @@ function tryRun() {
 if (askedataActiveCount < ASKDATA_MAX_CONCURRENT) {
 askedataActiveCount++
 Promise.resolve().then(fn).then(
-result => {askedataActiveCount--;drainAskedataQueue();resolve(result)},
-err => {askedataActiveCount--;drainAskedataQueue();reject(err)}
+result => { askedataActiveCount--; drainAskedataQueue(); resolve(result) },
+err => { askedataActiveCount--; drainAskedataQueue(); reject(err) }
 )
 } else {
 askedataQueue.push(tryRun)
@@ -89,14 +92,15 @@ tryRun()
 function drainAskedataQueue() {
 if (askedataQueue.length > 0 && askedataActiveCount < ASKDATA_MAX_CONCURRENT) askedataQueue.shift()()
 }
+
 let askedataFailures = 0
 let askedataBlockedUntil = 0
 function askedataCircuitOpen() {
 if (Date.now() < askedataBlockedUntil) return true
-if (askedataBlockedUntil > 0) {askedataBlockedUntil = 0;askedataFailures = 0}
+if (askedataBlockedUntil > 0) { askedataBlockedUntil = 0; askedataFailures = 0 }
 return false
 }
-function askedataRecordSuccess() {askedataFailures = 0;askedataBlockedUntil = 0}
+function askedataRecordSuccess() { askedataFailures = 0; askedataBlockedUntil = 0 }
 function askedataRecordFailure() {
 askedataFailures++
 if (askedataFailures >= 3) {
@@ -104,6 +108,7 @@ askedataBlockedUntil = Date.now() + 30000
 console.error('[ASKDATA] Circuit breaker OPEN for 30s')
 }
 }
+
 async function callASKDATA(systemPrompt, userMessage, maxTokens = 1024) {
 if (!ASKDATA_ENDPOINT || !ASKDATA_KEY) throw new Error('ASKDATA_ENDPOINT and ASKDATA_KEY are required')
 if (askedataCircuitOpen()) throw new Error('ASKDATA temporarily unavailable')
@@ -112,9 +117,9 @@ try {
 const response = await fetchWithTimeout(
 ASKDATA_ENDPOINT,
 {
-method:'POST',
-headers:{'Content-Type':'application/json','Authorization':`Bearer ${ASKDATA_KEY}`},
-body:JSON.stringify({model:ASKDATA_MODEL,messages:[{role:'system',content:systemPrompt},{role:'user',content:userMessage}],temperature:0.1,max_tokens:maxTokens}),
+method: 'POST',
+headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${ASKDATA_KEY}` },
+body: JSON.stringify({ model: ASKDATA_MODEL, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }], temperature: 0.1, max_tokens: maxTokens }),
 },
 ASKDATA_TIMEOUT_MS
 )
@@ -131,15 +136,16 @@ throw err
 }
 })
 }
+
 async function callASKDATA2(systemPrompt, userMessage, maxTokens = 1024) {
 if (!ASKDATA2_ENDPOINT || !ASKDATA2_KEY) throw new Error('ASKDATA2_ENDPOINT and ASKDATA2_KEY are required')
 try {
 const response = await fetchWithTimeout(
 ASKDATA2_ENDPOINT,
 {
-method:'POST',
-headers:{'Content-Type':'application/json','Authorization':`Bearer ${ASKDATA2_KEY}`,'Accept':'application/json'},
-body:JSON.stringify({model:ASKDATA2_MODEL,messages:[{role:'system',content:systemPrompt},{role:'user',content:userMessage}],max_tokens:maxTokens,temperature:0.1,top_p:1.0,stream:false}),
+method: 'POST',
+headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${ASKDATA2_KEY}`, 'Accept': 'application/json' },
+body: JSON.stringify({ model: ASKDATA2_MODEL, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }], max_tokens: maxTokens, temperature: 0.1, top_p: 1.0, stream: false }),
 },
 ASKDATA2_TIMEOUT_MS
 )
@@ -154,6 +160,7 @@ console.error(`[ASKDATA2] Failed: ${err.message}`)
 throw err
 }
 }
+
 async function callBestAvailableEngine(systemPrompt, userMessage, maxTokens = 1024) {
 let primaryError = null
 if (ASKDATA_ENDPOINT && ASKDATA_KEY && !askedataCircuitOpen()) {
@@ -179,6 +186,7 @@ console.error(`[ASKDATA2] Also failed: ${err.message}`)
 }
 return ''
 }
+
 function classifyDocumentType(chunks, fileName) {
 const ext = ('.' + fileName.split('.').pop()).toLowerCase()
 const codeExts = new Set(['.py','.js','.ts','.jsx','.tsx','.java','.cpp','.c','.h','.cs','.go','.rb','.php','.swift','.kt','.r','.sql','.sh','.bash','.ps1'])
@@ -191,14 +199,24 @@ if (metaChunks / Math.max(chunks.length,1) > 0.4) return 'data_dictionary'
 const sample = chunks.slice(0,10).map(c => c.text || '').join('\n')
 const ddSignals = [/is defined as:/i,/formula\s*:/i,/how to calculate/i,/report url for/i,/power bi link for/i].filter(p => p.test(sample)).length
 if (ddSignals >= 2) return 'data_dictionary'
-const sfSignals = [/^#{1,6}\s+\S/m,/^(Abstract|Introduction|Background|Methodology|Methods|Results|Discussion|Conclusion|References|Summary|Executive Summary|Key Findings)\b/im,/\|\s*\S+\s*\|/,/^\d+\.\d+\s+[A-Z]/m].filter(p => p.test(sample)).length
+const sfSignals = [
+/^#{1,6}\s+\S/m,
+/^(Abstract|Introduction|Background|Methodology|Methods|Results|Discussion|Conclusion|References|Summary|Executive Summary|Key Findings)\b/im,
+/\|\s*\S+\s*\|/,
+/^\d+\.\d+\s+[A-Z]/m,
+/^\*\*[^*]{3,60}\*\*\s*:?\s*$/m,
+/\[Section:/m,
+].filter(p => p.test(sample)).length
 if (sfSignals >= 2) return 'structured'
 const codeSignals = [/^(function|class|def|import|const|let|var|async)\s/m,/=>\s*{/,/\bpublic\s+(static\s+)?\w+\s+\w+\s*\(/m].filter(p => p.test(sample)).length
 if (codeSignals >= 2) return 'code'
+const sfChunkRatio = chunks.filter(c => c.metadata && c.metadata.section).length / Math.max(chunks.length,1)
+if (sfChunkRatio > 0.3) return 'structured'
 const hasLongParagraphs = chunks.filter(c => (c.text || '').length > 300).length > chunks.length * 0.4
 if (hasLongParagraphs) return 'unstructured'
 return 'unstructured'
 }
+
 function detectDocTypeFromChunks(chunks) {
 if (!chunks || chunks.length === 0) return 'unstructured'
 const ddCount = chunks.filter(c => c.metadata && c.metadata.measure).length
@@ -207,75 +225,86 @@ const sfCount = chunks.filter(c => c.metadata && c.metadata.section).length
 if (sfCount / Math.max(chunks.length,1) > 0.3) return 'structured'
 return 'unstructured'
 }
-async function extractPdf(buffer) {const r = await pdfParse(buffer);return r.text || ''}
+
+async function extractPdf(buffer) { const r = await pdfParse(buffer); return r.text || '' }
+
 async function extractWord(buffer) {
-  const htmlResult = await mammoth.convertToHtml({buffer})
-  const html = htmlResult.value
-  const withTables = html.replace(/<table>([\s\S]*?)<\/table>/g, (_, tableInner) => {
-    const rows = []
-    const trMatches = tableInner.match(/<tr>([\s\S]*?)<\/tr>/g) || []
-    let headers = []
-    trMatches.forEach((tr, rowIdx) => {
-      const cells = (tr.match(/<t[dh]>([\s\S]*?)<\/t[dh]>/g) || [])
-        .map(cell => cell.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim())
-        .filter(Boolean)
-      if (rowIdx === 0) {
-        headers = cells
-      } else {
-        rows.push(cells.map((val, i) => `${headers[i] || 'Col' + (i + 1)}: ${val}`).join(' | '))
-      }
-    })
-    return '\n' + rows.join('\n') + '\n'
-  })
-  const plain = withTables
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n')
-    .replace(/<\/h[1-6]>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/&#\d+;/g, ' ')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim()
-  const lines = plain.split('\n')
-  const out = []
-  let buf = []
+try {
+const htmlResult = await mammoth.convertToHtml({ buffer })
+const html = htmlResult.value || ''
+const root = htmlParse(html)
 
-  const isSectionHeading = (line) => {
-    const t = line.trim()
-    if (!t || t.length > 60 || t.includes('|') || t.includes(':')) return false
-    return /^[A-Z][A-Za-z\s]+$/.test(t) || /^(Compensation|Bonus|Other|Notice|Employee|Offer|Letter|Designation|Department|Location|Joining)\b/i.test(t)
-  }
-
-  for (const line of lines) {
-    if (isSectionHeading(line) && buf.length > 0) {
-      const combined = buf.join('\n').trim()
-      if (combined.length > 20) out.push(combined)
-      buf = [line]
-    } else {
-      buf.push(line)
-    }
-  }
-  if (buf.length > 0) {
-    const combined = buf.join('\n').trim()
-    if (combined.length > 20) out.push(combined)
-  }
-  return out.join('\n\n')
+const lines = []
+for (const node of root.childNodes) {
+const tag = (node.tagName || '').toLowerCase()
+const text = (node.structuredText || node.innerText || node.rawText || '').trim()
+if (!text) continue
+if (['h1','h2','h3','h4','h5','h6'].includes(tag)) {
+lines.push(`## ${text}`)
+} else if (tag === 'p') {
+const boldChildren = node.querySelectorAll('strong, b')
+const fullBold = boldChildren.length > 0 && (boldChildren[0].structuredText || '').trim().length > 3
+const paraText = (node.structuredText || node.innerText || '').trim()
+if (fullBold && paraText.length < 100) {
+lines.push(`**${paraText}**`)
+} else {
+lines.push(paraText)
 }
+} else if (tag === 'ul' || tag === 'ol') {
+for (const li of node.querySelectorAll('li')) {
+const liText = (li.structuredText || li.innerText || '').trim()
+if (liText) {
+const boldInLi = li.querySelectorAll('strong, b')
+if (boldInLi.length > 0 && liText.length < 100) {
+lines.push(`- **${liText}**`)
+} else {
+lines.push(`- ${liText}`)
+}
+}
+}
+} else if (tag === 'table') {
+for (const row of node.querySelectorAll('tr')) {
+const cells = row.querySelectorAll('td, th').map(c => (c.structuredText || c.innerText || '').trim())
+if (cells.length > 0) lines.push('| ' + cells.join(' | ') + ' |')
+}
+} else if (text) {
+lines.push(text)
+}
+}
+return lines.join('\n')
+} catch (err) {
+console.warn(`[extractWord] HTML conversion failed, falling back to raw text: ${err.message}`)
+const r = await mammoth.extractRawText({ buffer })
+return r.value || ''
+}
+}
+
+function extractCsv(buffer, delimiter) {
+const text = buffer.toString('utf-8')
+const result = Papa.parse(text, { header: true, skipEmptyLines: true, delimiter })
+if (!result.data?.length) return text
+return result.data.map((row,i) => `Row ${i+1}: ` + Object.entries(row).map(([k,v]) => `${k}=${v}`).join(' | ')).join('\n')
+}
+
 async function extractOffice(buffer) {
 return new Promise((resolve, reject) => {
-parseOffice(buffer, (text, err) => {if (err) reject(err);else resolve(text || '')},{outputErrorToConsole:false})
+parseOffice(buffer, (text, err) => { if (err) reject(err); else resolve(text || '') }, { outputErrorToConsole: false })
 })
 }
+
 function extractHtml(buffer) {
 const root = htmlParse(buffer.toString('utf-8'))
 root.querySelectorAll('script, style').forEach(n => n.remove())
 return root.structuredText || root.innerText || root.rawText || ''
 }
-function extractXml(buffer) {return buffer.toString('utf-8').replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim()}
-function extractJson(buffer) {try {return JSON.stringify(JSON.parse(buffer.toString('utf-8')),null,2)} catch {return buffer.toString('utf-8')}}
+
+function extractXml(buffer) { return buffer.toString('utf-8').replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim() }
+function extractJson(buffer) { try { return JSON.stringify(JSON.parse(buffer.toString('utf-8')),null,2) } catch { return buffer.toString('utf-8') } }
 function extractJsonl(buffer) {
-return buffer.toString('utf-8').split('\n').filter(Boolean).map(line => {try {return JSON.stringify(JSON.parse(line))} catch {return line}}).join('\n')
+return buffer.toString('utf-8').split('\n').filter(Boolean).map(line => { try { return JSON.stringify(JSON.parse(line)) } catch { return line } }).join('\n')
 }
-function extractYaml(buffer) {try {return JSON.stringify(yaml.load(buffer.toString('utf-8')),null,2)} catch {return buffer.toString('utf-8')}}
+function extractYaml(buffer) { try { return JSON.stringify(yaml.load(buffer.toString('utf-8')),null,2) } catch { return buffer.toString('utf-8') } }
+
 async function extractEml(buffer) {
 const parsed = await simpleParser(buffer)
 const parts = []
@@ -287,11 +316,13 @@ if (parsed.text) parts.push(`\n${parsed.text}`)
 else if (parsed.html) parts.push(`\n${extractHtml(Buffer.from(parsed.html))}`)
 return parts.join('\n')
 }
+
 async function extractEpub(buffer) {
 return new Promise(resolve => {
-parseOffice(buffer, (text, err) => {resolve(err || !text ? '[EPUB: convert to PDF for best results]' : text)},{outputErrorToConsole:false})
+parseOffice(buffer, (text, err) => { resolve(err || !text ? '[EPUB: convert to PDF for best results]' : text) }, { outputErrorToConsole: false })
 })
 }
+
 async function extractTextFromBuffer(buffer, fileName) {
 const ext = ('.' + fileName.split('.').pop()).toLowerCase()
 if (ext === '.pdf') return extractPdf(buffer)
@@ -314,27 +345,37 @@ const plainText = new Set(['.txt','.py','.js','.ts','.jsx','.tsx','.java','.cpp'
 if (plainText.has(ext)) return buffer.toString('utf-8')
 return ''
 }
+
 function sniffDocumentType(text, fileName) {
 const ext = ('.' + fileName.split('.').pop()).toLowerCase()
 const sfExts = new Set(['.pdf','.docx','.doc','.odt','.rtf','.pptx','.ppt','.md','.markdown','.rst','.html','.htm'])
 if (!sfExts.has(ext)) return 'unstructured'
-const lines = text.split('\n').slice(0,50)
+const lines = text.split('\n').slice(0,80)
 let headingCount = 0
 let tableCount = 0
 let longParaCount = 0
+let boldHeadingCount = 0
+let bulletHeadingCount = 0
 for (const line of lines) {
-if (/^#{1,6}\s+\S/.test(line.trim())) headingCount++
-if (/^(Abstract|Introduction|Background|Methodology|Methods|Results|Discussion|Conclusion|References|Summary|Executive Summary|Key Findings|Recommendations)\b/i.test(line.trim())) headingCount++
+const trimmed = line.trim()
+if (/^#{1,6}\s+\S/.test(trimmed)) headingCount++
+if (/^(Abstract|Introduction|Background|Methodology|Methods|Results|Discussion|Conclusion|References|Summary|Executive Summary|Key Findings|Recommendations)\b/i.test(trimmed)) headingCount++
 if (/\|.*\|/.test(line)) tableCount++
 if (line.length > 200) longParaCount++
+if (/^\*\*[^*]{3,60}\*\*\s*:?\s*$/.test(trimmed)) boldHeadingCount++
+if (/^[-*•]\s*\*\*[^*]+\*\*/.test(trimmed)) bulletHeadingCount++
+if (/^[A-Z][A-Za-z\s]{3,50}:\s*$/.test(trimmed) && trimmed.length < 80) boldHeadingCount++
 }
 const sampleLower = text.slice(0,3000).toLowerCase()
 const ddSignals = [/is defined as/,/formula:/,/how to calculate/,/measure name/,/attribute name/].filter(p => p.test(sampleLower)).length
 if (ddSignals >= 2) return 'data_dictionary'
-if (headingCount >= 3 || tableCount >= 2) return 'structured'
+const structuredSignals = headingCount + boldHeadingCount + bulletHeadingCount
+if (structuredSignals >= 2 || tableCount >= 2) return 'structured'
+if (boldHeadingCount >= 1 && bulletHeadingCount >= 1) return 'structured'
 if (longParaCount >= 5) return 'unstructured'
 return 'unstructured'
 }
+
 function chunkTextLegacy(text, sourceFile) {
 const CHUNK_SIZE_L = 1200
 const CHUNK_OVERLAP_L = 2
@@ -345,7 +386,7 @@ let buffer = []
 let bufferLength = 0
 function flush() {
 const chunkStr = buffer.join('\n\n')
-if (chunkStr.length >= 30) chunks.push({text:chunkStr,source_file:sourceFile,chunk_index:chunkIndex++,embedding:[]})
+if (chunkStr.length >= 30) chunks.push({ text: chunkStr, source_file: sourceFile, chunk_index: chunkIndex++, embedding: [] })
 buffer = []
 bufferLength = 0
 }
@@ -360,7 +401,7 @@ for (const line of lines) {
 const projected = lineLength + (lineBuffer.length ? 1 : 0) + line.length
 if (lineBuffer.length > 0 && projected > CHUNK_SIZE_L) {
 const s = lineBuffer.join('\n')
-if (s.length >= 30) chunks.push({text:s,source_file:sourceFile,chunk_index:chunkIndex++,embedding:[]})
+if (s.length >= 30) chunks.push({ text: s, source_file: sourceFile, chunk_index: chunkIndex++, embedding: [] })
 lineBuffer = lineBuffer.slice(-CHUNK_OVERLAP_L)
 lineLength = lineBuffer.join('\n').length
 }
@@ -369,7 +410,7 @@ lineLength += (lineLength ? 1 : 0) + line.length
 }
 if (lineBuffer.length) {
 const s = lineBuffer.join('\n')
-if (s.length >= 30) chunks.push({text:s,source_file:sourceFile,chunk_index:chunkIndex++,embedding:[]})
+if (s.length >= 30) chunks.push({ text: s, source_file: sourceFile, chunk_index: chunkIndex++, embedding: [] })
 }
 continue
 }
@@ -377,7 +418,7 @@ const projected = bufferLength + (bufferLength ? 2 : 0) + block.length
 if (buffer.length > 0 && projected > CHUNK_SIZE_L) {
 const lastBlock = buffer[buffer.length - 1] || ''
 flush()
-if (lastBlock) {buffer.push(lastBlock);bufferLength = lastBlock.length}
+if (lastBlock) { buffer.push(lastBlock); bufferLength = lastBlock.length }
 }
 buffer.push(block)
 bufferLength += (bufferLength ? 2 : 0) + block.length
@@ -385,6 +426,7 @@ bufferLength += (bufferLength ? 2 : 0) + block.length
 if (buffer.length > 0) flush()
 return chunks
 }
+
 async function downloadBlobAsBuffer(containerClient, blobName) {
 const download = await containerClient.getBlobClient(blobName).download()
 const parts = []
@@ -393,12 +435,13 @@ parts.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
 }
 return Buffer.concat(parts)
 }
+
 async function _doLoadChunks(clientId) {
 if (!blobServiceClient) throw new Error('AZURE_CONNECTION_STRING not set')
 const containerClient = blobServiceClient.getContainerClient(AZURE_CONTAINER_NAME)
 const prefix = `${RAW_PREFIX}/${clientId}/`
 const blobNames = []
-for await (const blob of containerClient.listBlobsFlat({prefix})) {
+for await (const blob of containerClient.listBlobsFlat({ prefix })) {
 const fileName = blob.name.split('/').pop()
 const ext = ('.' + fileName.split('.').pop()).toLowerCase()
 if (SUPPORTED_EXTENSIONS.has(ext)) blobNames.push(blob.name)
@@ -414,8 +457,8 @@ const buffer = await downloadBlobAsBuffer(containerClient, blobName)
 if (['.xlsx','.xls','.ods'].includes(ext)) {
 const structuredRows = extractSpreadsheet(buffer)
 return structuredRows.map((row,idx) => ({
-text:row.text,source_file:fileName,chunk_index:idx,embedding:[],
-metadata:row.metadata || null,docType:'data_dictionary',
+text: row.text, source_file: fileName, chunk_index: idx, embedding: [],
+metadata: row.metadata || null, docType: 'data_dictionary',
 }))
 }
 const text = await extractTextFromBuffer(buffer, fileName)
@@ -430,12 +473,13 @@ rawChunks = chunkStructuredDocument(text, fileName)
 rawChunks = slidingWindowChunk(text, fileName)
 }
 const finalDocType = docTypeHint === 'data_dictionary' ? 'data_dictionary' : classifyDocumentType(rawChunks, fileName)
-return rawChunks.map(c => ({...c, docType:finalDocType}))
+console.log(`[loadChunks] ${fileName} -> sniff=${docTypeHint} final=${finalDocType} chunks=${rawChunks.length}`)
+return rawChunks.map(c => ({...c, docType: finalDocType}))
 }))
 for (const result of results) {
 if (result.status === 'fulfilled') {
 const fileChunks = result.value
-fileChunks.forEach((c,idx) => {c.chunk_index = chunkIndexOffset + idx})
+fileChunks.forEach((c,idx) => { c.chunk_index = chunkIndexOffset + idx })
 chunkIndexOffset += fileChunks.length
 allChunks.push(...fileChunks)
 } else {
@@ -445,49 +489,51 @@ console.warn('[loadChunks] Blob failed:', result.reason?.message)
 }
 return allChunks
 }
+
 const CHUNK_CACHE = new Map()
 async function loadChunksForClient(clientId) {
 const now = Date.now()
 const cached = CHUNK_CACHE.get(clientId)
 if (cached && cached.chunks) {
-if (now - cached.ts <= CHUNK_CACHE_TTL) return {chunks:cached.chunks,invertedIndexes:cached.invertedIndexes}
+if (now - cached.ts <= CHUNK_CACHE_TTL) return { chunks: cached.chunks, invertedIndexes: cached.invertedIndexes }
 if (!cached.loading) {
 const refreshPromise = _doLoadChunks(clientId)
 .then(chunks => {
 const invertedIndexes = buildAllInvertedIndexes(chunks)
-CHUNK_CACHE.set(clientId, {chunks,invertedIndexes,ts:Date.now(),loading:null})
+CHUNK_CACHE.set(clientId, { chunks, invertedIndexes, ts: Date.now(), loading: null })
 console.log(`[chunkCache] Background refresh done for ${clientId}: ${chunks.length} chunks`)
 })
 .catch(err => {
 const existing = CHUNK_CACHE.get(clientId)
-if (existing) CHUNK_CACHE.set(clientId, {...existing,loading:null})
+if (existing) CHUNK_CACHE.set(clientId, {...existing, loading: null})
 console.warn(`[chunkCache] Background refresh failed for ${clientId}: ${err.message}`)
 })
-CHUNK_CACHE.set(clientId, {...cached,loading:refreshPromise})
+CHUNK_CACHE.set(clientId, {...cached, loading: refreshPromise})
 }
-return {chunks:cached.chunks,invertedIndexes:cached.invertedIndexes}
+return { chunks: cached.chunks, invertedIndexes: cached.invertedIndexes }
 }
 if (cached && cached.loading) {
 await cached.loading
 const entry = CHUNK_CACHE.get(clientId)
-return {chunks:entry?.chunks || [],invertedIndexes:entry?.invertedIndexes || {}}
+return { chunks: entry?.chunks || [], invertedIndexes: entry?.invertedIndexes || {} }
 }
 const loadPromise = _doLoadChunks(clientId)
 .then(chunks => {
 const invertedIndexes = buildAllInvertedIndexes(chunks)
-CHUNK_CACHE.set(clientId, {chunks,invertedIndexes,ts:Date.now(),loading:null})
+CHUNK_CACHE.set(clientId, { chunks, invertedIndexes, ts: Date.now(), loading: null })
 console.log(`[chunkCache] Loaded ${chunks.length} chunks for ${clientId}`)
 return chunks
 })
 .catch(err => {
-CHUNK_CACHE.set(clientId, {chunks:null,invertedIndexes:{},ts:0,loading:null})
+CHUNK_CACHE.set(clientId, { chunks: null, invertedIndexes: {}, ts: 0, loading: null })
 throw err
 })
-CHUNK_CACHE.set(clientId, {chunks:null,invertedIndexes:{},ts:0,loading:loadPromise})
+CHUNK_CACHE.set(clientId, { chunks: null, invertedIndexes: {}, ts: 0, loading: loadPromise })
 await loadPromise
 const entry = CHUNK_CACHE.get(clientId)
-return {chunks:entry?.chunks || [],invertedIndexes:entry?.invertedIndexes || {}}
+return { chunks: entry?.chunks || [], invertedIndexes: entry?.invertedIndexes || {} }
 }
+
 function buildAllInvertedIndexes(chunks) {
 const ddChunks = chunks.filter(c => c.docType === 'data_dictionary')
 const sfChunks = chunks.filter(c => c.docType === 'structured')
@@ -499,10 +545,12 @@ ud: udChunks.length > 0 ? buildInvertedIndexUD(udChunks) : null,
 all: buildInvertedIndex(chunks),
 }
 }
+
 function invalidateChunkCache(clientId) {
 CHUNK_CACHE.delete(clientId)
 console.log(`[chunkCache] Invalidated cache for client: ${clientId}`)
 }
+
 function warmupChunkCaches() {
 if (!WARMUP_CLIENT_IDS.length || !blobServiceClient) return
 console.log(`[warmup] Pre-loading chunks for: ${WARMUP_CLIENT_IDS.join(', ')}`)
@@ -512,15 +560,17 @@ loadChunksForClient(clientId)
 .catch(err => console.warn(`[warmup] ${clientId} -- ${err.message}`))
 }
 }
+
 let db = null
 async function getDb() {
 if (db) return db
 const client = new MongoClient(MONGODB_URI)
 await client.connect()
 db = client.db(MONGODB_DB)
-await db.collection('clients').createIndex({apiKey:1},{unique:true,sparse:true})
+await db.collection('clients').createIndex({ apiKey: 1 }, { unique: true, sparse: true })
 return db
 }
+
 let chatDb = null
 async function getChatDb() {
 if (chatDb) return chatDb
@@ -530,26 +580,29 @@ await client.connect()
 chatDb = client.db(CHAT_HISTORY_DB)
 return chatDb
 }
+
 const CLIENT_CACHE = new Map()
 const CACHE_TTL_MS = 5 * 60 * 1000
 function getCached(apiKey) {
 const entry = CLIENT_CACHE.get(apiKey)
 if (!entry) return null
-if (Date.now() - entry.cachedAt > CACHE_TTL_MS) {CLIENT_CACHE.delete(apiKey);return null}
+if (Date.now() - entry.cachedAt > CACHE_TTL_MS) { CLIENT_CACHE.delete(apiKey); return null }
 return entry
 }
-function setCache(apiKey, data) {CLIENT_CACHE.set(apiKey, {...data,cachedAt:Date.now()})}
-function evictCache(apiKey) {if (apiKey) CLIENT_CACHE.delete(apiKey)}
+function setCache(apiKey, data) { CLIENT_CACHE.set(apiKey, {...data, cachedAt: Date.now()}) }
+function evictCache(apiKey) { if (apiKey) CLIENT_CACHE.delete(apiKey) }
+
 async function verifyApiKey(apiKey) {
 if (!apiKey || !apiKey.startsWith('rak_')) return null
 const cached = getCached(apiKey)
-if (cached) return {clientId:cached.clientId,name:cached.name}
+if (cached) return { clientId: cached.clientId, name: cached.name }
 const database = await getDb()
-const client = await database.collection('clients').findOne({apiKey},{projection:{clientId:1,name:1,_id:0}})
+const client = await database.collection('clients').findOne({ apiKey }, { projection: { clientId: 1, name: 1, _id: 0 } })
 if (!client) return null
-setCache(apiKey, {clientId:client.clientId,name:client.name})
-return {clientId:client.clientId,name:client.name}
+setCache(apiKey, { clientId: client.clientId, name: client.name })
+return { clientId: client.clientId, name: client.name }
 }
+
 function startApiKeyHealthChecker() {
 if (!MONGODB_URI) return
 setInterval(async () => {
@@ -557,29 +610,33 @@ const keys = [...CLIENT_CACHE.keys()]
 if (!keys.length) return
 try {
 const database = await getDb()
-const validDocs = await database.collection('clients').find({apiKey:{$in:keys}},{projection:{apiKey:1,_id:0}}).toArray()
+const validDocs = await database.collection('clients').find({ apiKey: { $in: keys } }, { projection: { apiKey: 1, _id: 0 } }).toArray()
 const validSet = new Set(validDocs.map(d => d.apiKey))
 for (const key of keys) if (!validSet.has(key)) evictCache(key)
 } catch {}
 }, KEY_CHECK_INTERVAL_MS)
 }
+
 function extractApiKey(req) {
 const header = req.headers['authorization'] || ''
 return header.startsWith('Bearer ') ? header.slice(7).trim() : null
 }
+
 async function requireClientKey(req, res, next) {
 const apiKey = extractApiKey(req) || req.body?.apiKey
-if (!apiKey) return res.status(401).json({error:'Missing API key'})
+if (!apiKey) return res.status(401).json({ error: 'Missing API key' })
 const client = await verifyApiKey(apiKey)
-if (!client) return res.status(401).json({error:'Invalid or expired API key'})
+if (!client) return res.status(401).json({ error: 'Invalid or expired API key' })
 req.client = client
 next()
 }
+
 function requireAdminKey(req, res, next) {
 const key = extractApiKey(req)
-if (!key || key !== ADMIN_API_KEY) return res.status(401).json({error:'Unauthorized'})
+if (!key || key !== ADMIN_API_KEY) return res.status(401).json({ error: 'Unauthorized' })
 next()
 }
+
 function cleanAnswer(rawAnswer) {
 if (!rawAnswer) return ''
 let cleaned = fixBrokenUrls(rawAnswer)
@@ -595,6 +652,7 @@ cleaned = trimToLastCompleteSentence(cleaned)
 if (cleaned.length > 0 && !/[.!?]$/.test(cleaned)) cleaned += '.'
 return ensureSinglePeriod(cleaned)
 }
+
 async function generateAnswer(query, hits, intent, docType) {
 let systemPrompt, userMessage
 if (docType === 'data_dictionary') {
@@ -609,11 +667,13 @@ userMessage = buildUserMessageUD(query, hits, intent)
 }
 return callBestAvailableEngine(systemPrompt, userMessage, 1024)
 }
+
 function buildFallbackAnswer(query, hits, intent, docType) {
 if (docType === 'data_dictionary') return buildFallbackAnswerDD(query, hits, intent)
 if (docType === 'structured') return buildFallbackAnswerSF(query, hits)
 return buildFallbackAnswerUD(query, hits)
 }
+
 async function retrieveHitsForDocType(processedQuery, chunks, topK, invertedIndexes, docType, intent) {
 if (docType === 'data_dictionary') {
 const ddChunks = chunks.filter(c => c.docType === 'data_dictionary')
@@ -631,6 +691,7 @@ const udChunks = chunks.filter(c => c.docType !== 'data_dictionary' && c.docType
 const idx = invertedIndexes.ud || invertedIndexes.all
 return retrieveChunksUD(processedQuery, udChunks.length > 0 ? udChunks : chunks, topK, idx)
 }
+
 function computePoolConfidence(hits, docType) {
 if (!hits || hits.length === 0) return 0
 const topScore = hits[0]?._score || 0
@@ -644,6 +705,7 @@ let confidence = avgScore + gap * 0.5
 if (docType === 'data_dictionary') confidence *= 1.4
 return confidence
 }
+
 async function retrieveBestHitsAcrossAllTypes(processedQuery, chunks, topK, invertedIndexes, intent) {
 const ddChunks = chunks.filter(c => c.docType === 'data_dictionary')
 const sfChunks = chunks.filter(c => c.docType === 'structured')
@@ -662,12 +724,12 @@ udChunks.length > 0
 ])
 
 const pools = [
-{hits: ddHits, docType: 'data_dictionary'},
-{hits: sfHits, docType: 'structured'},
-{hits: udHits, docType: 'unstructured'},
+{ hits: ddHits, docType: 'data_dictionary' },
+{ hits: sfHits, docType: 'structured' },
+{ hits: udHits, docType: 'unstructured' },
 ].filter(p => p.hits && p.hits.length > 0)
 
-if (pools.length === 0) return {hits: [], docType: 'unstructured'}
+if (pools.length === 0) return { hits: [], docType: 'unstructured' }
 
 for (const pool of pools) {
 pool.confidence = computePoolConfidence(pool.hits, pool.docType)
@@ -677,12 +739,13 @@ console.log(`[routing] docType=${pool.docType} topScore=${pool.hits[0]?._score?.
 const validPools = pools.filter(p => p.confidence > 0)
 if (validPools.length === 0) {
 pools.sort((a, b) => (b.hits[0]?._score || 0) - (a.hits[0]?._score || 0))
-return {hits: pools[0].hits, docType: pools[0].docType}
+return { hits: pools[0].hits, docType: pools[0].docType }
 }
 
 validPools.sort((a, b) => b.confidence - a.confidence)
-return {hits: validPools[0].hits, docType: validPools[0].docType}
+return { hits: validPools[0].hits, docType: validPools[0].docType }
 }
+
 async function generateAnswerForTopic(topic, chunks, topK, invertedIndexes) {
 const topicQuery = `what is ${topic}`
 const docType = detectDocTypeFromChunks(chunks)
@@ -704,6 +767,7 @@ answer = answer.replace(/^\*\*[^*]+\*\*\s*(is defined as:?\s*)?/i,'').trim()
 if (answer && !/[.!?]$/.test(answer)) answer += '.'
 return answer
 }
+
 async function generateComparisonAnswer(topicA, topicB, chunks, topK, invertedIndexes) {
 const comparisonQuery = `difference between ${topicA} and ${topicB}`
 const docType = detectDocTypeFromChunks(chunks)
@@ -714,7 +778,7 @@ const seen = new Set()
 const deduped = []
 for (const h of allHits) {
 const fp = (h.text || '').trim().slice(0,80).toLowerCase()
-if (!seen.has(fp)) {seen.add(fp);deduped.push(h)}
+if (!seen.has(fp)) { seen.add(fp); deduped.push(h) }
 }
 if (deduped.length === 0) return null
 let rawAnswer = ''
@@ -736,10 +800,11 @@ if (answerB && !answerB.includes('could not find')) parts.push(`**${capFirst(top
 else parts.push(`**${capFirst(topicB)}:** I could not find information about "${capFirst(topicB)}" in your documents.`)
 return parts.join('\n\n')
 }
+
 async function handleMultiTopicQuery(topics, mode, chunks, topK, invertedIndexes) {
 const results = await Promise.all(topics.map(async (topic) => {
 const answer = await generateAnswerForTopic(topic, chunks, topK, invertedIndexes)
-return {topic, answer}
+return { topic, answer }
 }))
 const parts = results.map(({topic, answer}) => {
 const cap = capFirst(topic)
@@ -759,24 +824,25 @@ return parts.join('\n\n')
 }
 return parts.join('\n\n')
 }
+
 async function saveConversationMessage(clientId, conversationId, query, answer, sources) {
 try {
 const chatDatabase = await getChatDb()
 const col = chatDatabase.collection('conversations')
 const now = new Date()
-const userMsg = {role:'user',content:query,timestamp:now}
-const assistantMsg = {role:'assistant',content:answer,sources:sources.map(s => ({source_file:s.source_file,score:s.score})),timestamp:now}
+const userMsg = { role: 'user', content: query, timestamp: now }
+const assistantMsg = { role: 'assistant', content: answer, sources: sources.map(s => ({ source_file: s.source_file, score: s.score })), timestamp: now }
 let activeConversationId = conversationId || null
 if (activeConversationId) {
 const updated = await col.findOneAndUpdate(
-{_id:new ObjectId(activeConversationId),clientId},
-{$push:{messages:{$each:[userMsg,assistantMsg]}},$set:{updatedAt:now}},
-{returnDocument:'after',projection:{_id:1}}
+{ _id: new ObjectId(activeConversationId), clientId },
+{ $push: { messages: { $each: [userMsg, assistantMsg] } }, $set: { updatedAt: now } },
+{ returnDocument: 'after', projection: { _id: 1 } }
 )
 if (!updated) activeConversationId = null
 }
 if (!activeConversationId) {
-const result = await col.insertOne({clientId,title:generateTitle(query),messages:[userMsg,assistantMsg],createdAt:now,updatedAt:now})
+const result = await col.insertOne({ clientId, title: generateTitle(query), messages: [userMsg, assistantMsg], createdAt: now, updatedAt: now })
 activeConversationId = result.insertedId.toString()
 }
 return activeConversationId
@@ -785,225 +851,244 @@ console.warn('[saveConversationMessage] Failed:', saveErr.message)
 return conversationId || null
 }
 }
+
 const IN_FLIGHT = new Map()
+
 app.get('/health', (req, res) => res.json({
-ok:true,service:'ask-data',
-engines:{primary:ASKDATA_ENDPOINT ? 'configured' : 'missing',fallback:ASKDATA2_ENDPOINT ? 'configured' : 'missing'},
-chunkCacheSize:CHUNK_CACHE.size,
-primaryCircuitOpen:askedataCircuitOpen(),
-primaryFailures:askedataFailures,
-maxHits:MAX_HITS_GLOBAL,
+ok: true, service: 'ask-data',
+engines: { primary: ASKDATA_ENDPOINT ? 'configured' : 'missing', fallback: ASKDATA2_ENDPOINT ? 'configured' : 'missing' },
+chunkCacheSize: CHUNK_CACHE.size,
+primaryCircuitOpen: askedataCircuitOpen(),
+primaryFailures: askedataFailures,
+maxHits: MAX_HITS_GLOBAL,
 }))
+
 app.post('/client/verify', async (req, res) => {
 try {
 const apiKey = extractApiKey(req) || req.body?.apiKey
-if (!apiKey) return res.status(400).json({valid:false,error:'apiKey is required'})
+if (!apiKey) return res.status(400).json({ valid: false, error: 'apiKey is required' })
 const client = await verifyApiKey(apiKey)
-if (!client) return res.status(401).json({valid:false,error:'Invalid or expired API key'})
-res.json({valid:true,client})
-} catch (err) {res.status(500).json({valid:false,error:err.message})}
+if (!client) return res.status(401).json({ valid: false, error: 'Invalid or expired API key' })
+res.json({ valid: true, client })
+} catch (err) { res.status(500).json({ valid: false, error: err.message }) }
 })
+
 app.post('/admin/clients', requireAdminKey, async (req, res) => {
 try {
-let {name, clientId, apiKey} = req.body
-if (!name || !clientId) return res.status(400).json({error:'name and clientId are required'})
-if (!apiKey) {apiKey = generateApiKey()}
-else if (!apiKey.startsWith('rak_')) return res.status(400).json({error:'apiKey must start with "rak_"'})
+let { name, clientId, apiKey } = req.body
+if (!name || !clientId) return res.status(400).json({ error: 'name and clientId are required' })
+if (!apiKey) { apiKey = generateApiKey() }
+else if (!apiKey.startsWith('rak_')) return res.status(400).json({ error: 'apiKey must start with "rak_"' })
 const database = await getDb()
 const col = database.collection('clients')
-const existing = await col.findOne({$or:[{clientId},{apiKey}]})
+const existing = await col.findOne({ $or: [{ clientId }, { apiKey }] })
 if (existing) {
 const field = existing.clientId === clientId ? 'clientId' : 'apiKey'
-return res.status(409).json({error:`A client with this ${field} already exists`})
+return res.status(409).json({ error: `A client with this ${field} already exists` })
 }
 const now = new Date().toISOString()
-const doc = {name:name.trim(),clientId:clientId.trim().toLowerCase(),apiKey,apiKeyRotatedAt:now,folderLink:'',sourceType:'google-drive',status:'idle',documentsCount:0,autoSync:false,watchIntervalMs:300000,lastRunAt:null,lastError:null,createdAt:now,updatedAt:now}
+const doc = { name: name.trim(), clientId: clientId.trim().toLowerCase(), apiKey, apiKeyRotatedAt: now, folderLink: '', sourceType: 'google-drive', status: 'idle', documentsCount: 0, autoSync: false, watchIntervalMs: 300000, lastRunAt: null, lastError: null, createdAt: now, updatedAt: now }
 const result = await col.insertOne(doc)
-res.status(201).json({...doc,_id:result.insertedId})
-} catch (err) {res.status(500).json({error:err.message})}
+res.status(201).json({...doc, _id: result.insertedId})
+} catch (err) { res.status(500).json({ error: err.message }) }
 })
+
 app.get('/admin/clients', requireAdminKey, async (req, res) => {
 try {
 const database = await getDb()
-const clients = await database.collection('clients').find({},{projection:{apiKey:0}}).sort({createdAt:-1}).toArray()
-res.json({clients})
-} catch (err) {res.status(500).json({error:err.message})}
+const clients = await database.collection('clients').find({}, { projection: { apiKey: 0 } }).sort({ createdAt: -1 }).toArray()
+res.json({ clients })
+} catch (err) { res.status(500).json({ error: err.message }) }
 })
+
 app.get('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
 try {
 const database = await getDb()
-const client = await database.collection('clients').findOne({clientId:req.params.clientId})
-if (!client) return res.status(404).json({error:'Client not found'})
+const client = await database.collection('clients').findOne({ clientId: req.params.clientId })
+if (!client) return res.status(404).json({ error: 'Client not found' })
 res.json(client)
-} catch (err) {res.status(500).json({error:err.message})}
+} catch (err) { res.status(500).json({ error: err.message }) }
 })
+
 app.post('/admin/clients/:clientId/regenerate-key', requireAdminKey, async (req, res) => {
 try {
 const database = await getDb()
 const col = database.collection('clients')
-const oldClient = await col.findOne({clientId:req.params.clientId},{projection:{apiKey:1}})
-if (!oldClient) return res.status(404).json({error:'Client not found'})
+const oldClient = await col.findOne({ clientId: req.params.clientId }, { projection: { apiKey: 1 } })
+if (!oldClient) return res.status(404).json({ error: 'Client not found' })
 const newApiKey = generateApiKey()
 const now = new Date().toISOString()
 if (oldClient.apiKey) evictCache(oldClient.apiKey)
-await col.findOneAndUpdate({clientId:req.params.clientId},{$set:{apiKey:newApiKey,apiKeyRotatedAt:now,updatedAt:now}},{returnDocument:'after'})
-res.json({success:true,clientId:req.params.clientId,newApiKey,apiKeyRotatedAt:now})
-} catch (err) {res.status(500).json({error:err.message})}
+await col.findOneAndUpdate({ clientId: req.params.clientId }, { $set: { apiKey: newApiKey, apiKeyRotatedAt: now, updatedAt: now } }, { returnDocument: 'after' })
+res.json({ success: true, clientId: req.params.clientId, newApiKey, apiKeyRotatedAt: now })
+} catch (err) { res.status(500).json({ error: err.message }) }
 })
+
 app.patch('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
 try {
 const database = await getDb()
-const updates = {...req.body,updatedAt:new Date().toISOString()}
+const updates = {...req.body, updatedAt: new Date().toISOString()}
 if (updates.apiKey !== undefined) {
-if (!updates.apiKey.startsWith('rak_')) return res.status(400).json({error:'apiKey must start with "rak_"'})
-const old = await database.collection('clients').findOne({clientId:req.params.clientId},{projection:{apiKey:1}})
+if (!updates.apiKey.startsWith('rak_')) return res.status(400).json({ error: 'apiKey must start with "rak_"' })
+const old = await database.collection('clients').findOne({ clientId: req.params.clientId }, { projection: { apiKey: 1 } })
 if (old?.apiKey) evictCache(old.apiKey)
 updates.apiKeyRotatedAt = new Date().toISOString()
 }
-const result = await database.collection('clients').findOneAndUpdate({clientId:req.params.clientId},{$set:updates},{returnDocument:'after'})
-if (!result) return res.status(404).json({error:'Client not found'})
+const result = await database.collection('clients').findOneAndUpdate({ clientId: req.params.clientId }, { $set: updates }, { returnDocument: 'after' })
+if (!result) return res.status(404).json({ error: 'Client not found' })
 res.json(result)
-} catch (err) {res.status(500).json({error:err.message})}
+} catch (err) { res.status(500).json({ error: err.message }) }
 })
+
 app.delete('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
 try {
-const {clientId} = req.params
+const { clientId } = req.params
 const database = await getDb()
-const client = await database.collection('clients').findOne({clientId})
-if (!client) return res.status(404).json({error:'Client not found'})
+const client = await database.collection('clients').findOne({ clientId })
+if (!client) return res.status(404).json({ error: 'Client not found' })
 if (client.apiKey) evictCache(client.apiKey)
-await database.collection('clients').deleteOne({clientId})
+await database.collection('clients').deleteOne({ clientId })
 invalidateChunkCache(clientId)
 const blobsDeleted = [], blobsFailed = []
 if (blobServiceClient) {
 try {
 const containerClient = blobServiceClient.getContainerClient(AZURE_CONTAINER_NAME)
 for (const prefix of [`raw/${clientId}/`,`meta/${clientId}/`]) {
-for await (const blob of containerClient.listBlobsFlat({prefix})) {
-try {await containerClient.deleteBlob(blob.name);blobsDeleted.push(blob.name)}
-catch (e) {blobsFailed.push({name:blob.name,error:e.message})}
+for await (const blob of containerClient.listBlobsFlat({ prefix })) {
+try { await containerClient.deleteBlob(blob.name); blobsDeleted.push(blob.name) }
+catch (e) { blobsFailed.push({ name: blob.name, error: e.message }) }
 }
 }
-} catch (azureErr) {blobsFailed.push({name:'azure-connection',error:azureErr.message})}
+} catch (azureErr) { blobsFailed.push({ name: 'azure-connection', error: azureErr.message }) }
 }
-res.json({ok:true,deleted:clientId,blobsDeleted:blobsDeleted.length,blobsFailed:blobsFailed.length > 0 ? blobsFailed : undefined})
-} catch (err) {res.status(500).json({error:err.message})}
+res.json({ ok: true, deleted: clientId, blobsDeleted: blobsDeleted.length, blobsFailed: blobsFailed.length > 0 ? blobsFailed : undefined })
+} catch (err) { res.status(500).json({ error: err.message }) }
 })
+
 app.post('/admin/clients/:clientId/invalidate-cache', requireAdminKey, (req, res) => {
 invalidateChunkCache(req.params.clientId)
-const {RESPONSE_CACHE} = require('./src/config')
+const { RESPONSE_CACHE } = require('./src/config')
 RESPONSE_CACHE.clear()
-res.json({ok:true,clientId:req.params.clientId,message:'Chunk + response cache invalidated'})
+res.json({ ok: true, clientId: req.params.clientId, message: 'Chunk + response cache invalidated' })
 })
+
 app.post('/client/login', async (req, res) => {
 try {
 const apiKey = extractApiKey(req) || req.body?.apiKey
-if (!apiKey) return res.status(400).json({error:'apiKey is required'})
+if (!apiKey) return res.status(400).json({ error: 'apiKey is required' })
 const client = await verifyApiKey(apiKey)
-if (!client) return res.status(401).json({error:'Invalid API key'})
+if (!client) return res.status(401).json({ error: 'Invalid API key' })
 if (blobServiceClient) loadChunksForClient(client.clientId).catch(err => console.warn(`[login warmup] ${client.clientId}: ${err.message}`))
-res.json({ok:true,client})
-} catch (err) {res.status(500).json({error:err.message})}
+res.json({ ok: true, client })
+} catch (err) { res.status(500).json({ error: err.message }) }
 })
+
 app.post('/chat/login', async (req, res) => {
 try {
 const apiKey = extractApiKey(req) || req.body?.apiKey
-if (!apiKey) return res.status(400).json({error:'apiKey is required'})
+if (!apiKey) return res.status(400).json({ error: 'apiKey is required' })
 const client = await verifyApiKey(apiKey)
-if (!client) return res.status(401).json({error:'Invalid API key'})
+if (!client) return res.status(401).json({ error: 'Invalid API key' })
 if (blobServiceClient) loadChunksForClient(client.clientId).catch(err => console.warn(`[chat/login warmup] ${client.clientId}: ${err.message}`))
-res.json({ok:true,client})
-} catch (err) {res.status(500).json({error:err.message})}
+res.json({ ok: true, client })
+} catch (err) { res.status(500).json({ error: err.message }) }
 })
+
 app.get('/client/me', requireClientKey, async (req, res) => {
 try {
 const database = await getDb()
-const client = await database.collection('clients').findOne({clientId:req.client.clientId},{projection:{apiKey:0}})
-if (!client) return res.status(404).json({error:'Client not found'})
+const client = await database.collection('clients').findOne({ clientId: req.client.clientId }, { projection: { apiKey: 0 } })
+if (!client) return res.status(404).json({ error: 'Client not found' })
 res.json(client)
-} catch (err) {res.status(500).json({error:err.message})}
+} catch (err) { res.status(500).json({ error: err.message }) }
 })
+
 app.post('/chat/conversations', requireClientKey, async (req, res) => {
 try {
-const {title} = req.body
+const { title } = req.body
 const database = await getChatDb()
 const now = new Date()
-const conversation = {clientId:req.client.clientId,title:title||'New Conversation',messages:[],createdAt:now,updatedAt:now}
+const conversation = { clientId: req.client.clientId, title: title || 'New Conversation', messages: [], createdAt: now, updatedAt: now }
 const result = await database.collection('conversations').insertOne(conversation)
-res.status(201).json({...conversation,_id:result.insertedId})
-} catch (err) {res.status(500).json({error:err.message})}
+res.status(201).json({...conversation, _id: result.insertedId})
+} catch (err) { res.status(500).json({ error: err.message }) }
 })
+
 app.post('/chat/conversations/list', requireClientKey, async (req, res) => {
 try {
 const database = await getChatDb()
-const conversations = await database.collection('conversations').find({clientId:req.client.clientId},{projection:{messages:0}}).sort({updatedAt:-1}).toArray()
-res.json({conversations})
-} catch (err) {res.status(500).json({error:err.message})}
+const conversations = await database.collection('conversations').find({ clientId: req.client.clientId }, { projection: { messages: 0 } }).sort({ updatedAt: -1 }).toArray()
+res.json({ conversations })
+} catch (err) { res.status(500).json({ error: err.message }) }
 })
+
 app.post('/chat/conversations/get', requireClientKey, async (req, res) => {
 try {
-const {conversationId} = req.body
-if (!conversationId) return res.status(400).json({error:'conversationId is required'})
+const { conversationId } = req.body
+if (!conversationId) return res.status(400).json({ error: 'conversationId is required' })
 const database = await getChatDb()
-const conversation = await database.collection('conversations').findOne({_id:new ObjectId(conversationId),clientId:req.client.clientId})
-if (!conversation) return res.status(404).json({error:'Conversation not found'})
+const conversation = await database.collection('conversations').findOne({ _id: new ObjectId(conversationId), clientId: req.client.clientId })
+if (!conversation) return res.status(404).json({ error: 'Conversation not found' })
 res.json(conversation)
-} catch (err) {res.status(500).json({error:err.message})}
+} catch (err) { res.status(500).json({ error: err.message }) }
 })
+
 app.post('/chat/conversations/rename', requireClientKey, async (req, res) => {
 try {
-const {conversationId, title} = req.body
-if (!conversationId || !title) return res.status(400).json({error:'conversationId and title are required'})
+const { conversationId, title } = req.body
+if (!conversationId || !title) return res.status(400).json({ error: 'conversationId and title are required' })
 const database = await getChatDb()
 const result = await database.collection('conversations').findOneAndUpdate(
-{_id:new ObjectId(conversationId),clientId:req.client.clientId},
-{$set:{title:title.trim(),updatedAt:new Date()}},
-{returnDocument:'after',projection:{messages:0}}
+{ _id: new ObjectId(conversationId), clientId: req.client.clientId },
+{ $set: { title: title.trim(), updatedAt: new Date() } },
+{ returnDocument: 'after', projection: { messages: 0 } }
 )
-if (!result) return res.status(404).json({error:'Conversation not found'})
+if (!result) return res.status(404).json({ error: 'Conversation not found' })
 res.json(result)
-} catch (err) {res.status(500).json({error:err.message})}
+} catch (err) { res.status(500).json({ error: err.message }) }
 })
+
 app.post('/chat/conversations/delete', requireClientKey, async (req, res) => {
 try {
-const {conversationId} = req.body
-if (!conversationId) return res.status(400).json({error:'conversationId is required'})
+const { conversationId } = req.body
+if (!conversationId) return res.status(400).json({ error: 'conversationId is required' })
 const database = await getChatDb()
-const result = await database.collection('conversations').deleteOne({_id:new ObjectId(conversationId),clientId:req.client.clientId})
-if (result.deletedCount === 0) return res.status(404).json({error:'Conversation not found'})
-res.json({ok:true,deleted:conversationId})
-} catch (err) {res.status(500).json({error:err.message})}
+const result = await database.collection('conversations').deleteOne({ _id: new ObjectId(conversationId), clientId: req.client.clientId })
+if (result.deletedCount === 0) return res.status(404).json({ error: 'Conversation not found' })
+res.json({ ok: true, deleted: conversationId })
+} catch (err) { res.status(500).json({ error: err.message }) }
 })
+
 app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) => {
 try {
-const {query, topK = 6, conversationId} = req.body
-if (!query?.trim()) return res.status(400).json({error:'query is required'})
+const { query, topK = 6, conversationId } = req.body
+if (!query?.trim()) return res.status(400).json({ error: 'query is required' })
 const validation = validateQuery(query)
-if (!validation.valid) return res.json({answer:validation.message,sources:[],conversationId:conversationId||null,client:req.client})
-const {clientId, name} = req.client
+if (!validation.valid) return res.json({ answer: validation.message, sources: [], conversationId: conversationId || null, client: req.client })
+const { clientId, name } = req.client
 const intent = detectQueryIntent(query.trim())
 if (intent === 'greeting') {
 return res.json({
-answer:"Hello! I'm your document assistant. Ask me anything about your data, research papers, or documents.",
-sources:[],conversationId:conversationId||null,client:{clientId,name},
+answer: "Hello! I'm your document assistant. Ask me anything about your data, research papers, or documents.",
+sources: [], conversationId: conversationId || null, client: { clientId, name },
 })
 }
 const cacheKey = getCacheKey(clientId, query)
 const cached = responseCacheGet(cacheKey)
 if (cached) {
-const activeConversationId = await saveConversationMessage(clientId, conversationId||null, query.trim(), cached.answer, cached.sources||[])
-return res.json({...cached,cached:true,conversationId:activeConversationId})
+const activeConversationId = await saveConversationMessage(clientId, conversationId || null, query.trim(), cached.answer, cached.sources || [])
+return res.json({...cached, cached: true, conversationId: activeConversationId})
 }
 if (IN_FLIGHT.has(cacheKey)) {
 try {
 const result = await IN_FLIGHT.get(cacheKey)
-const activeConversationId = await saveConversationMessage(clientId, conversationId||null, query.trim(), result.answer, result.sources||[])
-return res.json({...result,conversationId:activeConversationId})
+const activeConversationId = await saveConversationMessage(clientId, conversationId || null, query.trim(), result.answer, result.sources || [])
+return res.json({...result, conversationId: activeConversationId})
 } catch {}
 }
 const requestPromise = (async () => {
-const {chunks, invertedIndexes} = await loadChunksForClient(clientId)
-if (chunks.length === 0) return {answer:'No documents found for your account. Please ensure your documents have been ingested first.',sources:[],client:{clientId,name}}
+const { chunks, invertedIndexes } = await loadChunksForClient(clientId)
+if (chunks.length === 0) return { answer: 'No documents found for your account. Please ensure your documents have been ingested first.', sources: [], client: { clientId, name } }
 let processedQuery = applyTypos(query.trim())
 console.log(`[QueryPipeline] Original: "${query.trim()}"`)
 if (processedQuery !== query.trim()) console.log(`[QueryPipeline] After typos: "${processedQuery}"`)
@@ -1026,17 +1111,18 @@ if (intent === 'all_urls') {
 const urlChunks = chunks.filter(c => /https?:\/\/\S+/.test(c.text || ''))
 const urlEntries = extractAllUrlsFromChunks(urlChunks)
 const answer = urlEntries.length > 0 ? urlEntries.map(e => `**${e.name}:** ${e.url}`).join('\n') : 'I could not find any URLs in your documents.'
-const sources = urlChunks.slice(0,6).map(h => ({source_file:h.source_file||'unknown',chunk_index:h.chunk_index??0,score:null,preview:(h.text||'').slice(0,200)}))
-return {answer,sources,client:{clientId,name}}
+const sources = urlChunks.slice(0,6).map(h => ({ source_file: h.source_file || 'unknown', chunk_index: h.chunk_index ?? 0, score: null, preview: (h.text || '').slice(0,200) }))
+return { answer, sources, client: { clientId, name } }
 }
+
 const multiTopicCheck = detectMultiTopicQuery(processedQuery)
 if (multiTopicCheck.isMulti) {
 console.log(`[chat/message] Multi-topic detected: ${JSON.stringify(multiTopicCheck.topics)} mode=${multiTopicCheck.mode}`)
 const answer = await handleMultiTopicQuery(multiTopicCheck.topics, multiTopicCheck.mode, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndexes)
-return {answer,sources:[],client:{clientId,name}}
+return { answer, sources: [], client: { clientId, name } }
 }
 
-const {hits, docType: routedDocType} = await retrieveBestHitsAcrossAllTypes(processedQuery, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndexes, intent)
+const { hits, docType: routedDocType } = await retrieveBestHitsAcrossAllTypes(processedQuery, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndexes, intent)
 
 let finalHits = hits
 let finalDocType = routedDocType
@@ -1048,7 +1134,8 @@ finalDocType = detectDocTypeFromChunks(finalHits.length > 0 ? finalHits : chunks
 
 console.log(`[chat/message] "${query.slice(0,60)}" -> intent=${intent}, docType=${finalDocType}, hits=${finalHits.length}, topScore=${finalHits[0]?._score?.toFixed(2)||0}`)
 
-if (finalHits.length === 0) return {answer:'I could not find relevant information about this in your documents. Try rephrasing your question.',sources:[],client:{clientId,name}}
+if (finalHits.length === 0) return { answer: 'I could not find relevant information about this in your documents. Try rephrasing your question.', sources: [], client: { clientId, name } }
+
 let rawAnswer = ''
 if (intent !== 'url_lookup') {
 try {
@@ -1060,32 +1147,37 @@ new Promise((_,reject) => setTimeout(() => reject(new Error('All engines timed o
 console.warn(`[chat/message] All engines failed, using rule-based fallback: ${err.message}`)
 }
 }
+
 const isBlank = !rawAnswer || rawAnswer.trim().length < 15
 const answer = isBlank ? buildFallbackAnswer(processedQuery, finalHits, intent, finalDocType) : cleanAnswer(rawAnswer)
 if (isBlank) console.warn(`[chat/message] Blank from all engines, used rule-based fallback for: "${query.slice(0,60)}"`)
+
 const sources = finalHits.map(h => ({
-source_file:h.source_file||'unknown',
-chunk_index:h.chunk_index??0,
-score:typeof h._score === 'number' ? parseFloat(h._score.toFixed(4)) : null,
-preview:(h.text||'').slice(0,200),
+source_file: h.source_file || 'unknown',
+chunk_index: h.chunk_index ?? 0,
+score: typeof h._score === 'number' ? parseFloat(h._score.toFixed(4)) : null,
+preview: (h.text || '').slice(0,200),
 }))
-return {answer,sources,client:{clientId,name}}
+return { answer, sources, client: { clientId, name } }
 })()
+
 IN_FLIGHT.set(cacheKey, requestPromise)
 let result
-try {result = await requestPromise} finally {IN_FLIGHT.delete(cacheKey)}
+try { result = await requestPromise } finally { IN_FLIGHT.delete(cacheKey) }
 if (result.answer && result.answer.length > 15) responseCacheSet(cacheKey, result)
-const activeConversationId = await saveConversationMessage(clientId, conversationId||null, query.trim(), result.answer, result.sources||[])
-res.json({...result,conversationId:activeConversationId})
+const activeConversationId = await saveConversationMessage(clientId, conversationId || null, query.trim(), result.answer, result.sources || [])
+res.json({...result, conversationId: activeConversationId})
 } catch (err) {
 console.error('[chat/message] Error:', err.message)
-if (!res.headersSent) res.status(500).json({error:err.message})
+if (!res.headersSent) res.status(500).json({ error: err.message })
 }
 }))
+
 app.use((err, req, res, next) => {
 console.error('[global error handler]', err)
-if (!res.headersSent) res.status(500).json({error:'An unexpected error occurred. Please try again.'})
+if (!res.headersSent) res.status(500).json({ error: 'An unexpected error occurred. Please try again.' })
 })
+
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => {
 console.log(`Service running on port ${PORT}`)
@@ -1094,4 +1186,5 @@ console.log(`MAX_HITS: ${MAX_HITS_GLOBAL}`)
 startApiKeyHealthChecker()
 warmupChunkCaches()
 })
+
 module.exports = app
