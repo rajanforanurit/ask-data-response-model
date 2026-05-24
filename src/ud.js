@@ -8,6 +8,8 @@ ASKDATA2_REWRITE_TIMEOUT_MS,fetchWithTimeout,
 const UD_CHUNK_SIZE = 800
 const UD_OVERLAP_SENTENCES = 3
 const UD_MIN_CHUNK_LEN = 60
+const BM25_K1 = 1.2
+const BM25_B = 0.75
 const ACRONYM_MAP = {
 'occ':'occupancy','app':'application','appl':'application',
 'rev':'revenue','mgmt':'management','maint':'maintenance',
@@ -122,28 +124,58 @@ return chunks
 }
 function buildInvertedIndexUD(chunks) {
 const index = new Map()
+const df = new Map()
+const totalLen = chunks.reduce((s,c) => s + (c.text || '').length, 0)
+const avgdl = chunks.length > 0 ? totalLen / chunks.length : 1
 for (let i = 0; i < chunks.length; i++) {
 const text = (chunks[i].text || '').toLowerCase()
 const words = text.replace(/[^\w\s]/g,' ').split(/\s+/)
+const seen = new Set()
 for (const w of words) {
 if (w.length < 2) continue
 if (!index.has(w)) index.set(w, new Set())
 index.get(w).add(i)
+if (!seen.has(w)) {
+df.set(w, (df.get(w) || 0) + 1)
+seen.add(w)
+}
 const expanded = expandAcronyms(w)
 if (expanded !== w) {
 if (!index.has(expanded)) index.set(expanded, new Set())
 index.get(expanded).add(i)
+if (!seen.has(expanded)) {
+df.set(expanded, (df.get(expanded) || 0) + 1)
+seen.add(expanded)
 }
 }
 }
+}
+index._meta = { df, avgdl, N: chunks.length }
 return index
+}
+function termFreqInChunk(term, text) {
+let count = 0
+let pos = 0
+while ((pos = text.indexOf(term, pos)) !== -1) {
+count++
+pos += term.length
+}
+return count
+}
+function bm25Score(term, chunkText, dl, avgdl, N, df) {
+const f = termFreqInChunk(term, chunkText)
+if (f === 0) return 0
+const dfVal = df.get(term) || 0
+const idf = Math.log((N - dfVal + 0.5) / (dfVal + 0.5) + 1)
+const tfNorm = (f * (BM25_K1 + 1)) / (f + BM25_K1 * (1 - BM25_B + BM25_B * dl / avgdl))
+return idf * tfNorm
 }
 function needsRewrite(query) {
 const trimmed = query.trim()
 const words = trimmed.split(/\s+/).filter(Boolean)
 if (words.length <= 2) return true
 if (/[^\x00-\x7F]/.test(trimmed) && words.length < 5) return true
-if (/(.)\1{3,}/.test(trimmed)) return true
+if (/(.)\\1{3,}/.test(trimmed)) return true
 if (words.length < 4 && !/\b(what|how|define|explain|formula|calculate|list|show|find)\b/i.test(trimmed)) return true
 return false
 }
@@ -205,18 +237,24 @@ for (const idx of (invertedIndex.get(variant) || new Set())) union.add(idx)
 }
 const source = union.size > 0 ? [...union].map(i => chunks[i]).filter(Boolean) : chunks.slice(0,300)
 const subjectPhraseStr = subject.toLowerCase()
+const meta = invertedIndex?._meta || {}
+const df = meta.df || new Map()
+const avgdl = meta.avgdl || 300
+const N = meta.N || chunks.length
 const scored = source.map(c => {
 const text = (c.text || '').toLowerCase()
+const dl = text.length
 let score = 0
-const wordCoverage = expandedWords.filter(w => text.includes(w)).length
-score += wordCoverage * 2
-if (text.includes(subjectPhraseStr)) score += 10
+for (const term of expandedWords) {
+score += bm25Score(term, text, dl, avgdl, N, df)
+}
+if (text.includes(subjectPhraseStr)) score += 6
 const subjectWordCoverage = subjectWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`,'i').test(text)).length
-score += subjectWordCoverage * 3
-const density = Math.min(text.length / 300, 6)
-score += density
-if (intent === 'calculation' && (/formula|calculated|computed|equation/i.test(text))) score += 8
-if (intent === 'definition' && (/is defined as|means|refers to|describes/i.test(text))) score += 6
+score += subjectWordCoverage * 2
+const sourceBoost = subjectWords.some(w => (c.source_file || '').toLowerCase().includes(w)) ? 1.4 : 1.0
+score *= sourceBoost
+if (intent === 'calculation' && (/formula|calculated|computed|equation/i.test(text))) score += 5
+if (intent === 'definition' && (/is defined as|means|refers to|describes/i.test(text))) score += 4
 const penalty = computeNegativePenalty(subject, c.text || '')
 score -= penalty
 return {...c,_score:score}
@@ -228,7 +266,7 @@ const fallback = chunks
 const t = (c.text || '').toLowerCase()
 return expandedWords.some(w => t.includes(w))
 })
-.map(c => ({...c,_score:1}))
+.map(c => ({...c,_score:0.1}))
 .slice(0, Math.min(topK, 10))
 const existingIds = new Set(top.map(c => c.chunk_index))
 for (const c of fallback) {
