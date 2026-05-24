@@ -2,7 +2,7 @@ const {
 escapeRegex,capFirst,ensureSinglePeriod,trimToCompleteSentence,
 applySynonyms,normalizeQuery,extractSubject,normalizeTerms,
 computeNegativePenalty,CHUNK_SIZE,MAX_HITS_GLOBAL,
-detectQueryIntent,
+detectQueryIntent,selectFocusedHits,
 } = require('./config')
 const SF_CHUNK_SIZE = 1600
 const SF_HEADING_OVERLAP = 1
@@ -191,7 +191,7 @@ score -= penalty
 return {...c, _score: score}
 }).filter(c => c._score > 0).sort((a,b) => b._score - a._score)
 
-let top = scored.slice(0, Math.min(topK, MAX_HITS_GLOBAL))
+let top = selectFocusedHits(scored, Math.min(topK, MAX_HITS_GLOBAL))
 if (top.length === 0) {
 top = chunks.filter(c => {
 const t = (c.text || '').toLowerCase()
@@ -232,7 +232,7 @@ const deduped = []
 for (const h of hits) {
 const fp = (h.text || '').trim().slice(0,80).toLowerCase()
 if (!seen.has(fp)) { seen.add(fp); deduped.push(h) }
-if (deduped.length >= 10) break
+if (deduped.length >= 4) break
 }
 return deduped.map((h,i) => {
 const section = h.metadata && h.metadata.section ? `[Section: ${h.metadata.section}]` : ''
