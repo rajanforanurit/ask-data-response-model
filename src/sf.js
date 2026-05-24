@@ -6,6 +6,22 @@ detectQueryIntent,
 } = require('./config')
 const SF_CHUNK_SIZE = 1600
 const SF_HEADING_OVERLAP = 1
+const BM25_K1 = 1.2
+const BM25_B = 0.75
+const SECTION_SYNONYMS = {
+salary: ['compensation','pay','ctc','breakup','remuneration','package','wages','earnings'],
+compensation: ['salary','pay','ctc','breakup','remuneration','package'],
+pay: ['salary','compensation','ctc','wages'],
+ctc: ['salary','compensation','breakup','package'],
+bonus: ['bonus terms','performance','incentive'],
+package: ['salary','compensation','ctc','breakup'],
+designation: ['position','role','title','job'],
+role: ['designation','position','title'],
+joining: ['joining date','start date','commencement'],
+notice: ['notice period','exit','resignation'],
+probation: ['probation period','trial period'],
+benefits: ['perks','allowances','insurance','pf'],
+}
 function isHeading(line) {
 const trimmed = line.trim()
 if (!trimmed) return false
@@ -113,12 +129,21 @@ return chunks
 }
 function buildInvertedIndexSF(chunks) {
 const index = new Map()
+const df = new Map()
+const totalLen = chunks.reduce((s,c) => s + (c.text || '').length, 0)
+const avgdl = chunks.length > 0 ? totalLen / chunks.length : 1
 for (let i = 0; i < chunks.length; i++) {
-const words = (chunks[i].text || '').toLowerCase().replace(/[^\w\s]/g,' ').split(/\s+/)
+const text = (chunks[i].text || '').toLowerCase()
+const words = text.replace(/[^\w\s]/g,' ').split(/\s+/)
+const seen = new Set()
 for (const w of words) {
 if (w.length < 2) continue
 if (!index.has(w)) index.set(w, new Set())
 index.get(w).add(i)
+if (!seen.has(w)) {
+df.set(w, (df.get(w) || 0) + 1)
+seen.add(w)
+}
 }
 if (chunks[i].metadata && chunks[i].metadata.section) {
 const sWords = chunks[i].metadata.section.toLowerCase().replace(/[^\w\s]/g,' ').split(/\s+/)
@@ -126,11 +151,60 @@ for (const w of sWords) {
 if (w.length >= 2) {
 if (!index.has(w)) index.set(w, new Set())
 index.get(w).add(i)
+if (!seen.has(w)) {
+df.set(w, (df.get(w) || 0) + 1)
+seen.add(w)
 }
 }
 }
 }
+}
+index._meta = { df, avgdl, N: chunks.length }
 return index
+}
+function termFreqInChunk(term, text) {
+let count = 0
+let pos = 0
+while ((pos = text.indexOf(term, pos)) !== -1) {
+count++
+pos += term.length
+}
+return count
+}
+function bm25Score(term, chunkText, dl, avgdl, N, df) {
+const f = termFreqInChunk(term, chunkText)
+if (f === 0) return 0
+const dfVal = df.get(term) || 0
+const idf = Math.log((N - dfVal + 0.5) / (dfVal + 0.5) + 1)
+const tfNorm = (f * (BM25_K1 + 1)) / (f + BM25_K1 * (1 - BM25_B + BM25_B * dl / avgdl))
+return idf * tfNorm
+}
+function expandSectionTerms(words) {
+const expanded = new Set(words)
+for (const w of words) {
+const synonyms = SECTION_SYNONYMS[w.toLowerCase()] || []
+for (const s of synonyms) expanded.add(s.toLowerCase())
+}
+return [...expanded]
+}
+function sectionRelevanceScore(sectionName, queryWords, subjectWords) {
+if (!sectionName) return 0
+const sectionLower = sectionName.toLowerCase()
+const sectionTokens = sectionLower.replace(/[^\w\s]/g,' ').split(/\s+/)
+const allQueryTerms = expandSectionTerms([...queryWords, ...subjectWords])
+let score = 0
+for (const term of allQueryTerms) {
+if (sectionLower.includes(term)) score += 10
+}
+for (const token of sectionTokens) {
+const synonyms = SECTION_SYNONYMS[token] || []
+for (const syn of synonyms) {
+if (allQueryTerms.some(t => t === syn || syn.includes(t) || t.includes(syn))) {
+score += 6
+}
+}
+}
+return score
 }
 function retrieveChunksSF(query, chunks, topK, invertedIndex) {
 const intent = detectQueryIntent(query)
@@ -144,26 +218,26 @@ for (const idx of (invertedIndex.get(w) || new Set())) union.add(idx)
 for (const variant of normalizeTerms(w)) {
 for (const idx of (invertedIndex.get(variant) || new Set())) union.add(idx)
 }
+for (const syn of (SECTION_SYNONYMS[w.toLowerCase()] || [])) {
+for (const idx of (invertedIndex.get(syn) || new Set())) union.add(idx)
+}
 }
 }
 const source = union.size > 0 ? [...union].map(i => chunks[i]).filter(Boolean) : chunks.slice(0,200)
+const meta = invertedIndex?._meta || {}
+const df = meta.df || new Map()
+const avgdl = meta.avgdl || 400
+const N = meta.N || chunks.length
 const scored = source.map(c => {
 const text = (c.text || '').toLowerCase()
+const dl = text.length
 let score = 0
-const wordCoverage = queryWords.filter(w => text.includes(w)).length
-score += wordCoverage * 2
-const subjectCoverage = subjectWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`,'i').test(text)).length
-score += subjectCoverage * 4
-if (c.metadata && c.metadata.section) {
-const sectionLower = c.metadata.section.toLowerCase()
-const sectionMatchCount = subjectWords.filter(w => sectionLower.includes(w)).length
-score += sectionMatchCount * 8
+for (const term of [...queryWords, ...subjectWords]) {
+score += bm25Score(term, text, dl, avgdl, N, df)
 }
-if (c.metadata && c.metadata.isTable) score += 3
-if (intent === 'lookup' || intent === 'general') {
-const densityBonus = Math.min(text.length / 200, 5)
-score += densityBonus
-}
+const secScore = sectionRelevanceScore(c.metadata && c.metadata.section ? c.metadata.section : '', queryWords, subjectWords)
+score += secScore
+if (c.metadata && c.metadata.isTable) score += 4
 const penalty = computeNegativePenalty(subject, c.text || '')
 score -= penalty
 return {...c, _score:score}
@@ -173,7 +247,7 @@ if (top.length === 0) {
 top = chunks.filter(c => {
 const t = (c.text || '').toLowerCase()
 return queryWords.some(w => t.includes(w))
-}).slice(0, Math.min(topK, 10)).map(c => ({...c, _score:1}))
+}).slice(0, Math.min(topK, 10)).map(c => ({...c, _score:0.1}))
 }
 return top
 }
