@@ -4,7 +4,6 @@ applySynonyms,normalizeQuery,extractSubject,normalizeTerms,
 computeNegativePenalty,CHUNK_SIZE,MAX_HITS_GLOBAL,
 detectQueryIntent,
 } = require('./config')
-
 const SF_CHUNK_SIZE = 1600
 const SF_HEADING_OVERLAP = 1
 
