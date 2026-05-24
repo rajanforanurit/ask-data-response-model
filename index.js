@@ -208,12 +208,34 @@ if (sfCount / Math.max(chunks.length,1) > 0.3) return 'structured'
 return 'unstructured'
 }
 async function extractPdf(buffer) {const r = await pdfParse(buffer);return r.text || ''}
-async function extractWord(buffer) {const r = await mammoth.extractRawText({buffer});return r.value || ''}
-function extractCsv(buffer, delimiter) {
-const text = buffer.toString('utf-8')
-const result = Papa.parse(text, {header:true,skipEmptyLines:true,delimiter})
-if (!result.data?.length) return text
-return result.data.map((row,i) => `Row ${i+1}: ` + Object.entries(row).map(([k,v]) => `${k}=${v}`).join(' | ')).join('\n')
+async function extractWord(buffer) {
+  const htmlResult = await mammoth.convertToHtml({buffer})
+  const html = htmlResult.value
+  const withTables = html.replace(/<table>([\s\S]*?)<\/table>/g, (_, tableInner) => {
+    const rows = []
+    const trMatches = tableInner.match(/<tr>([\s\S]*?)<\/tr>/g) || []
+    let headers = []
+    trMatches.forEach((tr, rowIdx) => {
+      const cells = (tr.match(/<t[dh]>([\s\S]*?)<\/t[dh]>/g) || [])
+        .map(cell => cell.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim())
+        .filter(Boolean)
+      if (rowIdx === 0) {
+        headers = cells
+      } else {
+        const rowParts = cells.map((val, i) => `${headers[i] || 'Col'+(i+1)}: ${val}`)
+        rows.push(rowParts.join(' | '))
+      }
+    })
+    return '\n' + rows.join('\n') + '\n'
+  })
+  return withTables
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<\/h[1-6]>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&nbsp;/g,' ').replace(/&#\d+;/g,' ')
+    .replace(/\n{3,}/g,'\n\n')
+    .trim()
 }
 async function extractOffice(buffer) {
 return new Promise((resolve, reject) => {
