@@ -217,25 +217,48 @@ async function extractWord(buffer) {
     let headers = []
     trMatches.forEach((tr, rowIdx) => {
       const cells = (tr.match(/<t[dh]>([\s\S]*?)<\/t[dh]>/g) || [])
-        .map(cell => cell.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim())
+        .map(cell => cell.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim())
         .filter(Boolean)
       if (rowIdx === 0) {
         headers = cells
       } else {
-        const rowParts = cells.map((val, i) => `${headers[i] || 'Col'+(i+1)}: ${val}`)
-        rows.push(rowParts.join(' | '))
+        rows.push(cells.map((val, i) => `${headers[i] || 'Col' + (i + 1)}: ${val}`).join(' | '))
       }
     })
     return '\n' + rows.join('\n') + '\n'
   })
-  return withTables
+  const plain = withTables
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<\/p>/gi, '\n')
     .replace(/<\/h[1-6]>/gi, '\n')
     .replace(/<[^>]+>/g, '')
-    .replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&nbsp;/g,' ').replace(/&#\d+;/g,' ')
-    .replace(/\n{3,}/g,'\n\n')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/&#\d+;/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
     .trim()
+  const lines = plain.split('\n')
+  const out = []
+  let buf = []
+
+  const isSectionHeading = (line) => {
+    const t = line.trim()
+    if (!t || t.length > 60 || t.includes('|') || t.includes(':')) return false
+    return /^[A-Z][A-Za-z\s]+$/.test(t) || /^(Compensation|Bonus|Other|Notice|Employee|Offer|Letter|Designation|Department|Location|Joining)\b/i.test(t)
+  }
+
+  for (const line of lines) {
+    if (isSectionHeading(line) && buf.length > 0) {
+      const combined = buf.join('\n').trim()
+      if (combined.length > 20) out.push(combined)
+      buf = [line]
+    } else {
+      buf.push(line)
+    }
+  }
+  if (buf.length > 0) {
+    const combined = buf.join('\n').trim()
+    if (combined.length > 20) out.push(combined)
+  }
+  return out.join('\n\n')
 }
 async function extractOffice(buffer) {
 return new Promise((resolve, reject) => {
