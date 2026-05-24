@@ -3,7 +3,7 @@ escapeRegex,capFirst,ensureSinglePeriod,trimToCompleteSentence,
 applySynonyms,applyTypos,normalizeQuery,extractSubject,normalizeTerms,
 computeNegativePenalty,CHUNK_SIZE,MAX_HITS_GLOBAL,
 detectQueryIntent,ASKDATA2_ENDPOINT,ASKDATA2_KEY,ASKDATA2_MODEL,
-ASKDATA2_REWRITE_TIMEOUT_MS,fetchWithTimeout,
+ASKDATA2_REWRITE_TIMEOUT_MS,fetchWithTimeout,selectFocusedHits,
 } = require('./config')
 
 const UD_CHUNK_SIZE = 800
@@ -307,7 +307,7 @@ score -= penalty
 return {...c, _score: score}
 }).filter(c => c._score > 0).sort((a,b) => b._score - a._score)
 
-let top = scored.slice(0, Math.min(topK, MAX_HITS_GLOBAL))
+let top = selectFocusedHits(scored, Math.min(topK, MAX_HITS_GLOBAL))
 if (top.length < 3) {
 const fallback = chunks
 .filter(c => {
@@ -364,7 +364,7 @@ const deduped = []
 for (const h of hits) {
 const fp = (h.text || '').trim().slice(0,80).toLowerCase()
 if (!seen.has(fp)) { seen.add(fp); deduped.push(h) }
-if (deduped.length >= 6) break
+if (deduped.length >= 4) break
 }
 
 const subject = extractSubject(query)
