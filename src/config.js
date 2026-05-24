@@ -321,7 +321,7 @@ index.get(w).add(i)
 }
 return index
 }
-function selectFocusedHits(hits, topK = 6, dominanceThreshold = 1.4) {
+function selectFocusedHits(hits, topK = 6) {
 if (!hits || hits.length === 0) return []
 const byFile = {}
 for (const h of hits) {
@@ -333,24 +333,23 @@ const files = Object.keys(byFile)
 if (files.length === 1) return hits.slice(0, topK)
 const fileScores = files.map(f => {
 const fhits = byFile[f]
-const top3 = fhits.slice(0, 3).map(h => h._score || 0)
-const avg = top3.reduce((s, v) => s + v, 0) / top3.length
 const topScore = fhits[0]?._score || 0
-return { file: f, score: avg * 0.7 + topScore * 0.3, hits: fhits }
+const top2avg = fhits.slice(0, 2).reduce((s, h) => s + (h._score || 0), 0) / Math.min(fhits.length, 2)
+return { file: f, score: topScore * 0.6 + top2avg * 0.4, hits: fhits }
 }).sort((a, b) => b.score - a.score)
 const best = fileScores[0]
 const runnerUp = fileScores[1]
-if (runnerUp && best.score >= runnerUp.score * dominanceThreshold) {
+if (runnerUp && best.score >= runnerUp.score * 1.8) {
 console.log(`[focusedHits] Concentrating on "${best.file}" (${best.score.toFixed(2)} vs ${runnerUp.score.toFixed(2)})`)
 return best.hits.slice(0, topK)
 }
-const perFileCap = Math.ceil(topK / 2)
+const perFileCap = Math.max(2, Math.floor(topK * 0.6))
 const fileCounts = {}
 const result = []
 for (const h of hits) {
 const f = h.source_file || 'unknown'
 fileCounts[f] = (fileCounts[f] || 0) + 1
-if (fileCounts[f] <= perFileCap) result.push(h)
+if (f === best.file || fileCounts[f] <= Math.floor(topK * 0.3)) result.push(h)
 if (result.length >= topK) break
 }
 return result
