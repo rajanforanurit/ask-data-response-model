@@ -1,6 +1,6 @@
 require('dotenv').config()
 const express=require('express')
-const cors = require('cors')
+const cors =require('cors')
 const {MongoClient, ObjectId} = require('mongodb')
 const {BlobServiceClient} = require('@azure/storage-blob')
 const pdfParse = require('pdf-parse')
