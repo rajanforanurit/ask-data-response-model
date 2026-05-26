@@ -565,3 +565,125 @@ module.exports = {
   relaxedKeywordSearchDD,
   extractAllUrlsFromChunks,
 }
+
+
+function buildStructuredChunk(row, sourceFile = '', chunkIndex = 0) {
+  const text = [
+    row.table ? `Table: ${row.table}` : '',
+    row.column ? `Column: ${row.column}` : '',
+    row.datatype ? `Datatype: ${row.datatype}` : '',
+    row.definition ? `Definition: ${row.definition}` : '',
+    row.aliases && row.aliases.length > 0 ? `Aliases: ${row.aliases.join(', ')}` : '',
+  ].filter(Boolean).join('\n')
+
+  return {
+    docType: 'structured',
+    table: row.table || '',
+    column: row.column || '',
+    datatype: row.datatype || '',
+    definition: row.definition || '',
+    aliases: row.aliases || [],
+    text,
+    source_file: sourceFile,
+    chunk_index: chunkIndex,
+    embedding: [],
+    metadata: {
+      docType: 'structured',
+      table: row.table || '',
+      column: row.column || '',
+      datatype: row.datatype || '',
+      definition: row.definition || '',
+      aliases: row.aliases || [],
+    },
+  }
+}
+
+function calculateStructuredScore(doc, query, bm25Score = 0, bm25Max = 1) {
+  const qLower = query.toLowerCase().trim()
+  const queryTokens = qLower.split(/\s+/).filter(w => w.length >= 2)
+
+  const normalizedBm25 = bm25Max > 0 ? (bm25Score / bm25Max) * 0.5 : 0
+
+  let exactMatch = 0
+  const colLower = (doc.column || doc.metadata?.measure || '').toLowerCase().trim()
+  if (colLower && (colLower === qLower || queryTokens.some(t => t === colLower))) {
+    exactMatch += 100
+  }
+  for (const token of queryTokens) {
+    if (token.length >= 3 && (doc.text || '').toLowerCase().includes(token)) exactMatch += 3
+  }
+
+  let aliasMatch = 0
+  const aliases = doc.aliases || doc.metadata?.aliases || []
+  for (const alias of aliases) {
+    if (alias.toLowerCase() === qLower) aliasMatch += 50
+    else if (queryTokens.some(t => t.length >= 3 && alias.toLowerCase().includes(t))) aliasMatch += 20
+  }
+
+  let tableMatch = 0
+  const tableName = (doc.table || doc.metadata?.table || '').toLowerCase()
+  if (tableName) {
+    for (const token of queryTokens) {
+      if (token.length >= 3 && tableName.includes(token)) tableMatch += 20
+    }
+    if (tableName === qLower) tableMatch += 40
+  }
+
+  let columnMatch = 0
+  if (colLower) {
+    for (const token of queryTokens) {
+      if (token.toUpperCase() === colLower.toUpperCase()) columnMatch += 60
+      else if (token.length >= 3 && colLower.includes(token)) columnMatch += 15
+    }
+  }
+
+  return normalizedBm25 + exactMatch + aliasMatch + tableMatch + columnMatch
+}
+
+function structuredSearchDD(query, chunks, topK = 10) {
+  const { expandQueryString } = require('./aliases')
+  const expandedQuery = expandQueryString(query)
+  const queryTokens = expandedQuery.toLowerCase().split(/\s+/).filter(w => w.length >= 2)
+
+  const bm25Scores = (() => {
+    const k1 = 1.5, b = 0.75
+    const tokenized = chunks.map(c => (c.text || '').toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1))
+    const avgdl = tokenized.reduce((s, t) => s + t.length, 0) / Math.max(tokenized.length, 1)
+    const df = new Map()
+    for (const tokens of tokenized) {
+      const seen = new Set(tokens)
+      for (const t of seen) df.set(t, (df.get(t) || 0) + 1)
+    }
+    const N = tokenized.length
+    const qTokens = expandedQuery.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1)
+    return tokenized.map(tokens => {
+      const tf = new Map()
+      for (const t of tokens) tf.set(t, (tf.get(t) || 0) + 1)
+      let score = 0
+      for (const q of qTokens) {
+        const idf = Math.log((N - (df.get(q) || 0) + 0.5) / ((df.get(q) || 0) + 0.5) + 1)
+        const tfVal = tf.get(q) || 0
+        const numerator = tfVal * (k1 + 1)
+        const denominator = tfVal + k1 * (1 - b + b * tokens.length / avgdl)
+        score += idf * (numerator / denominator)
+      }
+      return score
+    })
+  })()
+
+  const bm25Max = Math.max(...bm25Scores, 1)
+
+  const scored = chunks.map((chunk, i) => {
+    const score = calculateStructuredScore(chunk, expandedQuery, bm25Scores[i] || 0, bm25Max)
+    return { ...chunk, _score: score }
+  }).filter(c => c._score > 0)
+
+  scored.sort((a, b) => b._score - a._score)
+  return scored.slice(0, topK)
+}
+
+module.exports = Object.assign(module.exports, {
+  buildStructuredChunk,
+  calculateStructuredScore,
+  structuredSearchDD,
+})
