@@ -42,6 +42,23 @@ const SYNONYM_MAP = [
 {pattern:/\bocc(upancy)?\s+formula\b/i,canonical:'occupancy formula'},
 {pattern:/\blead\s+acq(uisition)?\s+cost\b/i,canonical:'lead acquisition cost'},
 {pattern:/\blead\s+cost\b/i,canonical:'lead acquisition cost'},
+{pattern:/\b(salary\s+package|pay\s+package|ctc\s+package|compensation\s+package)\b/i,canonical:'compensation breakup'},
+{pattern:/\b(total\s+ctc|total\s+cost\s+to\s+company|cost\s+to\s+company)\b/i,canonical:'total ctc'},
+{pattern:/\b(gross\s+salary|gross\s+pay|gross\s+wage)\b/i,canonical:'gross salary'},
+{pattern:/\b(basic\s+salary|base\s+salary|basic\s+wage|base\s+pay)\b/i,canonical:'basic pay'},
+{pattern:/\b(hra|house\s+rent\s+allowance)\b/i,canonical:'hra'},
+{pattern:/\b(special\s+allowance|sp\s+allowance)\b/i,canonical:'special allowance'},
+{pattern:/\b(performance\s+bonus|annual\s+bonus|yearly\s+bonus|incentive\s+bonus)\b/i,canonical:'performance bonus'},
+{pattern:/\b(package\s+of|salary\s+of|pay\s+of|ctc\s+of|compensation\s+of|remuneration\s+of)\b/i,canonical:'compensation breakup of'},
+{pattern:/\bwhat\s+is\s+(his|her|their)\s+package\b/i,canonical:'what is compensation breakup'},
+{pattern:/\b(joining\s+date|date\s+of\s+joining|start\s+date)\b/i,canonical:'joining date'},
+{pattern:/\b(notice\s+period|probation\s+period|probation)\b/i,canonical:'probation'},
+{pattern:/\b(data\s+retention\s+policy|retention\s+policy|data\s+retention\s+period)\b/i,canonical:'data retention'},
+{pattern:/\b(privacy\s+policy|privacy\s+terms)\b/i,canonical:'privacy policy'},
+{pattern:/\b(contact\s+info|contact\s+details|contact\s+us)\b/i,canonical:'contact information'},
+{pattern:/\b(children\s+privacy|kids\s+privacy|minors\s+privacy)\b/i,canonical:"children's privacy"},
+{pattern:/\b(data\s+security|data\s+protection|security\s+policy)\b/i,canonical:'data security'},
+{pattern:/\b(data\s+sharing|share\s+data|third\s+party\s+sharing)\b/i,canonical:'data sharing'},
 ]
 const TYPO_MAP = {
 ehat:'what',waht:'what',whta:'what',whar:'what',
@@ -49,6 +66,10 @@ hwo:'how',hoe:'how',
 difine:'define',definr:'define',defien:'define',defne:'define',deifne:'define',
 expain:'explain',expalin:'explain',explian:'explain',
 wht:'what',shwo:'show',lsit:'list',lits:'list',
+occupany:'occupancy',occpancy:'occupancy',occupncy:'occupancy',
+applcant:'applicant',applicnat:'applicant',
+retension:'retention',retantion:'retention',
+varience:'variance',varianec:'variance',
 }
 const DOMAIN_SHORT_SAFELIST = new Set([
 'count','rate','rent','cost','date','type','name','unit','term','area',
@@ -56,6 +77,8 @@ const DOMAIN_SHORT_SAFELIST = new Set([
 'tax','due','paid','void','open','loss','gain','flow','days','beds',
 'bath','sqft','tier','band','code','flag','rank','sort','key','ref',
 ])
+const LOCATION_QUALIFIER_PATTERN = /\s+(?:in|at|for|of|within|under|inside|from)\s+(?:the\s+)?(?:[a-z][a-z\s]{1,30})$/i
+const PERSON_QUALIFIER_PATTERN = /\s+(?:of|for)\s+(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)$/
 const RESPONSE_CACHE = new Map()
 const RESPONSE_CACHE_TTL = 10 * 60 * 1000
 const RESPONSE_CACHE_MAX = 1000
@@ -210,6 +233,17 @@ return {isMulti:true,topics:[a,b],mode:'multi_definition'}
 }
 return {isMulti:false,topics:[],mode:null}
 }
+function stripLocationQualifier(subject) {
+const locationWords = new Set([
+'siwan seva','siwan','seva','anurit','anurit innovation','akshay','akshay kumar',
+'app','application','system','platform','service','portal','dashboard','module',
+])
+const stripped = subject.replace(LOCATION_QUALIFIER_PATTERN, '').trim()
+if (stripped.length > 2 && stripped !== subject) return stripped
+const personStripped = subject.replace(PERSON_QUALIFIER_PATTERN, '').trim()
+if (personStripped.length > 2 && personStripped !== subject) return personStripped
+return subject
+}
 function extractSubject(query) {
 const normalized = applySynonyms(query)
 const q = normalizeQuery(normalized)
@@ -239,11 +273,11 @@ const patterns = [
 for (const p of patterns) {
 const m = q.match(p)
 if (m) {
-const subject = m[1].trim().replace(/[?!.]+$/,'').trim()
-if (subject.length > 0) return subject
+const raw = m[1].trim().replace(/[?!.]+$/,'').trim()
+if (raw.length > 0) return stripLocationQualifier(raw)
 }
 }
-return q.replace(/[?!.]+$/,'').trim()
+return stripLocationQualifier(q.replace(/[?!.]+$/,'').trim())
 }
 function extractUrlKeywords(query) {
 const stopWords = new Set(['power','bi','report','url','link','for','the','a','an','of','in','get','me','show','give','find','fetch'])
