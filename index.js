@@ -6,10 +6,6 @@ const {BlobServiceClient} = require('@azure/storage-blob')
 const pdfParse = require('pdf-parse')
 const mammoth = require('mammoth')
 const {parse: htmlParse} = require('node-html-parser')
-const yaml = require('js-yaml')
-const Papa = require('papaparse')
-const {simpleParser} = require('mailparser')
-const {parseOffice} = require('officeparser')
 const crypto = require('crypto')
 const {
 MONGODB_URI,MONGODB_DB,CHAT_HISTORY_URI,CHAT_HISTORY_DB,
@@ -17,7 +13,8 @@ AZURE_CONNECTION_STRING,AZURE_CONTAINER_NAME,ADMIN_API_KEY,
 KEY_CHECK_INTERVAL_MS,ASKDATA_ENDPOINT,ASKDATA_KEY,ASKDATA_MODEL,
 ASKDATA_TIMEOUT_MS,ASKDATA2_ENDPOINT,ASKDATA2_KEY,ASKDATA2_MODEL,
 ASKDATA2_TIMEOUT_MS,REQUEST_TIMEOUT_MS,WARMUP_CLIENT_IDS,
-RAW_PREFIX,BLOB_CONCURRENCY,CHUNK_CACHE_TTL,MAX_HITS_GLOBAL,
+FAISS_PREFIX,BM25_PREFIX,CHUNK_CACHE_TTL,MAX_HITS_GLOBAL,
+FAISS_TOP_K,BM25_TOP_K,RERANK_TOP_K,
 SUPPORTED_EXTENSIONS,
 responseCacheGet,responseCacheSet,getCacheKey,escapeRegex,capFirst,
 ensureSinglePeriod,fixBrokenUrls,trimToLastCompleteSentence,
@@ -110,7 +107,7 @@ console.error('[ASKDATA] Circuit breaker OPEN for 30s')
 }
 
 async function callASKDATA(systemPrompt, userMessage, maxTokens = 1024) {
-if (!ASKDATA_ENDPOINT || !ASKDATA_KEY) throw new Error('ASKDATA_ENDPOINT and ASKDATA_KEY are required')
+if (!ASKDATA_ENDPOINT || !ASKDATA_KEY) throw new Error('ASKDATA not configured')
 if (askedataCircuitOpen()) throw new Error('ASKDATA temporarily unavailable')
 return runWithAskedataLimit(async () => {
 try {
@@ -138,7 +135,7 @@ throw err
 }
 
 async function callASKDATA2(systemPrompt, userMessage, maxTokens = 1024) {
-if (!ASKDATA2_ENDPOINT || !ASKDATA2_KEY) throw new Error('ASKDATA2_ENDPOINT and ASKDATA2_KEY are required')
+if (!ASKDATA2_ENDPOINT || !ASKDATA2_KEY) throw new Error('ASKDATA2 not configured')
 try {
 const response = await fetchWithTimeout(
 ASKDATA2_ENDPOINT,
@@ -173,11 +170,10 @@ primaryError = err
 console.warn(`[ASKDATA] Failed, switching to ASKDATA2: ${err.message}`)
 }
 } else {
-primaryError = new Error('ASKDATA unavailable (circuit open or not configured)')
+primaryError = new Error('ASKDATA unavailable')
 }
 if (ASKDATA2_ENDPOINT && ASKDATA2_KEY) {
 try {
-console.log(`[ASKDATA2] Activating (Reason: ${primaryError?.message})`)
 const result = await callASKDATA2(systemPrompt, userMessage, maxTokens)
 if (result && result.trim().length >= 15) return result
 } catch (err) {
@@ -185,246 +181,6 @@ console.error(`[ASKDATA2] Also failed: ${err.message}`)
 }
 }
 return ''
-}
-
-function classifyDocumentType(chunks, fileName) {
-const ext = ('.' + fileName.split('.').pop()).toLowerCase()
-const codeExts = new Set(['.py','.js','.ts','.jsx','.tsx','.java','.cpp','.c','.h','.cs','.go','.rb','.php','.swift','.kt','.r','.sql','.sh','.bash','.ps1'])
-const spreadsheetExts = new Set(['.xlsx','.xls','.ods','.csv','.tsv'])
-if (codeExts.has(ext)) return 'code'
-if (spreadsheetExts.has(ext)) return 'data_dictionary'
-if (!chunks || chunks.length === 0) return 'unstructured'
-const metaChunks = chunks.filter(c => c.metadata && c.metadata.measure).length
-if (metaChunks / Math.max(chunks.length,1) > 0.4) return 'data_dictionary'
-const sample = chunks.slice(0,10).map(c => c.text || '').join('\n')
-const ddSignals = [/is defined as:/i,/formula\s*:/i,/how to calculate/i,/report url for/i,/power bi link for/i].filter(p => p.test(sample)).length
-if (ddSignals >= 2) return 'data_dictionary'
-const sfSignals = [
-/^#{1,6}\s+\S/m,
-/^(Abstract|Introduction|Background|Methodology|Methods|Results|Discussion|Conclusion|References|Summary|Executive Summary|Key Findings)\b/im,
-/\|\s*\S+\s*\|/,
-/^\d+\.\d+\s+[A-Z]/m,
-/^\*\*[^*]{3,60}\*\*\s*:?\s*$/m,
-/\[Section:/m,
-].filter(p => p.test(sample)).length
-if (sfSignals >= 2) return 'structured'
-const codeSignals = [/^(function|class|def|import|const|let|var|async)\s/m,/=>\s*{/,/\bpublic\s+(static\s+)?\w+\s+\w+\s*\(/m].filter(p => p.test(sample)).length
-if (codeSignals >= 2) return 'code'
-const sfChunkRatio = chunks.filter(c => c.metadata && c.metadata.section).length / Math.max(chunks.length,1)
-if (sfChunkRatio > 0.3) return 'structured'
-const hasLongParagraphs = chunks.filter(c => (c.text || '').length > 300).length > chunks.length * 0.4
-if (hasLongParagraphs) return 'unstructured'
-return 'unstructured'
-}
-
-function detectDocTypeFromChunks(chunks) {
-if (!chunks || chunks.length === 0) return 'unstructured'
-const ddCount = chunks.filter(c => c.metadata && c.metadata.measure).length
-if (ddCount / Math.max(chunks.length,1) > 0.4) return 'data_dictionary'
-const sfCount = chunks.filter(c => c.metadata && c.metadata.section).length
-if (sfCount / Math.max(chunks.length,1) > 0.3) return 'structured'
-return 'unstructured'
-}
-
-async function extractPdf(buffer) { const r = await pdfParse(buffer); return r.text || '' }
-
-async function extractWord(buffer) {
-try {
-const htmlResult = await mammoth.convertToHtml({ buffer })
-const html = htmlResult.value || ''
-const root = htmlParse(html)
-
-const lines = []
-for (const node of root.childNodes) {
-const tag = (node.tagName || '').toLowerCase()
-const text = (node.structuredText || node.innerText || node.rawText || '').trim()
-if (!text) continue
-if (['h1','h2','h3','h4','h5','h6'].includes(tag)) {
-lines.push(`## ${text}`)
-} else if (tag === 'p') {
-const boldChildren = node.querySelectorAll('strong, b')
-const fullBold = boldChildren.length > 0 && (boldChildren[0].structuredText || '').trim().length > 3
-const paraText = (node.structuredText || node.innerText || '').trim()
-if (fullBold && paraText.length < 100) {
-lines.push(`**${paraText}**`)
-} else {
-lines.push(paraText)
-}
-} else if (tag === 'ul' || tag === 'ol') {
-for (const li of node.querySelectorAll('li')) {
-const liText = (li.structuredText || li.innerText || '').trim()
-if (liText) {
-const boldInLi = li.querySelectorAll('strong, b')
-if (boldInLi.length > 0 && liText.length < 100) {
-lines.push(`- **${liText}**`)
-} else {
-lines.push(`- ${liText}`)
-}
-}
-}
-} else if (tag === 'table') {
-for (const row of node.querySelectorAll('tr')) {
-const cells = row.querySelectorAll('td, th').map(c => (c.structuredText || c.innerText || '').trim())
-if (cells.length > 0) lines.push('| ' + cells.join(' | ') + ' |')
-}
-} else if (text) {
-lines.push(text)
-}
-}
-return lines.join('\n')
-} catch (err) {
-console.warn(`[extractWord] HTML conversion failed, falling back to raw text: ${err.message}`)
-const r = await mammoth.extractRawText({ buffer })
-return r.value || ''
-}
-}
-
-function extractCsv(buffer, delimiter) {
-const text = buffer.toString('utf-8')
-const result = Papa.parse(text, { header: true, skipEmptyLines: true, delimiter })
-if (!result.data?.length) return text
-return result.data.map((row,i) => `Row ${i+1}: ` + Object.entries(row).map(([k,v]) => `${k}=${v}`).join(' | ')).join('\n')
-}
-
-async function extractOffice(buffer) {
-return new Promise((resolve, reject) => {
-parseOffice(buffer, (text, err) => { if (err) reject(err); else resolve(text || '') }, { outputErrorToConsole: false })
-})
-}
-
-function extractHtml(buffer) {
-const root = htmlParse(buffer.toString('utf-8'))
-root.querySelectorAll('script, style').forEach(n => n.remove())
-return root.structuredText || root.innerText || root.rawText || ''
-}
-
-function extractXml(buffer) { return buffer.toString('utf-8').replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim() }
-function extractJson(buffer) { try { return JSON.stringify(JSON.parse(buffer.toString('utf-8')),null,2) } catch { return buffer.toString('utf-8') } }
-function extractJsonl(buffer) {
-return buffer.toString('utf-8').split('\n').filter(Boolean).map(line => { try { return JSON.stringify(JSON.parse(line)) } catch { return line } }).join('\n')
-}
-function extractYaml(buffer) { try { return JSON.stringify(yaml.load(buffer.toString('utf-8')),null,2) } catch { return buffer.toString('utf-8') } }
-
-async function extractEml(buffer) {
-const parsed = await simpleParser(buffer)
-const parts = []
-if (parsed.subject) parts.push(`Subject: ${parsed.subject}`)
-if (parsed.from) parts.push(`From: ${parsed.from.text}`)
-if (parsed.to) parts.push(`To: ${parsed.to.text}`)
-if (parsed.date) parts.push(`Date: ${parsed.date}`)
-if (parsed.text) parts.push(`\n${parsed.text}`)
-else if (parsed.html) parts.push(`\n${extractHtml(Buffer.from(parsed.html))}`)
-return parts.join('\n')
-}
-
-async function extractEpub(buffer) {
-return new Promise(resolve => {
-parseOffice(buffer, (text, err) => { resolve(err || !text ? '[EPUB: convert to PDF for best results]' : text) }, { outputErrorToConsole: false })
-})
-}
-
-async function extractTextFromBuffer(buffer, fileName) {
-const ext = ('.' + fileName.split('.').pop()).toLowerCase()
-if (ext === '.pdf') return extractPdf(buffer)
-if (ext === '.docx' || ext === '.doc') return extractWord(buffer)
-if (ext === '.odt' || ext === '.rtf') return extractOffice(buffer)
-if (['.xlsx','.xls','.ods'].includes(ext)) return null
-if (ext === '.csv') return extractCsv(buffer,',')
-if (ext === '.tsv') return extractCsv(buffer,'\t')
-if (ext === '.pptx' || ext === '.ppt') return extractOffice(buffer)
-if (ext === '.html' || ext === '.htm') return extractHtml(buffer)
-if (ext === '.xml') return extractXml(buffer)
-if (['.md','.markdown','.rst'].includes(ext)) return buffer.toString('utf-8')
-if (ext === '.json') return extractJson(buffer)
-if (ext === '.jsonl') return extractJsonl(buffer)
-if (ext === '.yaml' || ext === '.yml') return extractYaml(buffer)
-if (ext === '.toml') return buffer.toString('utf-8')
-if (ext === '.epub') return extractEpub(buffer)
-if (ext === '.eml') return extractEml(buffer)
-const plainText = new Set(['.txt','.py','.js','.ts','.jsx','.tsx','.java','.cpp','.c','.h','.cs','.go','.rb','.php','.swift','.kt','.r','.sql','.sh','.bash','.ps1'])
-if (plainText.has(ext)) return buffer.toString('utf-8')
-return ''
-}
-
-function sniffDocumentType(text, fileName) {
-const ext = ('.' + fileName.split('.').pop()).toLowerCase()
-const sfExts = new Set(['.pdf','.docx','.doc','.odt','.rtf','.pptx','.ppt','.md','.markdown','.rst','.html','.htm'])
-if (!sfExts.has(ext)) return 'unstructured'
-const lines = text.split('\n').slice(0,80)
-let headingCount = 0
-let tableCount = 0
-let longParaCount = 0
-let boldHeadingCount = 0
-let bulletHeadingCount = 0
-for (const line of lines) {
-const trimmed = line.trim()
-if (/^#{1,6}\s+\S/.test(trimmed)) headingCount++
-if (/^(Abstract|Introduction|Background|Methodology|Methods|Results|Discussion|Conclusion|References|Summary|Executive Summary|Key Findings|Recommendations)\b/i.test(trimmed)) headingCount++
-if (/\|.*\|/.test(line)) tableCount++
-if (line.length > 200) longParaCount++
-if (/^\*\*[^*]{3,60}\*\*\s*:?\s*$/.test(trimmed)) boldHeadingCount++
-if (/^[-*•]\s*\*\*[^*]+\*\*/.test(trimmed)) bulletHeadingCount++
-if (/^[A-Z][A-Za-z\s]{3,50}:\s*$/.test(trimmed) && trimmed.length < 80) boldHeadingCount++
-}
-const sampleLower = text.slice(0,3000).toLowerCase()
-const ddSignals = [/is defined as/,/formula:/,/how to calculate/,/measure name/,/attribute name/].filter(p => p.test(sampleLower)).length
-if (ddSignals >= 2) return 'data_dictionary'
-const structuredSignals = headingCount + boldHeadingCount + bulletHeadingCount
-if (structuredSignals >= 2 || tableCount >= 2) return 'structured'
-if (boldHeadingCount >= 1 && bulletHeadingCount >= 1) return 'structured'
-if (longParaCount >= 5) return 'unstructured'
-return 'unstructured'
-}
-
-function chunkTextLegacy(text, sourceFile) {
-const CHUNK_SIZE_L = 1200
-const CHUNK_OVERLAP_L = 2
-const chunks = []
-let chunkIndex = 0
-const blocks = text.replace(/\r\n/g,'\n').split(/\n{2,}/).map(b => b.trim()).filter(b => b.length > 0)
-let buffer = []
-let bufferLength = 0
-function flush() {
-const chunkStr = buffer.join('\n\n')
-if (chunkStr.length >= 30) chunks.push({ text: chunkStr, source_file: sourceFile, chunk_index: chunkIndex++, embedding: [] })
-buffer = []
-bufferLength = 0
-}
-for (let bi = 0; bi < blocks.length; bi++) {
-const block = blocks[bi]
-if (block.length > CHUNK_SIZE_L * 1.5) {
-if (buffer.length > 0) flush()
-const lines = block.split('\n').filter(l => l.trim())
-let lineBuffer = []
-let lineLength = 0
-for (const line of lines) {
-const projected = lineLength + (lineBuffer.length ? 1 : 0) + line.length
-if (lineBuffer.length > 0 && projected > CHUNK_SIZE_L) {
-const s = lineBuffer.join('\n')
-if (s.length >= 30) chunks.push({ text: s, source_file: sourceFile, chunk_index: chunkIndex++, embedding: [] })
-lineBuffer = lineBuffer.slice(-CHUNK_OVERLAP_L)
-lineLength = lineBuffer.join('\n').length
-}
-lineBuffer.push(line)
-lineLength += (lineLength ? 1 : 0) + line.length
-}
-if (lineBuffer.length) {
-const s = lineBuffer.join('\n')
-if (s.length >= 30) chunks.push({ text: s, source_file: sourceFile, chunk_index: chunkIndex++, embedding: [] })
-}
-continue
-}
-const projected = bufferLength + (bufferLength ? 2 : 0) + block.length
-if (buffer.length > 0 && projected > CHUNK_SIZE_L) {
-const lastBlock = buffer[buffer.length - 1] || ''
-flush()
-if (lastBlock) { buffer.push(lastBlock); bufferLength = lastBlock.length }
-}
-buffer.push(block)
-bufferLength += (bufferLength ? 2 : 0) + block.length
-}
-if (buffer.length > 0) flush()
-return chunks
 }
 
 async function downloadBlobAsBuffer(containerClient, blobName) {
@@ -436,58 +192,151 @@ parts.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
 return Buffer.concat(parts)
 }
 
-async function _doLoadChunks(clientId) {
+async function loadChunksFromBlob(clientId) {
 if (!blobServiceClient) throw new Error('AZURE_CONNECTION_STRING not set')
 const containerClient = blobServiceClient.getContainerClient(AZURE_CONTAINER_NAME)
-const prefix = `${RAW_PREFIX}/${clientId}/`
-const blobNames = []
-for await (const blob of containerClient.listBlobsFlat({ prefix })) {
-const fileName = blob.name.split('/').pop()
-const ext = ('.' + fileName.split('.').pop()).toLowerCase()
-if (SUPPORTED_EXTENSIONS.has(ext)) blobNames.push(blob.name)
-}
-const allChunks = []
-let chunkIndexOffset = 0
-for (let i = 0; i < blobNames.length; i += BLOB_CONCURRENCY) {
-const batch = blobNames.slice(i, i + BLOB_CONCURRENCY)
-const results = await Promise.allSettled(batch.map(async (blobName) => {
-const fileName = blobName.split('/').pop()
-const ext = ('.' + fileName.split('.').pop()).toLowerCase()
-const buffer = await downloadBlobAsBuffer(containerClient, blobName)
-if (['.xlsx','.xls','.ods'].includes(ext)) {
-const structuredRows = extractSpreadsheet(buffer)
-return structuredRows.map((row,idx) => ({
-text: row.text, source_file: fileName, chunk_index: idx, embedding: [],
-metadata: row.metadata || null, docType: 'data_dictionary',
+const chunksBlob = `${FAISS_PREFIX}/${clientId}/chunks.json`
+let chunks = []
+try {
+const buf = await downloadBlobAsBuffer(containerClient, chunksBlob)
+const raw = JSON.parse(buf.toString('utf-8'))
+chunks = raw.map((c, i) => ({
+text: c.text || '',
+source_file: c.source_file || 'unknown',
+chunk_index: i,
+embedding: c.embedding || null,
+metadata: c.metadata || null,
+docType: c.metadata?.section ? 'structured' : (c.metadata?.measure ? 'data_dictionary' : 'unstructured'),
 }))
+console.log(`[blobLoad] Loaded ${chunks.length} chunks for ${clientId} from ${chunksBlob}`)
+} catch (err) {
+console.warn(`[blobLoad] chunks.json not found for ${clientId}: ${err.message}`)
 }
-const text = await extractTextFromBuffer(buffer, fileName)
-if (!text?.trim()) return []
-const docTypeHint = sniffDocumentType(text, fileName)
-let rawChunks = []
-if (docTypeHint === 'data_dictionary') {
-rawChunks = chunkTextLegacy(text, fileName)
-} else if (docTypeHint === 'structured') {
-rawChunks = chunkStructuredDocument(text, fileName)
-} else {
-rawChunks = slidingWindowChunk(text, fileName)
+return chunks
 }
-const finalDocType = docTypeHint === 'data_dictionary' ? 'data_dictionary' : classifyDocumentType(rawChunks, fileName)
-console.log(`[loadChunks] ${fileName} -> sniff=${docTypeHint} final=${finalDocType} chunks=${rawChunks.length}`)
-return rawChunks.map(c => ({...c, docType: finalDocType}))
-}))
-for (const result of results) {
-if (result.status === 'fulfilled') {
-const fileChunks = result.value
-fileChunks.forEach((c,idx) => { c.chunk_index = chunkIndexOffset + idx })
-chunkIndexOffset += fileChunks.length
-allChunks.push(...fileChunks)
-} else {
-console.warn('[loadChunks] Blob failed:', result.reason?.message)
+
+async function loadBM25FromBlob(clientId) {
+if (!blobServiceClient) return null
+const containerClient = blobServiceClient.getContainerClient(AZURE_CONTAINER_NAME)
+const bm25Blob = `${BM25_PREFIX}/${clientId}/bm25.pkl`
+try {
+await containerClient.getBlobClient(bm25Blob).getProperties()
+console.log(`[blobLoad] BM25 blob exists for ${clientId} (Python-side scoring used)`)
+return { clientId, blobName: bm25Blob, available: true }
+} catch {
+console.warn(`[blobLoad] BM25 blob not found for ${clientId}`)
+return null
 }
 }
+
+function bm25ScoreJS(query, chunks) {
+const k1 = 1.5, b = 0.75
+const queryTokens = query.toLowerCase().replace(/[^\w\s]/g,' ').split(/\s+/).filter(w => w.length > 1)
+if (queryTokens.length === 0) return new Array(chunks.length).fill(0)
+const tokenized = chunks.map(c => (c.text || '').toLowerCase().replace(/[^\w\s]/g,' ').split(/\s+/).filter(w => w.length > 1))
+const avgdl = tokenized.reduce((s, t) => s + t.length, 0) / Math.max(tokenized.length, 1)
+const df = new Map()
+for (const tokens of tokenized) {
+const seen = new Set(tokens)
+for (const t of seen) df.set(t, (df.get(t) || 0) + 1)
 }
-return allChunks
+const N = tokenized.length
+return tokenized.map(tokens => {
+const tf = new Map()
+for (const t of tokens) tf.set(t, (tf.get(t) || 0) + 1)
+let score = 0
+for (const q of queryTokens) {
+const idf = Math.log((N - (df.get(q) || 0) + 0.5) / ((df.get(q) || 0) + 0.5) + 1)
+const tfVal = tf.get(q) || 0
+const numerator = tfVal * (k1 + 1)
+const denominator = tfVal + k1 * (1 - b + b * tokens.length / avgdl)
+score += idf * (numerator / denominator)
+}
+return score
+})
+}
+
+function hybridSearch(query, chunks, faissTopK = FAISS_TOP_K, bm25TopK = BM25_TOP_K, alpha = 0.6) {
+const invertedIndex = buildInvertedIndex(chunks)
+const queryWords = normalizeQuery(query).replace(/[^\w\s]/g,' ').split(/\s+/).filter(w => w.length > 1)
+const subject = extractSubject(query)
+const subjectWords = subject.toLowerCase().split(/\s+/).filter(w => w.length > 1)
+const candidateSet = new Set()
+for (const w of [...queryWords, ...subjectWords]) {
+for (const idx of (invertedIndex.get(w) || new Set())) candidateSet.add(idx)
+}
+const source = candidateSet.size > 0
+? [...candidateSet].map(i => chunks[i]).filter(Boolean)
+: chunks.slice(0, Math.min(300, chunks.length))
+const subjectPhraseStr = subject.toLowerCase()
+const faissScores = source.map(c => {
+const text = (c.text || '').toLowerCase()
+let score = 0
+const wordCoverage = queryWords.filter(w => text.includes(w)).length
+score += wordCoverage * 3
+const subjectCoverage = subjectWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`,'i').test(text)).length
+score += subjectCoverage * 5
+if (text.includes(subjectPhraseStr)) score += 8
+if (c.metadata?.section) {
+const sl = c.metadata.section.toLowerCase()
+const sm = subjectWords.filter(w => sl.includes(w)).length
+score += sm * 8
+if (sl.includes(subjectPhraseStr)) score += 12
+}
+if (c.metadata?.measure) {
+const ml = (c.metadata.measure || '').toLowerCase()
+if (ml === subjectPhraseStr) score += 100
+}
+return { chunk: c, faissScore: score }
+})
+const faissMax = Math.max(...faissScores.map(x => x.faissScore), 1)
+const bm25Raw = bm25ScoreJS(query, source)
+const bm25Max = Math.max(...bm25Raw, 1)
+const hybrid = faissScores.map((x, i) => {
+const fNorm = x.faissScore / faissMax
+const bNorm = bm25Raw[i] / bm25Max
+return { chunk: x.chunk, score: alpha * fNorm + (1 - alpha) * bNorm }
+})
+hybrid.sort((a, b) => b.score - a.score)
+const seen = new Set()
+const results = []
+for (const { chunk, score } of hybrid) {
+const fp = (chunk.text || '').trim().slice(0, 60).toLowerCase()
+if (!seen.has(fp)) {
+seen.add(fp)
+results.push({ ...chunk, _score: score })
+}
+if (results.length >= Math.max(faissTopK, bm25TopK)) break
+}
+return results
+}
+
+function classifyDocumentType(chunks, fileName) {
+if (!chunks || chunks.length === 0) return 'unstructured'
+const ddCount = chunks.filter(c => c.docType === 'data_dictionary').length
+if (ddCount / Math.max(chunks.length, 1) > 0.4) return 'data_dictionary'
+const sfCount = chunks.filter(c => c.docType === 'structured').length
+if (sfCount / Math.max(chunks.length, 1) > 0.3) return 'structured'
+return 'unstructured'
+}
+
+function detectDocTypeFromChunks(chunks) {
+if (!chunks || chunks.length === 0) return 'unstructured'
+const ddCount = chunks.filter(c => c.docType === 'data_dictionary').length
+if (ddCount / Math.max(chunks.length, 1) > 0.4) return 'data_dictionary'
+const sfCount = chunks.filter(c => c.docType === 'structured').length
+if (sfCount / Math.max(chunks.length, 1) > 0.3) return 'structured'
+return 'unstructured'
+}
+
+async function _doLoadChunks(clientId) {
+const chunks = await loadChunksFromBlob(clientId)
+if (chunks.length === 0) {
+console.warn(`[loadChunks] No chunks found in blob for ${clientId}`)
+return []
+}
+console.log(`[loadChunks] ${clientId} -> ${chunks.length} total chunks`)
+return chunks
 }
 
 const CHUNK_CACHE = new Map()
@@ -521,7 +370,6 @@ const loadPromise = _doLoadChunks(clientId)
 .then(chunks => {
 const invertedIndexes = buildAllInvertedIndexes(chunks)
 CHUNK_CACHE.set(clientId, { chunks, invertedIndexes, ts: Date.now(), loading: null })
-console.log(`[chunkCache] Loaded ${chunks.length} chunks for ${clientId}`)
 return chunks
 })
 .catch(err => {
@@ -674,30 +522,12 @@ if (docType === 'structured') return buildFallbackAnswerSF(query, hits)
 return buildFallbackAnswerUD(query, hits)
 }
 
-async function retrieveHitsForDocType(processedQuery, chunks, topK, invertedIndexes, docType, intent) {
-if (docType === 'data_dictionary') {
-const ddChunks = chunks.filter(c => c.docType === 'data_dictionary')
-const idx = invertedIndexes.dd
-const hits = await retrieveChunksDD(processedQuery, ddChunks.length > 0 ? ddChunks : chunks, topK, idx)
-if (hits.length === 0) return relaxedKeywordSearchDD(processedQuery, ddChunks.length > 0 ? ddChunks : chunks, 64, idx)
-return hits
-}
-if (docType === 'structured') {
-const sfChunks = chunks.filter(c => c.docType === 'structured')
-const idx = invertedIndexes.sf || invertedIndexes.all
-return retrieveChunksSF(processedQuery, sfChunks.length > 0 ? sfChunks : chunks, topK, idx)
-}
-const udChunks = chunks.filter(c => c.docType !== 'data_dictionary' && c.docType !== 'structured')
-const idx = invertedIndexes.ud || invertedIndexes.all
-return retrieveChunksUD(processedQuery, udChunks.length > 0 ? udChunks : chunks, topK, idx)
-}
-
 function computePoolConfidence(hits, docType) {
 if (!hits || hits.length === 0) return 0
 const topScore = hits[0]?._score || 0
 const secondScore = hits[1]?._score || 0
 const gap = topScore - secondScore
-const MIN_THRESHOLD = 3
+const MIN_THRESHOLD = 0.05
 if (topScore < MIN_THRESHOLD) return 0
 const topN = hits.slice(0, Math.min(5, hits.length))
 const avgScore = topN.reduce((s, h) => s + (h._score || 0), 0) / topN.length
@@ -710,46 +540,51 @@ async function retrieveBestHitsAcrossAllTypes(processedQuery, chunks, topK, inve
 const ddChunks = chunks.filter(c => c.docType === 'data_dictionary')
 const sfChunks = chunks.filter(c => c.docType === 'structured')
 const udChunks = chunks.filter(c => c.docType !== 'data_dictionary' && c.docType !== 'structured')
-
-const [ddHits, sfHits, udHits] = await Promise.all([
-ddChunks.length > 0
-? retrieveChunksDD(processedQuery, ddChunks, topK, invertedIndexes.dd).catch(() => [])
-: Promise.resolve([]),
-sfChunks.length > 0
-? Promise.resolve(retrieveChunksSF(processedQuery, sfChunks, topK, invertedIndexes.sf || invertedIndexes.all))
-: Promise.resolve([]),
-udChunks.length > 0
-? Promise.resolve(retrieveChunksUD(processedQuery, udChunks, topK, invertedIndexes.ud || invertedIndexes.all))
-: Promise.resolve([]),
-])
-
-const pools = [
-{ hits: ddHits, docType: 'data_dictionary' },
-{ hits: sfHits, docType: 'structured' },
-{ hits: udHits, docType: 'unstructured' },
-].filter(p => p.hits && p.hits.length > 0)
-
-if (pools.length === 0) return { hits: [], docType: 'unstructured' }
-
-for (const pool of pools) {
-pool.confidence = computePoolConfidence(pool.hits, pool.docType)
-console.log(`[routing] docType=${pool.docType} topScore=${pool.hits[0]?._score?.toFixed(2)||0} confidence=${pool.confidence.toFixed(2)}`)
+const hybridHits = hybridSearch(processedQuery, chunks, FAISS_TOP_K, BM25_TOP_K)
+const ddHits = ddChunks.length > 0 ? hybridHits.filter(h => h.docType === 'data_dictionary') : []
+const sfHits = sfChunks.length > 0 ? hybridHits.filter(h => h.docType === 'structured') : []
+const udHits = udChunks.length > 0 ? hybridHits.filter(h => h.docType !== 'data_dictionary' && h.docType !== 'structured') : []
+const ddKeyword = ddChunks.length > 0
+? await retrieveChunksDD(processedQuery, ddChunks, topK, invertedIndexes.dd).catch(() => [])
+: []
+const sfKeyword = sfChunks.length > 0
+? retrieveChunksSF(processedQuery, sfChunks, topK, invertedIndexes.sf || invertedIndexes.all)
+: []
+const udKeyword = udChunks.length > 0
+? retrieveChunksUD(processedQuery, udChunks, topK, invertedIndexes.ud || invertedIndexes.all)
+: []
+function mergeHits(hybridPool, keywordPool, limit) {
+const seen = new Set()
+const merged = []
+for (const h of [...hybridPool, ...keywordPool]) {
+const fp = (h.text || '').trim().slice(0, 60).toLowerCase()
+if (!seen.has(fp)) { seen.add(fp); merged.push(h) }
+if (merged.length >= limit) break
 }
-
+return merged
+}
+const pools = [
+{ hits: mergeHits(ddHits, ddKeyword, topK), docType: 'data_dictionary' },
+{ hits: mergeHits(sfHits, sfKeyword, topK), docType: 'structured' },
+{ hits: mergeHits(udHits, udKeyword, topK), docType: 'unstructured' },
+].filter(p => p.hits && p.hits.length > 0)
+if (pools.length === 0) return { hits: [], docType: 'unstructured' }
+for (const pool of pools) pool.confidence = computePoolConfidence(pool.hits, pool.docType)
 const validPools = pools.filter(p => p.confidence > 0)
 if (validPools.length === 0) {
 pools.sort((a, b) => (b.hits[0]?._score || 0) - (a.hits[0]?._score || 0))
 return { hits: pools[0].hits, docType: pools[0].docType }
 }
-
 validPools.sort((a, b) => b.confidence - a.confidence)
+console.log(`[routing] winner=${validPools[0].docType} confidence=${validPools[0].confidence.toFixed(3)}`)
 return { hits: validPools[0].hits, docType: validPools[0].docType }
 }
 
 async function generateAnswerForTopic(topic, chunks, topK, invertedIndexes) {
 const topicQuery = `what is ${topic}`
 const docType = detectDocTypeFromChunks(chunks)
-let hits = await retrieveHitsForDocType(topicQuery, chunks, topK, invertedIndexes, docType, 'definition')
+let hits = await retrieveBestHitsAcrossAllTypes(topicQuery, chunks, topK, invertedIndexes, 'definition')
+if (hits.hits) hits = hits.hits
 if (hits.length === 0) hits = relaxedKeywordSearchDD(topicQuery, chunks, 32, invertedIndexes.all)
 if (hits.length === 0) return null
 let rawAnswer = ''
@@ -759,7 +594,7 @@ generateAnswer(topicQuery, hits, 'definition', docType),
 new Promise((_,reject) => setTimeout(() => reject(new Error('timeout')),25000)),
 ])
 } catch (err) {
-console.warn(`[generateAnswerForTopic] Engine failed for "${topic}": ${err.message}`)
+console.warn(`[generateAnswerForTopic] Failed for "${topic}": ${err.message}`)
 }
 const isBlank = !rawAnswer || rawAnswer.trim().length < 15
 let answer = isBlank ? buildFallbackAnswer(topicQuery, hits, 'definition', docType) : cleanAnswer(rawAnswer)
@@ -771,8 +606,10 @@ return answer
 async function generateComparisonAnswer(topicA, topicB, chunks, topK, invertedIndexes) {
 const comparisonQuery = `difference between ${topicA} and ${topicB}`
 const docType = detectDocTypeFromChunks(chunks)
-const hitsA = await retrieveHitsForDocType(`what is ${topicA}`, chunks, topK, invertedIndexes, docType, 'definition')
-const hitsB = await retrieveHitsForDocType(`what is ${topicB}`, chunks, topK, invertedIndexes, docType, 'definition')
+const resA = await retrieveBestHitsAcrossAllTypes(`what is ${topicA}`, chunks, topK, invertedIndexes, 'definition')
+const resB = await retrieveBestHitsAcrossAllTypes(`what is ${topicB}`, chunks, topK, invertedIndexes, 'definition')
+const hitsA = resA.hits || []
+const hitsB = resB.hits || []
 const allHits = [...hitsA,...hitsB]
 const seen = new Set()
 const deduped = []
@@ -788,7 +625,7 @@ generateAnswer(comparisonQuery, deduped, 'comparison', docType),
 new Promise((_,reject) => setTimeout(() => reject(new Error('timeout')),25000)),
 ])
 } catch (err) {
-console.warn(`[generateComparisonAnswer] Engine failed for "${topicA}" vs "${topicB}": ${err.message}`)
+console.warn(`[generateComparisonAnswer] Failed: ${err.message}`)
 }
 if (rawAnswer && rawAnswer.trim().length >= 15) return cleanAnswer(rawAnswer)
 const answerA = await generateAnswerForTopic(topicA, chunks, topK, invertedIndexes)
@@ -857,10 +694,9 @@ const IN_FLIGHT = new Map()
 app.get('/health', (req, res) => res.json({
 ok: true, service: 'ask-data',
 engines: { primary: ASKDATA_ENDPOINT ? 'configured' : 'missing', fallback: ASKDATA2_ENDPOINT ? 'configured' : 'missing' },
+retrieval: 'hybrid BM25+keyword + cross-type routing',
 chunkCacheSize: CHUNK_CACHE.size,
 primaryCircuitOpen: askedataCircuitOpen(),
-primaryFailures: askedataFailures,
-maxHits: MAX_HITS_GLOBAL,
 }))
 
 app.post('/client/verify', async (req, res) => {
@@ -953,7 +789,7 @@ const blobsDeleted = [], blobsFailed = []
 if (blobServiceClient) {
 try {
 const containerClient = blobServiceClient.getContainerClient(AZURE_CONTAINER_NAME)
-for (const prefix of [`raw/${clientId}/`,`meta/${clientId}/`]) {
+for (const prefix of [`raw/${clientId}/`,`faiss/${clientId}/`,`bm25/${clientId}/`,`meta/${clientId}/`]) {
 for await (const blob of containerClient.listBlobsFlat({ prefix })) {
 try { await containerClient.deleteBlob(blob.name); blobsDeleted.push(blob.name) }
 catch (e) { blobsFailed.push({ name: blob.name, error: e.message }) }
@@ -1069,7 +905,7 @@ const { clientId, name } = req.client
 const intent = detectQueryIntent(query.trim())
 if (intent === 'greeting') {
 return res.json({
-answer: "Hello! I'm your document assistant. Ask me anything about your data, research papers, or documents.",
+answer: "Hello! I'm your document assistant. Ask me anything about your data or documents.",
 sources: [], conversationId: conversationId || null, client: { clientId, name },
 })
 }
@@ -1090,23 +926,18 @@ const requestPromise = (async () => {
 const { chunks, invertedIndexes } = await loadChunksForClient(clientId)
 if (chunks.length === 0) return { answer: 'No documents found for your account. Please ensure your documents have been ingested first.', sources: [], client: { clientId, name } }
 let processedQuery = applyTypos(query.trim())
-console.log(`[QueryPipeline] Original: "${query.trim()}"`)
-if (processedQuery !== query.trim()) console.log(`[QueryPipeline] After typos: "${processedQuery}"`)
 processedQuery = applySynonyms(processedQuery)
-
 const hasSFChunks = chunks.some(c => c.docType === 'structured')
 const hasUDChunks = chunks.some(c => c.docType !== 'data_dictionary' && c.docType !== 'structured')
-
 if (hasSFChunks || hasUDChunks) {
 const rewritten = await preprocessQueryUD(processedQuery)
-if (rewritten !== processedQuery) console.log(`[QueryPipeline] After UD rewrite: "${rewritten}"`)
+if (rewritten !== processedQuery) console.log(`[QueryPipeline] Rewritten: "${rewritten}"`)
 processedQuery = rewritten
 } else {
 const corrected = fuzzyCorrectQuery(processedQuery, chunks.filter(c => c.docType === 'data_dictionary'))
-if (corrected !== processedQuery) console.log(`[QueryPipeline] After DD fuzzy: "${corrected}"`)
+if (corrected !== processedQuery) console.log(`[QueryPipeline] Fuzzy corrected: "${corrected}"`)
 processedQuery = corrected
 }
-
 if (intent === 'all_urls') {
 const urlChunks = chunks.filter(c => /https?:\/\/\S+/.test(c.text || ''))
 const urlEntries = extractAllUrlsFromChunks(urlChunks)
@@ -1114,28 +945,21 @@ const answer = urlEntries.length > 0 ? urlEntries.map(e => `**${e.name}:** ${e.u
 const sources = urlChunks.slice(0,6).map(h => ({ source_file: h.source_file || 'unknown', chunk_index: h.chunk_index ?? 0, score: null, preview: (h.text || '').slice(0,200) }))
 return { answer, sources, client: { clientId, name } }
 }
-
 const multiTopicCheck = detectMultiTopicQuery(processedQuery)
 if (multiTopicCheck.isMulti) {
-console.log(`[chat/message] Multi-topic detected: ${JSON.stringify(multiTopicCheck.topics)} mode=${multiTopicCheck.mode}`)
+console.log(`[chat/message] Multi-topic: ${JSON.stringify(multiTopicCheck.topics)} mode=${multiTopicCheck.mode}`)
 const answer = await handleMultiTopicQuery(multiTopicCheck.topics, multiTopicCheck.mode, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndexes)
 return { answer, sources: [], client: { clientId, name } }
 }
-
 const { hits, docType: routedDocType } = await retrieveBestHitsAcrossAllTypes(processedQuery, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndexes, intent)
-
 let finalHits = hits
 let finalDocType = routedDocType
-
 if (finalHits.length === 0) {
 finalHits = relaxedKeywordSearchDD(processedQuery, chunks, 64, invertedIndexes.all)
 finalDocType = detectDocTypeFromChunks(finalHits.length > 0 ? finalHits : chunks)
 }
-
-console.log(`[chat/message] "${query.slice(0,60)}" -> intent=${intent}, docType=${finalDocType}, hits=${finalHits.length}, topScore=${finalHits[0]?._score?.toFixed(2)||0}`)
-
+console.log(`[chat/message] "${query.slice(0,60)}" -> intent=${intent}, docType=${finalDocType}, hits=${finalHits.length}`)
 if (finalHits.length === 0) return { answer: 'I could not find relevant information about this in your documents. Try rephrasing your question.', sources: [], client: { clientId, name } }
-
 let rawAnswer = ''
 if (intent !== 'url_lookup') {
 try {
@@ -1144,14 +968,12 @@ generateAnswer(processedQuery, finalHits, intent, finalDocType),
 new Promise((_,reject) => setTimeout(() => reject(new Error('All engines timed out')),55000)),
 ])
 } catch (err) {
-console.warn(`[chat/message] All engines failed, using rule-based fallback: ${err.message}`)
+console.warn(`[chat/message] All engines failed: ${err.message}`)
 }
 }
-
 const isBlank = !rawAnswer || rawAnswer.trim().length < 15
 const answer = isBlank ? buildFallbackAnswer(processedQuery, finalHits, intent, finalDocType) : cleanAnswer(rawAnswer)
-if (isBlank) console.warn(`[chat/message] Blank from all engines, used rule-based fallback for: "${query.slice(0,60)}"`)
-
+if (isBlank) console.warn(`[chat/message] Used fallback for: "${query.slice(0,60)}"`)
 const sources = finalHits.map(h => ({
 source_file: h.source_file || 'unknown',
 chunk_index: h.chunk_index ?? 0,
@@ -1160,7 +982,6 @@ preview: (h.text || '').slice(0,200),
 }))
 return { answer, sources, client: { clientId, name } }
 })()
-
 IN_FLIGHT.set(cacheKey, requestPromise)
 let result
 try { result = await requestPromise } finally { IN_FLIGHT.delete(cacheKey) }
@@ -1182,9 +1003,8 @@ const PORT = process.env.PORT || 4000
 app.listen(PORT, () => {
 console.log(`Service running on port ${PORT}`)
 console.log(`ASKDATA: ${ASKDATA_ENDPOINT ? 'configured' : 'MISSING'} | ASKDATA2: ${ASKDATA2_ENDPOINT ? 'configured' : 'missing'}`)
-console.log(`MAX_HITS: ${MAX_HITS_GLOBAL}`)
+console.log(`Retrieval: hybrid BM25+keyword, cross-type routing, per-client isolation`)
 startApiKeyHealthChecker()
 warmupChunkCaches()
 })
-
 module.exports = app
