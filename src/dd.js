@@ -1,4 +1,4 @@
-const XLSX = require('xlsx')
+const XLSX=require('xlsx')
 const {
 escapeRegex,capFirst,ensureSinglePeriod,trimToCompleteSentence,
 applySynonyms,normalizeQuery,extractSubject,extractUrlKeywords,
