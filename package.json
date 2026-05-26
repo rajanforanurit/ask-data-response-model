@@ -1,6 +1,6 @@
 {
   "name": "rag-client-auth",
-  "version": "3.23.0",
+  "version": "3.23.1",
   "description": "RAG backend with Ask-Data LLM",
   "main": "index.js",
   "engines": {
