@@ -26,12 +26,7 @@ generateApiKey,generateTitle,selectFocusedHits,
 const {
 extractSpreadsheet,retrieveChunksDD,buildSystemPromptDD,buildUserMessageDD,
 buildFallbackAnswerDD,fuzzyCorrectQuery,relaxedKeywordSearchDD,extractAllUrlsFromChunks,
-buildStructuredChunk,structuredSearchDD,
 }=require('./src/dd')
-const {classifyQuery:routerClassifyQuery}=require('./src/router')
-const {expandQueryString}=require('./src/aliases')
-const {retrieve:adaptiveRetrieve,semanticSearch}=require('./src/retrieval')
-const {detectDocumentType,classifyChunks}=require('./src/classifier')
 const {
 chunkStructuredDocument,buildInvertedIndexSF,retrieveChunksSF,
 buildSystemPromptSF,buildUserMessageSF,buildFallbackAnswerSF,
@@ -40,6 +35,160 @@ const {
 slidingWindowChunk,buildInvertedIndexUD,retrieveChunksUD,preprocessQueryUD,
 buildSystemPromptUD,buildUserMessageUD,buildFallbackAnswerUD,cleanOcrNoise,
 }=require('./src/ud')
+const STRUCTURED_KEYWORDS=['column','datatype','data type','schema','table','mapping','field','kpi','etl','nullable','primary key','foreign key','varchar','integer','nvarchar','decimal','definition','alias','catalog','dimension','measure','attribute','grain','fact table','lookup','reference']
+const STRUCTURED_FILE_TYPES=new Set(['csv','xlsx','xls','tsv'])
+const UPPERCASE_FIELD_RE=/[A-Z_]{3,}/g
+const ALIASES={
+'Scenario Alias':['SCN_ALIAS_CD','scenario alias','scenario alt name','scn alias'],
+'Scenario Code':['SCN_CD','scenario code','scenario identifier','scn cd'],
+'Scenario Name':['SCN_NM','scenario name','scenario description','scn nm'],
+'KPI':['key performance indicator','metric','measure','kpi code'],
+'ETL':['extract transform load','data pipeline','etl mapping'],
+'Primary Key':['PK','primary key column','unique identifier','id column'],
+'Foreign Key':['FK','foreign key column','reference column'],
+'Status':['STS_CD','status code','status flag','active flag','sts cd'],
+'Description':['DESC','DESCR','description field','definition field'],
+'Timestamp':['created_at','updated_at','modified_dt','create_dt'],
+}
+const STRUCTURED_QUERY_PATTERNS=[
+/\bdefine\b/i,/\bdefinition\b/i,/\bcolumn\b/i,/\bfield\b/i,/\btable\b/i,
+/\bschema\b/i,/\bmapping\b/i,/\bdatatype\b/i,/\bdata type\b/i,/\bkpi\b/i,
+/\betl\b/i,/\bmetric\b/i,/\bmeasure\b/i,/\bdimension\b/i,/\bmeaning of\b/i,
+/\balias\b/i,/\bcatalog\b/i,/what does .+ stand for/i,/what is the .+ column/i,/what is .+ field/i,
+]
+const UPPERCASE_CODE_PATTERN=/[A-Z][A-Z0-9_]{2,}[A-Z0-9]/
+function detectDocumentType(text='',metadata={}){
+const lowered=text.toLowerCase()
+const fileType=(metadata.fileType||metadata.file_type||'').toLowerCase().replace(/^\./,'')
+if(STRUCTURED_FILE_TYPES.has(fileType))return 'structured'
+const docTypeHint=metadata.doc_type||metadata.docType||''
+if(docTypeHint==='tabular'||docTypeHint==='structured')return 'structured'
+const keywordHits=STRUCTURED_KEYWORDS.filter(k=>lowered.includes(k)).length
+const uppercaseMatches=(text.match(UPPERCASE_FIELD_RE)||[]).length
+const lines=text.split('\n').filter(l=>l.trim())
+const pipeLines=lines.filter(l=>(l.match(/\|/g)||[]).length>=2).length
+const tableDensity=lines.length>0?pipeLines/lines.length:0
+let score=0
+if(keywordHits>=3)score+=3
+else if(keywordHits>=1)score+=1
+if(uppercaseMatches>20)score+=3
+else if(uppercaseMatches>8)score+=1
+if(tableDensity>=0.4)score+=3
+else if(tableDensity>=0.2)score+=1
+return score>=3?'structured':'semantic'
+}
+function queryHitsAlias(query=''){
+const qLower=query.toLowerCase()
+for(const[key,values]of Object.entries(ALIASES)){
+if(key.toLowerCase()===qLower)return true
+for(const v of values){if(v.toLowerCase()===qLower||qLower.includes(v.toLowerCase()))return true}
+}
+return false
+}
+function expandQueryString(query=''){
+const expanded=[query]
+const qLower=query.toLowerCase()
+for(const[key,values]of Object.entries(ALIASES)){
+if(key.toLowerCase()===qLower){expanded.push(...values);continue}
+for(const v of values){
+if(v.toLowerCase()===qLower){expanded.push(key,...values.filter(x=>x!==v));break}
+}
+if(qLower.includes(key.toLowerCase()))expanded.push(...values)
+for(const v of values){
+if(qLower.includes(v.toLowerCase())){expanded.push(key,...values.filter(x=>x!==v));break}
+}
+}
+const extras=[...new Set(expanded)].slice(1).join(' ')
+return extras?`${query} ${extras}`:query
+}
+function classifyQuery(query=''){
+if(!query.trim())return 'semantic'
+if(UPPERCASE_CODE_PATTERN.test(query))return 'structured'
+const qLower=query.toLowerCase()
+for(const pattern of STRUCTURED_QUERY_PATTERNS){if(pattern.test(qLower))return 'structured'}
+if(queryHitsAlias(query))return 'structured'
+return 'semantic'
+}
+function calculateStructuredScore(doc,query,bm25Score=0,bm25Max=1){
+const qLower=query.toLowerCase().trim()
+const queryTokens=qLower.split(/\s+/).filter(w=>w.length>=2)
+const normalizedBm25=bm25Max>0?(bm25Score/bm25Max)*0.5:0
+let exactMatch=0
+const colLower=(doc.column||doc.metadata?.measure||'').toLowerCase().trim()
+if(colLower&&(colLower===qLower||queryTokens.some(t=>t===colLower)))exactMatch+=100
+for(const token of queryTokens){
+if(token.length>=3&&(doc.text||'').toLowerCase().includes(token))exactMatch+=3
+}
+let aliasMatch=0
+const aliases=doc.aliases||doc.metadata?.aliases||[]
+for(const alias of aliases){
+if(alias.toLowerCase()===qLower)aliasMatch+=50
+else if(queryTokens.some(t=>t.length>=3&&alias.toLowerCase().includes(t)))aliasMatch+=20
+}
+let tableMatch=0
+const tableName=(doc.table||doc.metadata?.table||'').toLowerCase()
+if(tableName){
+for(const token of queryTokens){if(token.length>=3&&tableName.includes(token))tableMatch+=20}
+if(tableName===qLower)tableMatch+=40
+}
+let columnMatch=0
+if(colLower){
+for(const token of queryTokens){
+if(token.toUpperCase()===colLower.toUpperCase())columnMatch+=60
+else if(token.length>=3&&colLower.includes(token))columnMatch+=15
+}
+}
+return normalizedBm25+exactMatch+aliasMatch+tableMatch+columnMatch
+}
+function buildStructuredChunk(row,sourceFile='',chunkIndex=0){
+const text=[
+row.table?`Table: ${row.table}`:'',
+row.column?`Column: ${row.column}`:'',
+row.datatype?`Datatype: ${row.datatype}`:'',
+row.definition?`Definition: ${row.definition}`:'',
+row.aliases&&row.aliases.length>0?`Aliases: ${row.aliases.join(', ')}`:'',
+].filter(Boolean).join('\n')
+return{
+docType:'structured',
+table:row.table||'',
+column:row.column||'',
+datatype:row.datatype||'',
+definition:row.definition||'',
+aliases:row.aliases||[],
+text,
+source_file:sourceFile,
+chunk_index:chunkIndex,
+embedding:[],
+metadata:{docType:'structured',table:row.table||'',column:row.column||'',datatype:row.datatype||'',definition:row.definition||'',aliases:row.aliases||[]},
+}
+}
+function structuredSearchDD(query,chunks,topK=10){
+const expandedQuery=expandQueryString(query)
+const k1=1.5,b=0.75
+const tokenized=chunks.map(c=>(c.text||'').toLowerCase().replace(/[^\w\s]/g,' ').split(/\s+/).filter(w=>w.length>1))
+const avgdl=tokenized.reduce((s,t)=>s+t.length,0)/Math.max(tokenized.length,1)
+const df=new Map()
+for(const tokens of tokenized){const seen=new Set(tokens);for(const t of seen)df.set(t,(df.get(t)||0)+1)}
+const N=tokenized.length
+const qTokens=expandedQuery.toLowerCase().replace(/[^\w\s]/g,' ').split(/\s+/).filter(w=>w.length>1)
+const bm25Scores=tokenized.map(tokens=>{
+const tf=new Map()
+for(const t of tokens)tf.set(t,(tf.get(t)||0)+1)
+let score=0
+for(const q of qTokens){
+const idf=Math.log((N-(df.get(q)||0)+0.5)/((df.get(q)||0)+0.5)+1)
+const tfVal=tf.get(q)||0
+const numerator=tfVal*(k1+1)
+const denominator=tfVal+k1*(1-b+b*tokens.length/avgdl)
+score+=idf*(numerator/denominator)
+}
+return score
+})
+const bm25Max=Math.max(...bm25Scores,1)
+const scored=chunks.map((chunk,i)=>({...chunk,_score:calculateStructuredScore(chunk,expandedQuery,bm25Scores[i]||0,bm25Max)})).filter(c=>c._score>0)
+scored.sort((a,b)=>b._score-a._score)
+return scored.slice(0,topK)
+}
 const app=express()
 const allowedOrigins=[
 'http://localhost:8080','http://localhost:3000',
@@ -217,9 +366,7 @@ docType:resolveDocType(c),
 }))
 console.log(`[blobLoad] Loaded ${chunks.length} chunks for ${clientId} from ${chunksBlob}`)
 const byDoc={}
-for(const c of chunks){
-byDoc[c.doc_id]=(byDoc[c.doc_id]||0)+1
-}
+for(const c of chunks){byDoc[c.doc_id]=(byDoc[c.doc_id]||0)+1}
 console.log(`[blobLoad] doc distribution: ${JSON.stringify(byDoc)}`)
 }catch(err){
 console.warn(`[blobLoad] chunks.json not found for ${clientId}: ${err.message}`)
@@ -550,7 +697,6 @@ function pickBestSourceFile(query,chunks){
 if(!chunks||chunks.length===0)return null
 const files=[...new Set(chunks.map(c=>c.source_file).filter(Boolean))]
 if(files.length<=1)return null
-const subject=extractSubject(query).toLowerCase()
 const queryWords=normalizeQuery(query).replace(/[^\w\s]/g,' ').split(/\s+/).filter(w=>w.length>1)
 const fileScores=files.map(f=>{
 const fileChunks=chunks.filter(c=>c.source_file===f)
@@ -579,46 +725,37 @@ const udChunks=pool.filter(c=>c.docType!=='data_dictionary'&&c.docType!=='struct
 const structuredPool=[...ddChunks,...sfChunks]
 const semanticPool=udChunks
 const poolInvertedIndexes=sourceFilter?buildAllInvertedIndexes(pool):invertedIndexes
-
-const queryType=routerClassifyQuery(processedQuery)
+const queryType=classifyQuery(processedQuery)
 console.log(`[adaptiveRoute] queryType=${queryType} | structured=${structuredPool.length} | semantic=${semanticPool.length}`)
-
 if(queryType==='structured'&&structuredPool.length>0){
-const ddHits=ddChunks.length>0
-?structuredSearchDD(processedQuery,ddChunks,topK)
-:[]
-const sfKeyword=sfChunks.length>0
-?retrieveChunksSF(processedQuery,sfChunks,topK,poolInvertedIndexes.sf||poolInvertedIndexes.all)
-:[]
-const seen=new Set()
-const merged=[]
+const ddHits=ddChunks.length>0?structuredSearchDD(processedQuery,ddChunks,topK):[]
+const sfKeyword=sfChunks.length>0?retrieveChunksSF(processedQuery,sfChunks,topK,poolInvertedIndexes.sf||poolInvertedIndexes.all):[]
+const seenS=new Set()
+const mergedS=[]
 for(const h of[...ddHits,...sfKeyword]){
 const fp=(h.text||'').trim().slice(0,60).toLowerCase()
-if(!seen.has(fp)){seen.add(fp);merged.push(h)}
-if(merged.length>=topK)break
+if(!seenS.has(fp)){seenS.add(fp);mergedS.push(h)}
+if(mergedS.length>=topK)break
 }
-if(merged.length>0){
+if(mergedS.length>0){
 const docType=ddHits.length>=sfKeyword.length?'data_dictionary':'structured'
-console.log(`[adaptiveRoute] structured retrieval -> ${merged.length} hits, docType=${docType}`)
-return{hits:merged,docType}
+console.log(`[adaptiveRoute] structured retrieval -> ${mergedS.length} hits, docType=${docType}`)
+return{hits:mergedS,docType}
 }
 console.log(`[adaptiveRoute] structured retrieval empty, falling back to semantic`)
 }
-
 const hybridHits=hybridSearch(processedQuery,semanticPool.length>0?semanticPool:pool,FAISS_TOP_K,BM25_TOP_K,0.6,null)
-const udKeyword=semanticPool.length>0
-?retrieveChunksUD(processedQuery,semanticPool,topK,poolInvertedIndexes.ud||poolInvertedIndexes.all)
-:[]
-const seen=new Set()
-const merged=[]
+const udKeyword=semanticPool.length>0?retrieveChunksUD(processedQuery,semanticPool,topK,poolInvertedIndexes.ud||poolInvertedIndexes.all):[]
+const seenU=new Set()
+const mergedU=[]
 for(const h of[...hybridHits,...udKeyword]){
 const fp=(h.text||'').trim().slice(0,60).toLowerCase()
-if(!seen.has(fp)){seen.add(fp);merged.push(h)}
-if(merged.length>=topK)break
+if(!seenU.has(fp)){seenU.add(fp);mergedU.push(h)}
+if(mergedU.length>=topK)break
 }
-const docType=detectDocTypeFromChunks(merged.length>0?merged:pool)
-console.log(`[adaptiveRoute] semantic retrieval -> ${merged.length} hits, docType=${docType}`)
-return{hits:merged,docType}
+const docType=detectDocTypeFromChunks(mergedU.length>0?mergedU:pool)
+console.log(`[adaptiveRoute] semantic retrieval -> ${mergedU.length} hits, docType=${docType}`)
+return{hits:mergedU,docType}
 }
 async function generateAnswerForTopic(topic,chunks,topK,invertedIndexes){
 const topicQuery=`what is ${topic}`
@@ -730,7 +867,7 @@ const IN_FLIGHT=new Map()
 app.get('/health',(req,res)=>res.json({
 ok:true,service:'ask-data',
 engines:{primary:ASKDATA_ENDPOINT?'configured':'missing',fallback:ASKDATA2_ENDPOINT?'configured':'missing'},
-retrieval:'hybrid BM25+keyword + doc-level routing + cross-type routing',
+retrieval:'adaptive dual-retrieval: structured BM25+alias+exact | semantic hybrid+rerank',
 chunkCacheSize:CHUNK_CACHE.size,
 primaryCircuitOpen:askedataCircuitOpen(),
 }))
@@ -1035,7 +1172,7 @@ const PORT=process.env.PORT||4000
 app.listen(PORT,()=>{
 console.log(`Service running on port ${PORT}`)
 console.log(`ASKDATA: ${ASKDATA_ENDPOINT?'configured':'MISSING'} | ASKDATA2: ${ASKDATA2_ENDPOINT?'configured':'missing'}`)
-console.log(`Retrieval: hybrid BM25+keyword, doc-level routing, cross-type routing, per-client isolation`)
+console.log(`Retrieval: adaptive dual-retrieval — structured BM25+alias+exact (no reranker) | semantic hybrid+rerank`)
 startApiKeyHealthChecker()
 warmupChunkCaches()
 })
