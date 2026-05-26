@@ -19,23 +19,17 @@ const ASKDATA2_REWRITE_TIMEOUT_MS = parseInt(process.env.ASKDATA2_REWRITE_TIMEOU
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10)
 const WARMUP_CLIENT_IDS = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
 const RAW_PREFIX = 'raw'
-const CHUNK_SIZE = 1200
-const CHUNK_OVERLAP = 2
+const FAISS_PREFIX = 'faiss'
+const BM25_PREFIX = 'bm25'
+const CHUNK_SIZE = 600
+const CHUNK_OVERLAP = 120
 const BLOB_CONCURRENCY = parseInt(process.env.BLOB_CONCURRENCY || '8', 10)
 const CHUNK_CACHE_TTL = parseInt(process.env.CHUNK_CACHE_TTL_MS || '300000', 10)
 const MAX_HITS_GLOBAL = 50
-const SUPPORTED_EXTENSIONS = new Set([
-'.pdf','.docx','.doc','.txt','.rtf','.odt',
-'.xlsx','.xls','.ods','.csv','.tsv',
-'.pptx','.ppt',
-'.html','.htm','.xml','.md','.markdown','.rst',
-'.json','.jsonl','.yaml','.yml','.toml',
-'.py','.js','.ts','.jsx','.tsx',
-'.java','.cpp','.c','.h','.cs',
-'.go','.rb','.php','.swift','.kt',
-'.r','.sql','.sh','.bash','.ps1',
-'.epub','.eml',
-])
+const FAISS_TOP_K = 40
+const BM25_TOP_K = 40
+const RERANK_TOP_K = 10
+const SUPPORTED_EXTENSIONS = new Set(['.pdf','.docx','.doc','.xlsx','.xls','.csv'])
 const SYNONYM_MAP = [
 {pattern:/\bapp(lication)?\s+count\b/i,canonical:'application count'},
 {pattern:/\btotal\s+app(lication)?\s+count\b/i,canonical:'application count'},
@@ -237,7 +231,6 @@ const patterns = [
 /^(?:formula|equation)\s+(?:for|of)\s+(?:an?\s+|the\s+)?(.+)$/i,
 /^(.+?)\s+(?:formula|equation|calculation)$/i,
 /^what\s+does\s+(.+?)\s+represent/i,
-/^what\s+is\s+the\s+purpose\s+of\s+(?:the\s+)?(.+?)\s+(?:attribute|measure|field|column)$/i,
 /^compare\s+(.+?)\s+(?:vs|versus)\s+(.+)$/i,
 /^difference\s+between\s+(.+?)\s+and\s+(.+)$/i,
 /^what\s+(?:is|are)\s+(?:an?\s+|the\s+)?(.+)$/i,
@@ -340,10 +333,8 @@ return { file: f, score: topScore * 0.6 + top2avg * 0.4, hits: fhits }
 const best = fileScores[0]
 const runnerUp = fileScores[1]
 if (runnerUp && best.score >= runnerUp.score * 1.8) {
-console.log(`[focusedHits] Concentrating on "${best.file}" (${best.score.toFixed(2)} vs ${runnerUp.score.toFixed(2)})`)
 return best.hits.slice(0, topK)
 }
-const perFileCap = Math.max(2, Math.floor(topK * 0.6))
 const fileCounts = {}
 const result = []
 for (const h of hits) {
@@ -399,8 +390,10 @@ AZURE_CONNECTION_STRING,AZURE_CONTAINER_NAME,ADMIN_API_KEY,
 KEY_CHECK_INTERVAL_MS,ASKDATA_ENDPOINT,ASKDATA_KEY,ASKDATA_MODEL,
 ASKDATA_TIMEOUT_MS,ASKDATA2_ENDPOINT,ASKDATA2_KEY,ASKDATA2_MODEL,
 ASKDATA2_TIMEOUT_MS,ASKDATA2_REWRITE_TIMEOUT_MS,REQUEST_TIMEOUT_MS,
-WARMUP_CLIENT_IDS,RAW_PREFIX,CHUNK_SIZE,CHUNK_OVERLAP,BLOB_CONCURRENCY,
-CHUNK_CACHE_TTL,MAX_HITS_GLOBAL,SUPPORTED_EXTENSIONS,SYNONYM_MAP,TYPO_MAP,
+WARMUP_CLIENT_IDS,RAW_PREFIX,FAISS_PREFIX,BM25_PREFIX,
+CHUNK_SIZE,CHUNK_OVERLAP,BLOB_CONCURRENCY,
+CHUNK_CACHE_TTL,MAX_HITS_GLOBAL,FAISS_TOP_K,BM25_TOP_K,RERANK_TOP_K,
+SUPPORTED_EXTENSIONS,SYNONYM_MAP,TYPO_MAP,
 DOMAIN_SHORT_SAFELIST,RESPONSE_CACHE,
 responseCacheGet,responseCacheSet,escapeRegex,capFirst,ensureSinglePeriod,
 trimToCompleteSentence,trimToLastCompleteSentence,fixBrokenUrls,
