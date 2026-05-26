@@ -1,6 +1,6 @@
 require('dotenv').config()
 const MONGODB_URI=process.env.MONGODB_URI
-const MONGODB_DB = process.env.MONGODB_DB || 'clientcreds'
+const MONGODB_DB=process.env.MONGODB_DB || 'clientcreds'
 const CHAT_HISTORY_URI = process.env.CHAT_HISTORY_URI
 const CHAT_HISTORY_DB = process.env.CHAT_HISTORY_DB || 'chathistory'
 const AZURE_CONNECTION_STRING = process.env.AZURE_CONNECTION_STRING || ''
