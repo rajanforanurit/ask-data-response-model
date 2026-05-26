@@ -300,7 +300,7 @@ const intentRule = intent === 'definition'
 : intent === 'comparison'
 ? `Comparison: Bold each name. One definition each. End with "**Key Difference:**" from context only.`
 : `General: Answer in 2-4 sentences directly.`
-return `Data dictionary assistant. Answer ONLY from context. Bold subject. Complete sentences. No pipe characters. No source references.\nIf answer not in context say: "I could not find this in your documents."\n${intentRule}`
+return `Data dictionary assistant. Answer ONLY from context. Bold subject. Complete sentences. No pipe characters. No source references.\nIf answer not in context say: "I could not find this in your documents."\n${intentRule}\n\nCRITICAL: Never include file names, sheet names, table metadata, or source references in your answer. Never repeat lines like "[File: ...]", "[Sheet: ...]", "Table Name:", "Measure Name:", "Attribute Name:", or "Description:" labels. Output ONLY the clean answer text.`
 }
 function buildContextDD(hits) {
 const seen = new Set()
@@ -312,7 +312,15 @@ if (deduped.length >= 8) break
 }
 return deduped.map((h,i) => {
 const limit = i === 0 ? 1200 : 900
-return (h.text || '').trim().slice(0,limit)
+let text = (h.text || '').trim().slice(0,limit)
+// Strip any leaked file/sheet/metadata citation lines from chunk text
+text = text
+.replace(/\[File:[^\]]*\]\s*/g,'')
+.replace(/\[Sheet:[^\]]*\]\s*/g,'')
+.replace(/^(Table Name|Measure Name|Attribute Name|Source File|Sheet)\s*:[^\n]*/gim,'')
+.replace(/^\s*›\s*\d+\s+document\s+section[^\n]*/gim,'')
+.trim()
+return text
 }).join('\n\n---\n\n')
 }
 function buildUserMessageDD(query, hits, intent) {
