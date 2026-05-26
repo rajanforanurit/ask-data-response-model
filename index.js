@@ -260,7 +260,8 @@ score += idf * (numerator / denominator)
 return score
 })
 }
-function hybridSearchOnPool(query, pool, faissTopK, bm25TopK, alpha) {
+function hybridSearch(query, chunks, faissTopK = FAISS_TOP_K, bm25TopK = BM25_TOP_K, alpha = 0.6, sourceFilter = null) {
+const pool = sourceFilter ? chunks.filter(c => c.source_file === sourceFilter) : chunks
 if (pool.length === 0) return []
 const invertedIndex = buildInvertedIndex(pool)
 const queryWords = normalizeQuery(query).replace(/[^\w\s]/g,' ').split(/\s+/).filter(w => w.length > 1)
@@ -479,7 +480,18 @@ next()
 function cleanAnswer(rawAnswer) {
 if (!rawAnswer) return ''
 let cleaned = fixBrokenUrls(rawAnswer)
+// Strip leaked source/file/sheet citation lines the LLM echoes from context
+.replace(/\[File:[^\]]*\]\s*/g,'')
+.replace(/\[Sheet:[^\]]*\]\s*/g,'')
+// Strip metadata label lines like: Table Name: X | Measure Name: Y | Description: ...
+.replace(/^\s*(Table Name|Measure Name|Attribute Name|Description|Source File|Sheet)[^:\n]*:[^\n]*/gim,'')
+// Strip lines that are mostly pipe-separated key:value metadata
+.replace(/^[^\n]*(Table Name|Measure Name|Attribute Name)\s*:[^\n]*/gim,'')
+// Strip document section reference lines (e.g. "› 1 document section referenced")
+.replace(/^\s*›\s*\d+\s+document\s+section[^\n]*/gim,'')
+// Strip generic source reference markers
 .replace(/^\s*\[Source\s*\d+\]\s*/gm,'')
+// Strip lines that are mostly pipe characters (raw table rows leaked from context)
 .replace(/^[^\n]*(\|[^\n]*){3,}$/gm,'')
 .replace(/=== .+ ===\s*/gm,'')
 .replace(/\(from\s+[A-Za-z\s]+\)\s*/g,'')
@@ -553,19 +565,11 @@ const pool = sourceFilter ? chunks.filter(c => c.source_file === sourceFilter) :
 const ddChunks = pool.filter(c => c.docType === 'data_dictionary')
 const sfChunks = pool.filter(c => c.docType === 'structured')
 const udChunks = pool.filter(c => c.docType !== 'data_dictionary' && c.docType !== 'structured')
-
+const hybridHits = hybridSearch(processedQuery, pool, FAISS_TOP_K, BM25_TOP_K, 0.6, null)
+const ddHits = ddChunks.length > 0 ? hybridHits.filter(h => h.docType === 'data_dictionary') : []
+const sfHits = sfChunks.length > 0 ? hybridHits.filter(h => h.docType === 'structured') : []
+const udHits = udChunks.length > 0 ? hybridHits.filter(h => h.docType !== 'data_dictionary' && h.docType !== 'structured') : []
 const poolInvertedIndexes = sourceFilter ? buildAllInvertedIndexes(pool) : invertedIndexes
-
-const ddHybrid = ddChunks.length > 0
-? hybridSearchOnPool(processedQuery, ddChunks, FAISS_TOP_K, BM25_TOP_K, 0.6)
-: []
-const sfHybrid = sfChunks.length > 0
-? hybridSearchOnPool(processedQuery, sfChunks, FAISS_TOP_K, BM25_TOP_K, 0.6)
-: []
-const udHybrid = udChunks.length > 0
-? hybridSearchOnPool(processedQuery, udChunks, FAISS_TOP_K, BM25_TOP_K, 0.6)
-: []
-
 const ddKeyword = ddChunks.length > 0
 ? await retrieveChunksDD(processedQuery, ddChunks, topK, poolInvertedIndexes.dd).catch(() => [])
 : []
@@ -575,7 +579,6 @@ const sfKeyword = sfChunks.length > 0
 const udKeyword = udChunks.length > 0
 ? retrieveChunksUD(processedQuery, udChunks, topK, poolInvertedIndexes.ud || poolInvertedIndexes.all)
 : []
-
 function mergeHits(hybridPool, keywordPool, limit) {
 const seen = new Set()
 const merged = []
@@ -587,9 +590,9 @@ if (merged.length >= limit) break
 return merged
 }
 const pools = [
-{ hits: mergeHits(ddHybrid, ddKeyword, topK), docType: 'data_dictionary' },
-{ hits: mergeHits(sfHybrid, sfKeyword, topK), docType: 'structured' },
-{ hits: mergeHits(udHybrid, udKeyword, topK), docType: 'unstructured' },
+{ hits: mergeHits(ddHits, ddKeyword, topK), docType: 'data_dictionary' },
+{ hits: mergeHits(sfHits, sfKeyword, topK), docType: 'structured' },
+{ hits: mergeHits(udHits, udKeyword, topK), docType: 'unstructured' },
 ].filter(p => p.hits && p.hits.length > 0)
 if (pools.length === 0) return { hits: [], docType: 'unstructured' }
 for (const pool of pools) pool.confidence = computePoolConfidence(pool.hits, pool.docType)
@@ -711,7 +714,7 @@ const IN_FLIGHT = new Map()
 app.get('/health', (req, res) => res.json({
 ok: true, service: 'ask-data',
 engines: { primary: ASKDATA_ENDPOINT ? 'configured' : 'missing', fallback: ASKDATA2_ENDPOINT ? 'configured' : 'missing' },
-retrieval: 'hybrid BM25+keyword per-docType + doc-level routing + cross-type routing',
+retrieval: 'hybrid BM25+keyword + doc-level routing + cross-type routing',
 chunkCacheSize: CHUNK_CACHE.size,
 primaryCircuitOpen: askedataCircuitOpen(),
 }))
@@ -1015,7 +1018,7 @@ const PORT = process.env.PORT || 4000
 app.listen(PORT, () => {
 console.log(`Service running on port ${PORT}`)
 console.log(`ASKDATA: ${ASKDATA_ENDPOINT ? 'configured' : 'MISSING'} | ASKDATA2: ${ASKDATA2_ENDPOINT ? 'configured' : 'missing'}`)
-console.log(`Retrieval: hybrid BM25+keyword per-docType, doc-level routing, cross-type routing, per-client isolation`)
+console.log(`Retrieval: hybrid BM25+keyword, doc-level routing, cross-type routing, per-client isolation`)
 startApiKeyHealthChecker()
 warmupChunkCaches()
 })
