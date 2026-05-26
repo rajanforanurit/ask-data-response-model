@@ -5,7 +5,6 @@ const {
   normalizeTerms, extractFormulaFromText, computeNegativePenalty,
   MAX_HITS_GLOBAL, DOMAIN_SHORT_SAFELIST,
 } = require('./config')
-
 const stringSimilarity = require('string-similarity')
 const { levenshteinSimilarity } = require('./config')
 function cleanChunkText(text) {
@@ -18,7 +17,7 @@ function cleanChunkText(text) {
     .replace(/\s*\|\s*(Table Name|Measure Name|Attribute Name|Description|Connected Fact Table)[^|]*\|?[^\n]*/gi, '')
     .replace(/Connected Fact Table[^\n]*/gi, '')
     .replace(/^\s*›\s*\d+\s+document\s+section[^\n]*/gim, '')
-    .replace(/^(\s*\|[^\n]*){1,}/gm, '') // strip leading pipe-table rows
+    .replace(/^(\s*\|[^\n]*){1,}/gm, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
 }
@@ -95,7 +94,7 @@ function extractSpreadsheet(buffer) {
     const headers = []
     let lastNonBlank = ''
     for (const h of rawHeaders) {
-      if (h !== '') { lastNonBlank = h; headers.push(h) }
+      if (h !== '' && h !== 'nan') { lastNonBlank = h; headers.push(h) }
       else headers.push(lastNonBlank || `Col${headers.length + 1}`)
     }
 
@@ -407,7 +406,6 @@ function extractAllUrlsFromChunks(chunks) {
   return results
 }
 
-// ─── REPLACEMENT for buildContextDD ─────────────────────────────────────────
 function buildContextDD(hits) {
   const seen = new Set()
   const deduped = []
@@ -420,18 +418,18 @@ function buildContextDD(hits) {
     const limit = i === 0 ? 1200 : 900
     const text = cleanChunkText((h.text || '').trim()).slice(0, limit)
     return text
-  }).join('\n\n---\n\n')
+  }).filter(Boolean).join('\n\n---\n\n')
 }
 
-// ─── REPLACEMENT for buildFallbackAnswerDD ───────────────────────────────────
 function buildFallbackAnswerDD(query, hits, intent) {
   const { ensureSinglePeriod, trimToCompleteSentence, capFirst, escapeRegex, extractSubject, extractUrlKeywords, extractFormulaFromText, detectQueryIntent } = require('./config')
-  
+
   if (!hits || hits.length === 0) return 'I could not find relevant information about this in your documents.'
 
   const resolvedIntent = intent || detectQueryIntent(query)
   const subject = extractSubject(query)
-  const subjectLower = subject.toLowerCase()
+  const subjectLower = subject.toLowerCase().trim()
+  const subjectWords = subjectLower.split(/\s+/).filter(w => w.length > 1)
   const escapedSubject = escapeRegex(subjectLower)
 
   if (resolvedIntent === 'all_urls') {
@@ -487,29 +485,33 @@ function buildFallbackAnswerDD(query, hits, intent) {
     return `I could not find a formula for ${capFirst(subject)} in your documents.`
   }
 
-  // Definition / general
   for (const h of hits) {
     if (h.metadata && h.metadata.measure) {
       const measureLower = (h.metadata.measure || '').toLowerCase().trim()
-      if (
-        measureLower === subjectLower ||
+      const isExactMatch = measureLower === subjectLower
+      const isPartialMatch = !isExactMatch && (
         new RegExp(`\\b${escapedSubject}\\b`, 'i').test(measureLower) ||
-        new RegExp(`\\b${escapeRegex(measureLower)}\\b`, 'i').test(subjectLower)
-      ) {
+        new RegExp(`\\b${escapeRegex(measureLower)}\\b`, 'i').test(subjectLower) ||
+        (subjectWords.length > 1 && subjectWords.every(w => measureLower.includes(w)))
+      )
+      if (isExactMatch || isPartialMatch) {
         const cap = capFirst(h.metadata.measure)
-        if (resolvedIntent === 'definition' && h.metadata.description) {
-          return ensureSinglePeriod(`**${cap}** is defined as: ${h.metadata.description}.`)
+        const desc = h.metadata.description || ''
+        if (desc) {
+          return ensureSinglePeriod(`**${cap}** is defined as: ${trimToCompleteSentence(desc, 600)}.`)
         }
-        let answer = `**${cap}**`
-        if (h.metadata.description) answer += ` is defined as: ${h.metadata.description}`
-        if (!answer.endsWith('.')) answer += '.'
-        return ensureSinglePeriod(answer)
+        const cleanText = cleanChunkText(h.text || '')
+        const definedAsMatch = cleanText.match(/is defined as:\s*(.+?)(?:\.\s*Formula:|$)/is)
+        if (definedAsMatch) {
+          return ensureSinglePeriod(`**${cap}** is defined as: ${trimToCompleteSentence(definedAsMatch[1].trim(), 600)}.`)
+        }
+        return ensureSinglePeriod(`**${cap}:** ${trimToCompleteSentence(cleanText, 400)}.`)
       }
     }
   }
 
   const synthesisPattern = new RegExp(
-    `${escapedSubject}[^\\n]*is defined as:\\s*([^.\\n]+(?:\\.[^.\\n]+)?)(?:\\.\\s*Formula:\\s*([^.\\n]+(?:\\.[^.\\n]+)?))?(?:\\.\\s*Additional Info:\\s*([^.\\n]+))?`,
+    `${escapedSubject}[^\\n]{0,60}is defined as:\\s*([^.\\n]+(?:\\.[^.\\n]+)?)(?:\\.\\s*Formula:\\s*([^.\\n]+(?:\\.[^.\\n]+)?))?(?:\\.\\s*Additional Info:\\s*([^.\\n]+))?`,
     'im'
   )
   for (const h of hits) {
