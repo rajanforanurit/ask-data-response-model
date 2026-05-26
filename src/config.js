@@ -88,7 +88,7 @@ if (!entry) return null
 if (Date.now() - entry.ts > RESPONSE_CACHE_TTL) {RESPONSE_CACHE.delete(key);return null}
 return entry.value
 }
-function responseCacheSet(key, value) {
+function responseCacheSet (key, value) {
 if (RESPONSE_CACHE.size >= RESPONSE_CACHE_MAX) RESPONSE_CACHE.delete(RESPONSE_CACHE.keys().next().value)
 RESPONSE_CACHE.set(key, {value, ts: Date.now()})
 }
