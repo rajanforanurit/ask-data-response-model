@@ -21,7 +21,7 @@ ensureSinglePeriod,fixBrokenUrls,trimToLastCompleteSentence,
 applySynonyms,applyTypos,normalizeQuery,validateQuery,
 detectQueryIntent,detectMultiTopicQuery,extractSubject,
 buildInvertedIndex,fetchWithTimeout,withRequestTimeout,
-generateApiKey,generateTitle,
+generateApiKey,generateTitle,selectFocusedHits,
 } = require('./src/config')
 const {
 extractSpreadsheet,retrieveChunksDD,buildSystemPromptDD,buildUserMessageDD,
@@ -35,7 +35,6 @@ const {
 slidingWindowChunk,buildInvertedIndexUD,retrieveChunksUD,preprocessQueryUD,
 buildSystemPromptUD,buildUserMessageUD,buildFallbackAnswerUD,cleanOcrNoise,
 } = require('./src/ud')
-
 const app = express()
 const allowedOrigins = [
 'http://localhost:8080','http://localhost:3000',
@@ -64,9 +63,7 @@ allowedHeaders:['Content-Type','Authorization','x-session-id'],
 credentials:true,
 }))
 app.use(express.json())
-
 const blobServiceClient = AZURE_CONNECTION_STRING ? BlobServiceClient.fromConnectionString(AZURE_CONNECTION_STRING) : null
-
 let askedataActiveCount = 0
 const ASKDATA_MAX_CONCURRENT = 3
 const askedataQueue = []
@@ -89,7 +86,6 @@ tryRun()
 function drainAskedataQueue() {
 if (askedataQueue.length > 0 && askedataActiveCount < ASKDATA_MAX_CONCURRENT) askedataQueue.shift()()
 }
-
 let askedataFailures = 0
 let askedataBlockedUntil = 0
 function askedataCircuitOpen() {
@@ -105,7 +101,6 @@ askedataBlockedUntil = Date.now() + 30000
 console.error('[ASKDATA] Circuit breaker OPEN for 30s')
 }
 }
-
 async function callASKDATA(systemPrompt, userMessage, maxTokens = 1024) {
 if (!ASKDATA_ENDPOINT || !ASKDATA_KEY) throw new Error('ASKDATA not configured')
 if (askedataCircuitOpen()) throw new Error('ASKDATA temporarily unavailable')
@@ -133,7 +128,6 @@ throw err
 }
 })
 }
-
 async function callASKDATA2(systemPrompt, userMessage, maxTokens = 1024) {
 if (!ASKDATA2_ENDPOINT || !ASKDATA2_KEY) throw new Error('ASKDATA2 not configured')
 try {
@@ -157,7 +151,6 @@ console.error(`[ASKDATA2] Failed: ${err.message}`)
 throw err
 }
 }
-
 async function callBestAvailableEngine(systemPrompt, userMessage, maxTokens = 1024) {
 let primaryError = null
 if (ASKDATA_ENDPOINT && ASKDATA_KEY && !askedataCircuitOpen()) {
@@ -182,7 +175,6 @@ console.error(`[ASKDATA2] Also failed: ${err.message}`)
 }
 return ''
 }
-
 async function downloadBlobAsBuffer(containerClient, blobName) {
 const download = await containerClient.getBlobClient(blobName).download()
 const parts = []
@@ -191,7 +183,14 @@ parts.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
 }
 return Buffer.concat(parts)
 }
-
+function resolveDocType(c) {
+const meta = c.metadata || {}
+const section = c.section || meta.section || ''
+const measure = c.measure || meta.measure || ''
+if (section) return 'structured'
+if (measure) return 'data_dictionary'
+return 'unstructured'
+}
 async function loadChunksFromBlob(clientId) {
 if (!blobServiceClient) throw new Error('AZURE_CONNECTION_STRING not set')
 const containerClient = blobServiceClient.getContainerClient(AZURE_CONTAINER_NAME)
@@ -203,18 +202,25 @@ const raw = JSON.parse(buf.toString('utf-8'))
 chunks = raw.map((c, i) => ({
 text: c.text || '',
 source_file: c.source_file || 'unknown',
+doc_id: c.doc_id || c.metadata?.doc_id || 'unknown',
 chunk_index: i,
 embedding: c.embedding || null,
 metadata: c.metadata || null,
-docType: c.metadata?.section ? 'structured' : (c.metadata?.measure ? 'data_dictionary' : 'unstructured'),
+section: c.section || (c.metadata && c.metadata.section) || '',
+measure: c.measure || (c.metadata && c.metadata.measure) || '',
+docType: resolveDocType(c),
 }))
 console.log(`[blobLoad] Loaded ${chunks.length} chunks for ${clientId} from ${chunksBlob}`)
+const byDoc = {}
+for (const c of chunks) {
+byDoc[c.doc_id] = (byDoc[c.doc_id] || 0) + 1
+}
+console.log(`[blobLoad] doc distribution: ${JSON.stringify(byDoc)}`)
 } catch (err) {
 console.warn(`[blobLoad] chunks.json not found for ${clientId}: ${err.message}`)
 }
 return chunks
 }
-
 async function loadBM25FromBlob(clientId) {
 if (!blobServiceClient) return null
 const containerClient = blobServiceClient.getContainerClient(AZURE_CONTAINER_NAME)
@@ -228,7 +234,6 @@ console.warn(`[blobLoad] BM25 blob not found for ${clientId}`)
 return null
 }
 }
-
 function bm25ScoreJS(query, chunks) {
 const k1 = 1.5, b = 0.75
 const queryTokens = query.toLowerCase().replace(/[^\w\s]/g,' ').split(/\s+/).filter(w => w.length > 1)
@@ -255,9 +260,10 @@ score += idf * (numerator / denominator)
 return score
 })
 }
-
-function hybridSearch(query, chunks, faissTopK = FAISS_TOP_K, bm25TopK = BM25_TOP_K, alpha = 0.6) {
-const invertedIndex = buildInvertedIndex(chunks)
+function hybridSearch(query, chunks, faissTopK = FAISS_TOP_K, bm25TopK = BM25_TOP_K, alpha = 0.6, sourceFilter = null) {
+const pool = sourceFilter ? chunks.filter(c => c.source_file === sourceFilter) : chunks
+if (pool.length === 0) return []
+const invertedIndex = buildInvertedIndex(pool)
 const queryWords = normalizeQuery(query).replace(/[^\w\s]/g,' ').split(/\s+/).filter(w => w.length > 1)
 const subject = extractSubject(query)
 const subjectWords = subject.toLowerCase().split(/\s+/).filter(w => w.length > 1)
@@ -266,8 +272,8 @@ for (const w of [...queryWords, ...subjectWords]) {
 for (const idx of (invertedIndex.get(w) || new Set())) candidateSet.add(idx)
 }
 const source = candidateSet.size > 0
-? [...candidateSet].map(i => chunks[i]).filter(Boolean)
-: chunks.slice(0, Math.min(300, chunks.length))
+? [...candidateSet].map(i => pool[i]).filter(Boolean)
+: pool.slice(0, Math.min(300, pool.length))
 const subjectPhraseStr = subject.toLowerCase()
 const faissScores = source.map(c => {
 const text = (c.text || '').toLowerCase()
@@ -277,14 +283,14 @@ score += wordCoverage * 3
 const subjectCoverage = subjectWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`,'i').test(text)).length
 score += subjectCoverage * 5
 if (text.includes(subjectPhraseStr)) score += 8
-if (c.metadata?.section) {
-const sl = c.metadata.section.toLowerCase()
+if (c.metadata?.section || c.section) {
+const sl = (c.section || c.metadata?.section || '').toLowerCase()
 const sm = subjectWords.filter(w => sl.includes(w)).length
 score += sm * 8
 if (sl.includes(subjectPhraseStr)) score += 12
 }
-if (c.metadata?.measure) {
-const ml = (c.metadata.measure || '').toLowerCase()
+if (c.metadata?.measure || c.measure) {
+const ml = (c.measure || c.metadata?.measure || '').toLowerCase()
 if (ml === subjectPhraseStr) score += 100
 }
 return { chunk: c, faissScore: score }
@@ -298,9 +304,11 @@ const bNorm = bm25Raw[i] / bm25Max
 return { chunk: x.chunk, score: alpha * fNorm + (1 - alpha) * bNorm }
 })
 hybrid.sort((a, b) => b.score - a.score)
+const SCORE_THRESHOLD = 0.08
 const seen = new Set()
 const results = []
 for (const { chunk, score } of hybrid) {
+if (score < SCORE_THRESHOLD) break
 const fp = (chunk.text || '').trim().slice(0, 60).toLowerCase()
 if (!seen.has(fp)) {
 seen.add(fp)
@@ -310,7 +318,6 @@ if (results.length >= Math.max(faissTopK, bm25TopK)) break
 }
 return results
 }
-
 function classifyDocumentType(chunks, fileName) {
 if (!chunks || chunks.length === 0) return 'unstructured'
 const ddCount = chunks.filter(c => c.docType === 'data_dictionary').length
@@ -319,7 +326,6 @@ const sfCount = chunks.filter(c => c.docType === 'structured').length
 if (sfCount / Math.max(chunks.length, 1) > 0.3) return 'structured'
 return 'unstructured'
 }
-
 function detectDocTypeFromChunks(chunks) {
 if (!chunks || chunks.length === 0) return 'unstructured'
 const ddCount = chunks.filter(c => c.docType === 'data_dictionary').length
@@ -328,7 +334,6 @@ const sfCount = chunks.filter(c => c.docType === 'structured').length
 if (sfCount / Math.max(chunks.length, 1) > 0.3) return 'structured'
 return 'unstructured'
 }
-
 async function _doLoadChunks(clientId) {
 const chunks = await loadChunksFromBlob(clientId)
 if (chunks.length === 0) {
@@ -338,7 +343,6 @@ return []
 console.log(`[loadChunks] ${clientId} -> ${chunks.length} total chunks`)
 return chunks
 }
-
 const CHUNK_CACHE = new Map()
 async function loadChunksForClient(clientId) {
 const now = Date.now()
@@ -381,7 +385,6 @@ await loadPromise
 const entry = CHUNK_CACHE.get(clientId)
 return { chunks: entry?.chunks || [], invertedIndexes: entry?.invertedIndexes || {} }
 }
-
 function buildAllInvertedIndexes(chunks) {
 const ddChunks = chunks.filter(c => c.docType === 'data_dictionary')
 const sfChunks = chunks.filter(c => c.docType === 'structured')
@@ -393,12 +396,10 @@ ud: udChunks.length > 0 ? buildInvertedIndexUD(udChunks) : null,
 all: buildInvertedIndex(chunks),
 }
 }
-
 function invalidateChunkCache(clientId) {
 CHUNK_CACHE.delete(clientId)
 console.log(`[chunkCache] Invalidated cache for client: ${clientId}`)
 }
-
 function warmupChunkCaches() {
 if (!WARMUP_CLIENT_IDS.length || !blobServiceClient) return
 console.log(`[warmup] Pre-loading chunks for: ${WARMUP_CLIENT_IDS.join(', ')}`)
@@ -408,7 +409,6 @@ loadChunksForClient(clientId)
 .catch(err => console.warn(`[warmup] ${clientId} -- ${err.message}`))
 }
 }
-
 let db = null
 async function getDb() {
 if (db) return db
@@ -418,7 +418,6 @@ db = client.db(MONGODB_DB)
 await db.collection('clients').createIndex({ apiKey: 1 }, { unique: true, sparse: true })
 return db
 }
-
 let chatDb = null
 async function getChatDb() {
 if (chatDb) return chatDb
@@ -428,7 +427,6 @@ await client.connect()
 chatDb = client.db(CHAT_HISTORY_DB)
 return chatDb
 }
-
 const CLIENT_CACHE = new Map()
 const CACHE_TTL_MS = 5 * 60 * 1000
 function getCached(apiKey) {
@@ -439,7 +437,6 @@ return entry
 }
 function setCache(apiKey, data) { CLIENT_CACHE.set(apiKey, {...data, cachedAt: Date.now()}) }
 function evictCache(apiKey) { if (apiKey) CLIENT_CACHE.delete(apiKey) }
-
 async function verifyApiKey(apiKey) {
 if (!apiKey || !apiKey.startsWith('rak_')) return null
 const cached = getCached(apiKey)
@@ -450,7 +447,6 @@ if (!client) return null
 setCache(apiKey, { clientId: client.clientId, name: client.name })
 return { clientId: client.clientId, name: client.name }
 }
-
 function startApiKeyHealthChecker() {
 if (!MONGODB_URI) return
 setInterval(async () => {
@@ -464,12 +460,10 @@ for (const key of keys) if (!validSet.has(key)) evictCache(key)
 } catch {}
 }, KEY_CHECK_INTERVAL_MS)
 }
-
 function extractApiKey(req) {
 const header = req.headers['authorization'] || ''
 return header.startsWith('Bearer ') ? header.slice(7).trim() : null
 }
-
 async function requireClientKey(req, res, next) {
 const apiKey = extractApiKey(req) || req.body?.apiKey
 if (!apiKey) return res.status(401).json({ error: 'Missing API key' })
@@ -478,13 +472,11 @@ if (!client) return res.status(401).json({ error: 'Invalid or expired API key' }
 req.client = client
 next()
 }
-
 function requireAdminKey(req, res, next) {
 const key = extractApiKey(req)
 if (!key || key !== ADMIN_API_KEY) return res.status(401).json({ error: 'Unauthorized' })
 next()
 }
-
 function cleanAnswer(rawAnswer) {
 if (!rawAnswer) return ''
 let cleaned = fixBrokenUrls(rawAnswer)
@@ -500,7 +492,6 @@ cleaned = trimToLastCompleteSentence(cleaned)
 if (cleaned.length > 0 && !/[.!?]$/.test(cleaned)) cleaned += '.'
 return ensureSinglePeriod(cleaned)
 }
-
 async function generateAnswer(query, hits, intent, docType) {
 let systemPrompt, userMessage
 if (docType === 'data_dictionary') {
@@ -515,19 +506,17 @@ userMessage = buildUserMessageUD(query, hits, intent)
 }
 return callBestAvailableEngine(systemPrompt, userMessage, 1024)
 }
-
 function buildFallbackAnswer(query, hits, intent, docType) {
 if (docType === 'data_dictionary') return buildFallbackAnswerDD(query, hits, intent)
 if (docType === 'structured') return buildFallbackAnswerSF(query, hits)
 return buildFallbackAnswerUD(query, hits)
 }
-
 function computePoolConfidence(hits, docType) {
 if (!hits || hits.length === 0) return 0
 const topScore = hits[0]?._score || 0
 const secondScore = hits[1]?._score || 0
 const gap = topScore - secondScore
-const MIN_THRESHOLD = 0.05
+const MIN_THRESHOLD = 0.08
 if (topScore < MIN_THRESHOLD) return 0
 const topN = hits.slice(0, Math.min(5, hits.length))
 const avgScore = topN.reduce((s, h) => s + (h._score || 0), 0) / topN.length
@@ -535,23 +524,49 @@ let confidence = avgScore + gap * 0.5
 if (docType === 'data_dictionary') confidence *= 1.4
 return confidence
 }
-
-async function retrieveBestHitsAcrossAllTypes(processedQuery, chunks, topK, invertedIndexes, intent) {
-const ddChunks = chunks.filter(c => c.docType === 'data_dictionary')
-const sfChunks = chunks.filter(c => c.docType === 'structured')
-const udChunks = chunks.filter(c => c.docType !== 'data_dictionary' && c.docType !== 'structured')
-const hybridHits = hybridSearch(processedQuery, chunks, FAISS_TOP_K, BM25_TOP_K)
+function pickBestSourceFile(query, chunks) {
+if (!chunks || chunks.length === 0) return null
+const files = [...new Set(chunks.map(c => c.source_file).filter(Boolean))]
+if (files.length <= 1) return null
+const subject = extractSubject(query).toLowerCase()
+const queryWords = normalizeQuery(query).replace(/[^\w\s]/g,' ').split(/\s+/).filter(w => w.length > 1)
+const fileScores = files.map(f => {
+const fileChunks = chunks.filter(c => c.source_file === f)
+const bm25Raw = bm25ScoreJS(query, fileChunks)
+const bm25Max = Math.max(...bm25Raw, 1)
+const bm25Avg = bm25Raw.slice().sort((a,b) => b-a).slice(0,5).reduce((s,v) => s+v, 0) / 5
+const bm25Norm = bm25Avg / bm25Max
+const subjectHits = fileChunks.filter(c => {
+const t = (c.text || '').toLowerCase()
+return queryWords.filter(w => t.includes(w)).length >= Math.ceil(queryWords.length * 0.5)
+}).length
+const coverage = subjectHits / Math.max(fileChunks.length, 1)
+return { file: f, score: bm25Norm * 0.6 + coverage * 0.4 }
+}).sort((a,b) => b.score - a.score)
+const best = fileScores[0]
+const runner = fileScores[1]
+if (runner && best.score < runner.score * 1.5) return null
+console.log(`[docRouter] Routed to: ${best.file} (score=${best.score.toFixed(3)})`)
+return best.file
+}
+async function retrieveBestHitsAcrossAllTypes(processedQuery, chunks, topK, invertedIndexes, intent, sourceFilter = null) {
+const pool = sourceFilter ? chunks.filter(c => c.source_file === sourceFilter) : chunks
+const ddChunks = pool.filter(c => c.docType === 'data_dictionary')
+const sfChunks = pool.filter(c => c.docType === 'structured')
+const udChunks = pool.filter(c => c.docType !== 'data_dictionary' && c.docType !== 'structured')
+const hybridHits = hybridSearch(processedQuery, pool, FAISS_TOP_K, BM25_TOP_K, 0.6, null)
 const ddHits = ddChunks.length > 0 ? hybridHits.filter(h => h.docType === 'data_dictionary') : []
 const sfHits = sfChunks.length > 0 ? hybridHits.filter(h => h.docType === 'structured') : []
 const udHits = udChunks.length > 0 ? hybridHits.filter(h => h.docType !== 'data_dictionary' && h.docType !== 'structured') : []
+const poolInvertedIndexes = sourceFilter ? buildAllInvertedIndexes(pool) : invertedIndexes
 const ddKeyword = ddChunks.length > 0
-? await retrieveChunksDD(processedQuery, ddChunks, topK, invertedIndexes.dd).catch(() => [])
+? await retrieveChunksDD(processedQuery, ddChunks, topK, poolInvertedIndexes.dd).catch(() => [])
 : []
 const sfKeyword = sfChunks.length > 0
-? retrieveChunksSF(processedQuery, sfChunks, topK, invertedIndexes.sf || invertedIndexes.all)
+? retrieveChunksSF(processedQuery, sfChunks, topK, poolInvertedIndexes.sf || poolInvertedIndexes.all)
 : []
 const udKeyword = udChunks.length > 0
-? retrieveChunksUD(processedQuery, udChunks, topK, invertedIndexes.ud || invertedIndexes.all)
+? retrieveChunksUD(processedQuery, udChunks, topK, poolInvertedIndexes.ud || poolInvertedIndexes.all)
 : []
 function mergeHits(hybridPool, keywordPool, limit) {
 const seen = new Set()
@@ -579,7 +594,6 @@ validPools.sort((a, b) => b.confidence - a.confidence)
 console.log(`[routing] winner=${validPools[0].docType} confidence=${validPools[0].confidence.toFixed(3)}`)
 return { hits: validPools[0].hits, docType: validPools[0].docType }
 }
-
 async function generateAnswerForTopic(topic, chunks, topK, invertedIndexes) {
 const topicQuery = `what is ${topic}`
 const docType = detectDocTypeFromChunks(chunks)
@@ -602,7 +616,6 @@ answer = answer.replace(/^\*\*[^*]+\*\*\s*(is defined as:?\s*)?/i,'').trim()
 if (answer && !/[.!?]$/.test(answer)) answer += '.'
 return answer
 }
-
 async function generateComparisonAnswer(topicA, topicB, chunks, topK, invertedIndexes) {
 const comparisonQuery = `difference between ${topicA} and ${topicB}`
 const docType = detectDocTypeFromChunks(chunks)
@@ -637,7 +650,6 @@ if (answerB && !answerB.includes('could not find')) parts.push(`**${capFirst(top
 else parts.push(`**${capFirst(topicB)}:** I could not find information about "${capFirst(topicB)}" in your documents.`)
 return parts.join('\n\n')
 }
-
 async function handleMultiTopicQuery(topics, mode, chunks, topK, invertedIndexes) {
 const results = await Promise.all(topics.map(async (topic) => {
 const answer = await generateAnswerForTopic(topic, chunks, topK, invertedIndexes)
@@ -661,7 +673,6 @@ return parts.join('\n\n')
 }
 return parts.join('\n\n')
 }
-
 async function saveConversationMessage(clientId, conversationId, query, answer, sources) {
 try {
 const chatDatabase = await getChatDb()
@@ -688,17 +699,14 @@ console.warn('[saveConversationMessage] Failed:', saveErr.message)
 return conversationId || null
 }
 }
-
 const IN_FLIGHT = new Map()
-
 app.get('/health', (req, res) => res.json({
 ok: true, service: 'ask-data',
 engines: { primary: ASKDATA_ENDPOINT ? 'configured' : 'missing', fallback: ASKDATA2_ENDPOINT ? 'configured' : 'missing' },
-retrieval: 'hybrid BM25+keyword + cross-type routing',
+retrieval: 'hybrid BM25+keyword + doc-level routing + cross-type routing',
 chunkCacheSize: CHUNK_CACHE.size,
 primaryCircuitOpen: askedataCircuitOpen(),
 }))
-
 app.post('/client/verify', async (req, res) => {
 try {
 const apiKey = extractApiKey(req) || req.body?.apiKey
@@ -708,7 +716,6 @@ if (!client) return res.status(401).json({ valid: false, error: 'Invalid or expi
 res.json({ valid: true, client })
 } catch (err) { res.status(500).json({ valid: false, error: err.message }) }
 })
-
 app.post('/admin/clients', requireAdminKey, async (req, res) => {
 try {
 let { name, clientId, apiKey } = req.body
@@ -728,7 +735,6 @@ const result = await col.insertOne(doc)
 res.status(201).json({...doc, _id: result.insertedId})
 } catch (err) { res.status(500).json({ error: err.message }) }
 })
-
 app.get('/admin/clients', requireAdminKey, async (req, res) => {
 try {
 const database = await getDb()
@@ -736,7 +742,6 @@ const clients = await database.collection('clients').find({}, { projection: { ap
 res.json({ clients })
 } catch (err) { res.status(500).json({ error: err.message }) }
 })
-
 app.get('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
 try {
 const database = await getDb()
@@ -745,7 +750,6 @@ if (!client) return res.status(404).json({ error: 'Client not found' })
 res.json(client)
 } catch (err) { res.status(500).json({ error: err.message }) }
 })
-
 app.post('/admin/clients/:clientId/regenerate-key', requireAdminKey, async (req, res) => {
 try {
 const database = await getDb()
@@ -759,7 +763,6 @@ await col.findOneAndUpdate({ clientId: req.params.clientId }, { $set: { apiKey: 
 res.json({ success: true, clientId: req.params.clientId, newApiKey, apiKeyRotatedAt: now })
 } catch (err) { res.status(500).json({ error: err.message }) }
 })
-
 app.patch('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
 try {
 const database = await getDb()
@@ -775,7 +778,6 @@ if (!result) return res.status(404).json({ error: 'Client not found' })
 res.json(result)
 } catch (err) { res.status(500).json({ error: err.message }) }
 })
-
 app.delete('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
 try {
 const { clientId } = req.params
@@ -800,14 +802,12 @@ catch (e) { blobsFailed.push({ name: blob.name, error: e.message }) }
 res.json({ ok: true, deleted: clientId, blobsDeleted: blobsDeleted.length, blobsFailed: blobsFailed.length > 0 ? blobsFailed : undefined })
 } catch (err) { res.status(500).json({ error: err.message }) }
 })
-
 app.post('/admin/clients/:clientId/invalidate-cache', requireAdminKey, (req, res) => {
 invalidateChunkCache(req.params.clientId)
 const { RESPONSE_CACHE } = require('./src/config')
 RESPONSE_CACHE.clear()
 res.json({ ok: true, clientId: req.params.clientId, message: 'Chunk + response cache invalidated' })
 })
-
 app.post('/client/login', async (req, res) => {
 try {
 const apiKey = extractApiKey(req) || req.body?.apiKey
@@ -818,7 +818,6 @@ if (blobServiceClient) loadChunksForClient(client.clientId).catch(err => console
 res.json({ ok: true, client })
 } catch (err) { res.status(500).json({ error: err.message }) }
 })
-
 app.post('/chat/login', async (req, res) => {
 try {
 const apiKey = extractApiKey(req) || req.body?.apiKey
@@ -829,7 +828,6 @@ if (blobServiceClient) loadChunksForClient(client.clientId).catch(err => console
 res.json({ ok: true, client })
 } catch (err) { res.status(500).json({ error: err.message }) }
 })
-
 app.get('/client/me', requireClientKey, async (req, res) => {
 try {
 const database = await getDb()
@@ -838,7 +836,6 @@ if (!client) return res.status(404).json({ error: 'Client not found' })
 res.json(client)
 } catch (err) { res.status(500).json({ error: err.message }) }
 })
-
 app.post('/chat/conversations', requireClientKey, async (req, res) => {
 try {
 const { title } = req.body
@@ -849,7 +846,6 @@ const result = await database.collection('conversations').insertOne(conversation
 res.status(201).json({...conversation, _id: result.insertedId})
 } catch (err) { res.status(500).json({ error: err.message }) }
 })
-
 app.post('/chat/conversations/list', requireClientKey, async (req, res) => {
 try {
 const database = await getChatDb()
@@ -857,7 +853,6 @@ const conversations = await database.collection('conversations').find({ clientId
 res.json({ conversations })
 } catch (err) { res.status(500).json({ error: err.message }) }
 })
-
 app.post('/chat/conversations/get', requireClientKey, async (req, res) => {
 try {
 const { conversationId } = req.body
@@ -868,7 +863,6 @@ if (!conversation) return res.status(404).json({ error: 'Conversation not found'
 res.json(conversation)
 } catch (err) { res.status(500).json({ error: err.message }) }
 })
-
 app.post('/chat/conversations/rename', requireClientKey, async (req, res) => {
 try {
 const { conversationId, title } = req.body
@@ -883,7 +877,6 @@ if (!result) return res.status(404).json({ error: 'Conversation not found' })
 res.json(result)
 } catch (err) { res.status(500).json({ error: err.message }) }
 })
-
 app.post('/chat/conversations/delete', requireClientKey, async (req, res) => {
 try {
 const { conversationId } = req.body
@@ -894,7 +887,6 @@ if (result.deletedCount === 0) return res.status(404).json({ error: 'Conversatio
 res.json({ ok: true, deleted: conversationId })
 } catch (err) { res.status(500).json({ error: err.message }) }
 })
-
 app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) => {
 try {
 const { query, topK = 6, conversationId } = req.body
@@ -951,14 +943,28 @@ console.log(`[chat/message] Multi-topic: ${JSON.stringify(multiTopicCheck.topics
 const answer = await handleMultiTopicQuery(multiTopicCheck.topics, multiTopicCheck.mode, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndexes)
 return { answer, sources: [], client: { clientId, name } }
 }
-const { hits, docType: routedDocType } = await retrieveBestHitsAcrossAllTypes(processedQuery, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndexes, intent)
+const uniqueFiles = [...new Set(chunks.map(c => c.source_file).filter(Boolean))]
+let sourceFilter = null
+if (uniqueFiles.length > 1) {
+sourceFilter = pickBestSourceFile(processedQuery, chunks)
+if (sourceFilter) console.log(`[docRouter] Using source filter: ${sourceFilter}`)
+}
+const { hits, docType: routedDocType } = await retrieveBestHitsAcrossAllTypes(processedQuery, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndexes, intent, sourceFilter)
 let finalHits = hits
 let finalDocType = routedDocType
+if (finalHits.length === 0 && sourceFilter) {
+console.log(`[docRouter] No hits with filter, falling back to all docs`)
+const fallback = await retrieveBestHitsAcrossAllTypes(processedQuery, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndexes, intent, null)
+finalHits = fallback.hits
+finalDocType = fallback.docType
+}
 if (finalHits.length === 0) {
 finalHits = relaxedKeywordSearchDD(processedQuery, chunks, 64, invertedIndexes.all)
 finalDocType = detectDocTypeFromChunks(finalHits.length > 0 ? finalHits : chunks)
 }
-console.log(`[chat/message] "${query.slice(0,60)}" -> intent=${intent}, docType=${finalDocType}, hits=${finalHits.length}`)
+const focusedHits = selectFocusedHits(finalHits, Math.min(topK, MAX_HITS_GLOBAL))
+finalHits = focusedHits.length > 0 ? focusedHits : finalHits
+console.log(`[chat/message] "${query.slice(0,60)}" -> intent=${intent}, docType=${finalDocType}, hits=${finalHits.length}, sourceFilter=${sourceFilter || 'none'}`)
 if (finalHits.length === 0) return { answer: 'I could not find relevant information about this in your documents. Try rephrasing your question.', sources: [], client: { clientId, name } }
 let rawAnswer = ''
 if (intent !== 'url_lookup') {
@@ -993,17 +999,15 @@ console.error('[chat/message] Error:', err.message)
 if (!res.headersSent) res.status(500).json({ error: err.message })
 }
 }))
-
 app.use((err, req, res, next) => {
 console.error('[global error handler]', err)
 if (!res.headersSent) res.status(500).json({ error: 'An unexpected error occurred. Please try again.' })
 })
-
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => {
 console.log(`Service running on port ${PORT}`)
 console.log(`ASKDATA: ${ASKDATA_ENDPOINT ? 'configured' : 'MISSING'} | ASKDATA2: ${ASKDATA2_ENDPOINT ? 'configured' : 'missing'}`)
-console.log(`Retrieval: hybrid BM25+keyword, cross-type routing, per-client isolation`)
+console.log(`Retrieval: hybrid BM25+keyword, doc-level routing, cross-type routing, per-client isolation`)
 startApiKeyHealthChecker()
 warmupChunkCaches()
 })
