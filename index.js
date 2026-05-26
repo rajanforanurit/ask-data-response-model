@@ -26,7 +26,12 @@ generateApiKey,generateTitle,selectFocusedHits,
 const {
 extractSpreadsheet,retrieveChunksDD,buildSystemPromptDD,buildUserMessageDD,
 buildFallbackAnswerDD,fuzzyCorrectQuery,relaxedKeywordSearchDD,extractAllUrlsFromChunks,
+buildStructuredChunk,structuredSearchDD,
 }=require('./src/dd')
+const {classifyQuery:routerClassifyQuery}=require('./src/router')
+const {expandQueryString}=require('./src/aliases')
+const {retrieve:adaptiveRetrieve,semanticSearch}=require('./src/retrieval')
+const {detectDocumentType,classifyChunks}=require('./src/classifier')
 const {
 chunkStructuredDocument,buildInvertedIndexSF,retrieveChunksSF,
 buildSystemPromptSF,buildUserMessageSF,buildFallbackAnswerSF,
@@ -389,11 +394,15 @@ function buildAllInvertedIndexes(chunks){
 const ddChunks=chunks.filter(c=>c.docType==='data_dictionary')
 const sfChunks=chunks.filter(c=>c.docType==='structured')
 const udChunks=chunks.filter(c=>c.docType!=='data_dictionary'&&c.docType!=='structured')
+const structuredChunks=[...ddChunks,...sfChunks]
+const semanticChunks=udChunks
 return{
 dd:ddChunks.length>0?buildInvertedIndex(ddChunks):buildInvertedIndex(chunks),
 sf:sfChunks.length>0?buildInvertedIndexSF(sfChunks):null,
 ud:udChunks.length>0?buildInvertedIndexUD(udChunks):null,
 all:buildInvertedIndex(chunks),
+structured:structuredChunks.length>0?buildInvertedIndex(structuredChunks):null,
+semantic:semanticChunks.length>0?buildInvertedIndex(semanticChunks):null,
 }
 }
 function invalidateChunkCache(clientId){
@@ -567,45 +576,49 @@ const pool=sourceFilter?chunks.filter(c=>c.source_file===sourceFilter):chunks
 const ddChunks=pool.filter(c=>c.docType==='data_dictionary')
 const sfChunks=pool.filter(c=>c.docType==='structured')
 const udChunks=pool.filter(c=>c.docType!=='data_dictionary'&&c.docType!=='structured')
-const hybridHits=hybridSearch(processedQuery,pool,FAISS_TOP_K,BM25_TOP_K,0.6,null)
-const ddHits=ddChunks.length>0?hybridHits.filter(h=>h.docType==='data_dictionary'):[]
-const sfHits=sfChunks.length>0?hybridHits.filter(h=>h.docType==='structured'):[]
-const udHits=udChunks.length>0?hybridHits.filter(h=>h.docType!=='data_dictionary'&&h.docType!=='structured'):[]
+const structuredPool=[...ddChunks,...sfChunks]
+const semanticPool=udChunks
 const poolInvertedIndexes=sourceFilter?buildAllInvertedIndexes(pool):invertedIndexes
-const ddKeyword=ddChunks.length>0
-?await retrieveChunksDD(processedQuery,ddChunks,topK,poolInvertedIndexes.dd).catch(()=>[])
+
+const queryType=routerClassifyQuery(processedQuery)
+console.log(`[adaptiveRoute] queryType=${queryType} | structured=${structuredPool.length} | semantic=${semanticPool.length}`)
+
+if(queryType==='structured'&&structuredPool.length>0){
+const ddHits=ddChunks.length>0
+?structuredSearchDD(processedQuery,ddChunks,topK)
 :[]
 const sfKeyword=sfChunks.length>0
 ?retrieveChunksSF(processedQuery,sfChunks,topK,poolInvertedIndexes.sf||poolInvertedIndexes.all)
 :[]
-const udKeyword=udChunks.length>0
-?retrieveChunksUD(processedQuery,udChunks,topK,poolInvertedIndexes.ud||poolInvertedIndexes.all)
-:[]
-function mergeHits(hybridPool,keywordPool,limit){
 const seen=new Set()
 const merged=[]
-for(const h of[...hybridPool,...keywordPool]){
+for(const h of[...ddHits,...sfKeyword]){
 const fp=(h.text||'').trim().slice(0,60).toLowerCase()
 if(!seen.has(fp)){seen.add(fp);merged.push(h)}
-if(merged.length>=limit)break
+if(merged.length>=topK)break
 }
-return merged
+if(merged.length>0){
+const docType=ddHits.length>=sfKeyword.length?'data_dictionary':'structured'
+console.log(`[adaptiveRoute] structured retrieval -> ${merged.length} hits, docType=${docType}`)
+return{hits:merged,docType}
 }
-const pools=[
-{hits:mergeHits(ddHits,ddKeyword,topK),docType:'data_dictionary'},
-{hits:mergeHits(sfHits,sfKeyword,topK),docType:'structured'},
-{hits:mergeHits(udHits,udKeyword,topK),docType:'unstructured'},
-].filter(p=>p.hits&&p.hits.length>0)
-if(pools.length===0)return{hits:[],docType:'unstructured'}
-for(const pool of pools)pool.confidence=computePoolConfidence(pool.hits,pool.docType)
-const validPools=pools.filter(p=>p.confidence>0)
-if(validPools.length===0){
-pools.sort((a,b)=>(b.hits[0]?._score||0)-(a.hits[0]?._score||0))
-return{hits:pools[0].hits,docType:pools[0].docType}
+console.log(`[adaptiveRoute] structured retrieval empty, falling back to semantic`)
 }
-validPools.sort((a,b)=>b.confidence-a.confidence)
-console.log(`[routing] winner=${validPools[0].docType} confidence=${validPools[0].confidence.toFixed(3)}`)
-return{hits:validPools[0].hits,docType:validPools[0].docType}
+
+const hybridHits=hybridSearch(processedQuery,semanticPool.length>0?semanticPool:pool,FAISS_TOP_K,BM25_TOP_K,0.6,null)
+const udKeyword=semanticPool.length>0
+?retrieveChunksUD(processedQuery,semanticPool,topK,poolInvertedIndexes.ud||poolInvertedIndexes.all)
+:[]
+const seen=new Set()
+const merged=[]
+for(const h of[...hybridHits,...udKeyword]){
+const fp=(h.text||'').trim().slice(0,60).toLowerCase()
+if(!seen.has(fp)){seen.add(fp);merged.push(h)}
+if(merged.length>=topK)break
+}
+const docType=detectDocTypeFromChunks(merged.length>0?merged:pool)
+console.log(`[adaptiveRoute] semantic retrieval -> ${merged.length} hits, docType=${docType}`)
+return{hits:merged,docType}
 }
 async function generateAnswerForTopic(topic,chunks,topK,invertedIndexes){
 const topicQuery=`what is ${topic}`
