@@ -186,18 +186,38 @@ return `DOCUMENT CONTEXT:\n${context}${instruction}`
 function buildFallbackAnswerUD(query, hits) {
 if (!hits || hits.length === 0) return 'I could not find relevant information about this in your documents.'
 const subject = extractSubject(query)
-const subjectWords = subject.toLowerCase().split(/\s+/).filter(w => w.length > 1)
-const matchingText = []
-for (const h of hits.slice(0,4)) {
+const subjectLower = subject.toLowerCase()
+const subjectWords = subjectLower.split(/\s+/).filter(w => w.length > 1)
+const escapedSubject = escapeRegex(subjectLower)
+const definitionPattern = new RegExp(
+`\\b${escapedSubject}\\b[^.!?\\n]{0,80}(?:is|are|means|refers to|defined as|describes)[^.!?\\n]{5,}[.!?]`,
+'i'
+)
+for (const h of hits.slice(0, 6)) {
 const text = (h.text || '').trim()
-if (text.length > 50) {
-const hasSubjectWord = subjectWords.some(w => text.toLowerCase().includes(w))
-if (hasSubjectWord) matchingText.push(trimToCompleteSentence(text, 400))
+const m = text.match(definitionPattern)
+if (m) {
+const sentence = m[0].trim()
+return ensureSinglePeriod(`**${capFirst(subject)}** ${sentence.replace(new RegExp(`^\\b${escapedSubject}\\b\\s*`, 'i'), '')}.`)
 }
 }
-if (matchingText.length > 0) {
-const combined = matchingText.join(' ').slice(0,800)
-return ensureSinglePeriod(`**${capFirst(subject)}:** ${combined}.`)
+const sentences = []
+for (const h of hits.slice(0, 4)) {
+const text = (h.text || '').trim()
+for (const sent of text.split(/(?<=[.!?])\s+/)) {
+const s = sent.trim()
+if (s.length < 20) continue
+const hasSubject = subjectWords.some(w => s.toLowerCase().includes(w))
+if (hasSubject) sentences.push(s)
+}
+}
+if (sentences.length > 0) {
+const best = sentences.sort((a, b) => {
+const aScore = subjectWords.filter(w => a.toLowerCase().includes(w)).length
+const bScore = subjectWords.filter(w => b.toLowerCase().includes(w)).length
+return bScore - aScore
+})[0]
+return ensureSinglePeriod(`**${capFirst(subject)}:** ${trimToCompleteSentence(best, 300)}.`)
 }
 return `I could not find specific information about "${capFirst(subject)}" in your documents.`
 }
