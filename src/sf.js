@@ -1,12 +1,11 @@
 const {
 escapeRegex,capFirst,ensureSinglePeriod,trimToCompleteSentence,
-applySynonyms,normalizeQuery,extractSubject,normalizeTerms,
-computeNegativePenalty,CHUNK_SIZE,MAX_HITS_GLOBAL,
+normalizeQuery,extractSubject,normalizeTerms,
+computeNegativePenalty,MAX_HITS_GLOBAL,
 detectQueryIntent,selectFocusedHits,
 } = require('./config')
 const SF_CHUNK_SIZE = 1600
 const SF_HEADING_OVERLAP = 1
-
 function isHeading(line) {
 const trimmed = line.trim()
 if (!trimmed) return false
@@ -19,9 +18,7 @@ if (/^[A-Z][A-Za-z\s]{3,60}:\s*$/.test(trimmed) && trimmed.length < 80) return t
 if (/^[-*•]\s*\*\*[^*]+\*\*\s*:?\s*$/.test(trimmed)) return true
 return false
 }
-
 function isTableRow(line) { return /\|.*\|/.test(line.trim()) || /^\s*[-+]{3,}/.test(line.trim()) }
-
 function extractHeading(line) {
 return line.trim()
 .replace(/^#{1,6}\s+/,'')
@@ -31,7 +28,6 @@ return line.trim()
 .replace(/:\s*$/,'')
 .trim()
 }
-
 function chunkStructuredDocument(text, sourceFile) {
 const chunks = []
 let chunkIndex = 0
@@ -41,7 +37,6 @@ let buffer = []
 let bufferLen = 0
 let tableBuffer = []
 let inTable = false
-
 function flushBuffer(heading) {
 if (buffer.length === 0 && tableBuffer.length === 0) return
 const tableText = tableBuffer.length > 0 ? '\n' + tableBuffer.join('\n') : ''
@@ -61,11 +56,9 @@ bufferLen = 0
 tableBuffer = []
 inTable = false
 }
-
 for (let i = 0; i < lines.length; i++) {
 const line = lines[i]
 const trimmed = line.trim()
-
 if (isTableRow(line)) {
 if (!inTable) {
 if (buffer.length > 0 && bufferLen > SF_CHUNK_SIZE * 0.5) flushBuffer(currentHeading)
@@ -74,7 +67,6 @@ inTable = true
 tableBuffer.push(line)
 continue
 }
-
 if (inTable && !isTableRow(line) && trimmed !== '') {
 if (tableBuffer.length > 0) {
 const tableChunk = (currentHeading ? `[Section: ${currentHeading}]\n` : '') + tableBuffer.join('\n')
@@ -91,13 +83,11 @@ tableBuffer = []
 }
 inTable = false
 }
-
 if (isHeading(line)) {
 flushBuffer(currentHeading)
 currentHeading = extractHeading(line)
 continue
 }
-
 if (!trimmed) {
 if (bufferLen > SF_CHUNK_SIZE * 0.6 && buffer.length > 0) {
 const lastLines = buffer.slice(-SF_HEADING_OVERLAP)
@@ -107,7 +97,6 @@ bufferLen = lastLines.join('\n').length
 }
 continue
 }
-
 if (bufferLen + line.length > SF_CHUNK_SIZE && buffer.length > 0) {
 const lastLines = buffer.slice(-SF_HEADING_OVERLAP)
 flushBuffer(currentHeading)
@@ -117,19 +106,15 @@ bufferLen = lastLines.join('\n').length
 buffer.push(line)
 bufferLen += line.length + 1
 }
-
 flushBuffer(currentHeading)
-
 if (tableBuffer.length > 0) {
 const tableChunk = (currentHeading ? `[Section: ${currentHeading}]\n` : '') + tableBuffer.join('\n')
 if (tableChunk.trim().length >= 20) {
 chunks.push({ text: tableChunk.trim(), source_file: sourceFile, chunk_index: chunkIndex++, embedding: [], metadata: { section: currentHeading, isTable: true, docType: 'structured' } })
 }
 }
-
 return chunks
 }
-
 function buildInvertedIndexSF(chunks) {
 const index = new Map()
 for (let i = 0; i < chunks.length; i++) {
@@ -151,7 +136,6 @@ index.get(w).add(i)
 }
 return index
 }
-
 function retrieveChunksSF(query, chunks, topK, invertedIndex) {
 const intent = detectQueryIntent(query)
 const subject = extractSubject(query)
@@ -190,7 +174,6 @@ const penalty = computeNegativePenalty(subject, c.text || '')
 score -= penalty
 return {...c, _score: score}
 }).filter(c => c._score > 0).sort((a,b) => b._score - a._score)
-
 let top = selectFocusedHits(scored, Math.min(topK, MAX_HITS_GLOBAL))
 if (top.length === 0) {
 top = chunks.filter(c => {
@@ -200,32 +183,12 @@ return queryWords.some(w => t.includes(w))
 }
 return top
 }
-
 function buildSystemPromptSF(intent) {
-if (intent === 'definition') {
-return `You are a research document assistant. Answer questions using ONLY the provided document context.
-Rules:
-- For definitions, provide a clear, concise explanation drawn directly from the document. Bold the key term.
-- Write 1-2 complete sentences. Extract ONLY the definition for what was asked.
-- Do not list or repeat other sections from the document that were not asked about.
-- If the context lacks the answer, say: "I could not find this in your documents."`
+if (intent === 'definition') return `Document assistant. Answer ONLY from context. Bold key term. 1-2 sentences. If not found: "I could not find this in your documents."`
+if (intent === 'comparison') return `Document assistant. Compare items ONLY from context. Bold each item. If not found: "I could not find this in your documents."`
+if (intent === 'calculation') return `Document assistant. Extract formula/method ONLY from context. If not found: "I could not find this in your documents."`
+return `Document assistant. Answer ONLY from context. Be direct, 1-3 sentences. Reference section names when helpful. If not found: "I could not find this in your documents."`
 }
-if (intent === 'comparison') {
-return `You are a research document assistant. Compare the requested items using ONLY the provided context. Structure your comparison clearly with each item bolded. Derive all comparisons strictly from the document. If the context lacks the answer, say: "I could not find this in your documents."`
-}
-if (intent === 'calculation') {
-return `You are a research document assistant. Extract the formula or calculation method from the document context. Present it clearly. If the context lacks the answer, say: "I could not find this in your documents."`
-}
-return `You are a research document assistant. Answer questions accurately using ONLY the provided context from the document.
-Rules:
-- Be direct and concise. Answer in 1-3 sentences.
-- Synthesize information across sections when needed but extract only what is relevant to the question.
-- Reference section names when helpful (e.g., "According to the Data Retention section...").
-- Do not reproduce entire document sections. Extract only the relevant fact.
-- Do not invent facts not in the context.
-- If context lacks the answer, say: "I could not find this in your documents."`
-}
-
 function buildContextSF(hits) {
 const seen = new Set()
 const deduped = []
@@ -241,25 +204,23 @@ const text = (h.text || '').trim().slice(0,limit)
 return section ? `${section}\n${text}` : text
 }).join('\n\n---\n\n')
 }
-
 function buildUserMessageSF(query, hits, intent) {
 const context = buildContextSF(hits)
 const subject = extractSubject(query)
 let instruction = ''
 if (intent === 'definition') {
-instruction = `\n\nUsing the document context above, explain what "${subject}" means. Bold the key term. Write 1-2 complete sentences. Extract only the definition for "${subject}" and nothing else from the document.`
+instruction = `\n\nFrom context: what is "${subject}"? Bold the term. 1-2 sentences.`
 } else if (intent === 'calculation') {
-instruction = `\n\nUsing the document context above, describe how "${subject}" is calculated or measured. Present the formula or method clearly. Stay strictly within what the document says.`
+instruction = `\n\nFrom context: how is "${subject}" calculated? Present formula clearly.`
 } else if (intent === 'comparison') {
-instruction = `\n\nUsing the document context above, compare: ${query}. Bold each item being compared. Synthesize information from across sections as needed. Derive all comparisons strictly from the document.`
+instruction = `\n\nFrom context compare: ${query}. Bold each item.`
 } else if (intent === 'lookup') {
-instruction = `\n\nUsing the document context above, answer: ${query}. Be specific and direct. Reference section names if helpful. Extract only what answers this specific question.`
+instruction = `\n\nFrom context answer specifically: ${query}`
 } else {
-instruction = `\n\nUsing the document context above, answer: ${query}. Be concise (1-3 sentences). Reference section names when helpful. Extract only what directly answers the question. Stay strictly within the document content.`
+instruction = `\n\nFrom context answer: ${query}`
 }
 return `DOCUMENT CONTEXT:\n${context}${instruction}`
 }
-
 function buildFallbackAnswerSF(query, hits) {
 if (!hits || hits.length === 0) return 'I could not find relevant information about this topic in your documents.'
 const subject = extractSubject(query)
@@ -284,7 +245,6 @@ return ensureSinglePeriod(`**${capFirst(subject)}**${sectionRef}: ${combined}.`)
 }
 return `I could not find specific information about "${capFirst(subject)}" in your documents.`
 }
-
 module.exports = {
 chunkStructuredDocument, buildInvertedIndexSF, retrieveChunksSF,
 buildSystemPromptSF, buildUserMessageSF, buildFallbackAnswerSF,
