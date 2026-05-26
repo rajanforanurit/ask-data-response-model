@@ -3,7 +3,7 @@ const {
 escapeRegex,capFirst,ensureSinglePeriod,trimToCompleteSentence,
 applySynonyms,normalizeQuery,extractSubject,extractUrlKeywords,
 normalizeTerms,extractFormulaFromText,computeNegativePenalty,
-CHUNK_SIZE,CHUNK_OVERLAP,MAX_HITS_GLOBAL,DOMAIN_SHORT_SAFELIST,
+MAX_HITS_GLOBAL,DOMAIN_SHORT_SAFELIST,
 } = require('./config')
 const stringSimilarity = require('string-similarity')
 const {levenshteinSimilarity} = require('./config')
@@ -160,7 +160,6 @@ const {bestMatch} = stringSimilarity.findBestMatch(wordLower, vocabulary)
 const levSim = levenshteinSimilarity(wordLower, bestMatch.target)
 const combinedScore = bestMatch.rating * 0.6 + levSim * 0.4
 if (combinedScore >= 0.72 && bestMatch.target !== wordLower) {
-console.log(`[DD:fuzzyCorrect] "${word}" -> "${bestMatch.target}" (score: ${combinedScore.toFixed(3)})`)
 return bestMatch.target
 }
 return word
@@ -287,7 +286,6 @@ if (topCandidates.length === 0 && pool.length > 0) topCandidates = pool.slice(0,
 if (topCandidates.length === 0 && !_isRetry) {
 const corrected = fuzzyCorrectQuery(query, chunks)
 if (corrected.toLowerCase() !== query.toLowerCase()) {
-console.log(`[DD] Self-healing retry with fuzzy-corrected query: "${corrected}"`)
 return retrieveChunksDD(corrected, chunks, topK, invertedIndex, true)
 }
 }
@@ -296,17 +294,13 @@ return topCandidates.slice(0, Math.min(topK, MAX_HITS_GLOBAL))
 }
 function buildSystemPromptDD(intent) {
 const intentRule = intent === 'definition'
-? `Definition: Bold measure name, one sentence definition only. No formula or calculation details.`
+? `Definition: Bold measure name, one sentence definition only.`
 : intent === 'calculation'
-? `Calculation: Output ONLY "**Formula for [Name]:** [formula]." No definition or description.`
+? `Calculation: Output ONLY "**Formula for [Name]:** [formula]."`
 : intent === 'comparison'
-? `Comparison: Bold each name. Write a concise definition for each. End with a "**Key Difference:**" sentence derived strictly from the context. Do not invent differences.`
-: `General: Answer directly in 2-4 sentences. Do not volunteer formulas or definitions unprompted.`
-return `You are a data dictionary assistant for a real estate analytics platform. Answer ONLY from context.
-Rules: Bold the subject with **Name**. Write complete sentences only. No pipe-delimited data. No double periods. No source references like [1]. No sheet references. Keep answers concise.
-If context lacks the answer, say: "I could not find this in your documents."
-Intent rule (highest priority): ${intentRule}
-Formats: Definition: "**[Name]** is [desc]." | Calculation: "**Formula for [Name]:** [formula]." | URL: return URL only. | Comparison: "**[A]:** [desc]. **[B]:** [desc]. **Key Difference:** [one sentence derived from context]."`
+? `Comparison: Bold each name. One definition each. End with "**Key Difference:**" from context only.`
+: `General: Answer in 2-4 sentences directly.`
+return `Data dictionary assistant. Answer ONLY from context. Bold subject. Complete sentences. No pipe characters. No source references.\nIf answer not in context say: "I could not find this in your documents."\n${intentRule}`
 }
 function buildContextDD(hits) {
 const seen = new Set()
@@ -318,7 +312,7 @@ if (deduped.length >= 8) break
 }
 return deduped.map((h,i) => {
 const limit = i === 0 ? 1200 : 900
-return `[Source ${i+1}]\n${(h.text || '').trim().slice(0,limit)}`
+return (h.text || '').trim().slice(0,limit)
 }).join('\n\n---\n\n')
 }
 function buildUserMessageDD(query, hits, intent) {
@@ -326,17 +320,17 @@ const context = buildContextDD(hits)
 const subject = extractSubject(query)
 let instruction = ''
 if (intent === 'definition') {
-instruction = `\n\nFrom the context, write a one-sentence definition of "${subject}". Bold the name. No formula or calculation. End with one period.`
+instruction = `\n\nFrom context: one-sentence definition of "${subject}". Bold the name.`
 } else if (intent === 'calculation') {
-instruction = `\n\nFrom the context, return only: "**Formula for ${capFirst(subject)}:** [formula]." No definition or description.`
+instruction = `\n\nFrom context: return only "**Formula for ${capFirst(subject)}:** [formula]."`
 } else if (intent === 'url_lookup') {
-instruction = `\n\nFrom the context, return only the full URL for "${extractUrlKeywords(query).join(' ')}".`
+instruction = `\n\nFrom context: return only the full URL for "${extractUrlKeywords(query).join(' ')}".`
 } else if (intent === 'all_urls') {
-instruction = `\n\nFrom the context, list ALL URLs. Format: name: URL. One per line.`
+instruction = `\n\nFrom context: list ALL URLs. Format: name: URL. One per line.`
 } else if (intent === 'comparison') {
-instruction = `\n\nFrom the context, compare: ${query}. Bold each name. Provide a concise definition for each based strictly on the context. End with a "**Key Difference:**" sentence that accurately reflects what the context says about these two items. Do not fabricate or assume differences. One period at end.`
+instruction = `\n\nFrom context compare: ${query}. Bold each name. End with "**Key Difference:**" from context only.`
 } else {
-instruction = `\n\nFrom the context, answer in clear sentences: ${query}. Answer only what was asked. No pipe characters. One period at end.`
+instruction = `\n\nFrom context answer: ${query}`
 }
 return `CONTEXT:\n${context}${instruction}`
 }
