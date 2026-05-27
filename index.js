@@ -6,11 +6,7 @@ const { BlobServiceClient } = require('@azure/storage-blob')
 const pdfParse = require('pdf-parse')
 const mammoth = require('mammoth')
 const XLSX = require('xlsx')
-const { parse: htmlParse } = require('node-html-parser')
-const yaml = require('js-yaml')
 const Papa = require('papaparse')
-const { simpleParser } = require('mailparser')
-const { parseOffice } = require('officeparser')
 const stringSimilarity = require('string-similarity')
 const crypto = require('crypto')
 const app = express()
@@ -62,37 +58,20 @@ const ASKDATA2_KEY = process.env.ASKDATA2_KEY || ''
 const ASKDATA2_MODEL = process.env.ASKDATA2_MODEL || 'ASKDATA2'
 const ASKDATA2_TIMEOUT_MS = parseInt(process.env.ASKDATA2_TIMEOUT_MS || '30000', 10)
 const ASKDATA2_REWRITE_TIMEOUT_MS = parseInt(process.env.ASKDATA2_REWRITE_TIMEOUT_MS || '8000', 10)
-const AZURE_EMBED_ENDPOINT = process.env.AZURE_EMBED_ENDPOINT || ''
-const AZURE_EMBED_KEY = process.env.AZURE_EMBED_KEY || ''
-const AZURE_EMBED_MODEL = process.env.AZURE_EMBED_MODEL || 'text-embedding-3-small'
-const EMBED_TIMEOUT_MS = parseInt(process.env.EMBED_TIMEOUT_MS || '10000', 10)
-const EMBED_POOL_LIMIT = parseInt(process.env.EMBED_POOL_LIMIT || '20', 10)
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10)
 const WARMUP_CLIENT_IDS = (process.env.WARMUP_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
-const RERANKER_ENDPOINT = process.env.RERANKER_ENDPOINT || ''
-const RERANKER_KEY = process.env.RERANKER_KEY || ''
-const RERANKER_TIMEOUT_MS = parseInt(process.env.RERANKER_TIMEOUT_MS || '8000', 10)
 const RAW_PREFIX = 'raw'
 const CHUNK_SIZE = 1200
 const CHUNK_OVERLAP = 2
+const POLICY_CHUNK_SIZE = 900
+const POLICY_CHUNK_OVERLAP = 150
 const BLOB_CONCURRENCY = parseInt(process.env.BLOB_CONCURRENCY || '8', 10)
 const CHUNK_CACHE_TTL = parseInt(process.env.CHUNK_CACHE_TTL_MS || '300000', 10)
 const MAX_HITS_GLOBAL = 50
 const blobServiceClient = AZURE_CONNECTION_STRING
 ? BlobServiceClient.fromConnectionString(AZURE_CONNECTION_STRING)
 : null
-const SUPPORTED_EXTENSIONS = new Set([
-'.pdf', '.docx', '.doc', '.txt', '.rtf', '.odt',
-'.xlsx', '.xls', '.ods', '.csv', '.tsv',
-'.pptx', '.ppt',
-'.html', '.htm', '.xml', '.md', '.markdown', '.rst',
-'.json', '.jsonl', '.yaml', '.yml', '.toml',
-'.py', '.js', '.ts', '.jsx', '.tsx',
-'.java', '.cpp', '.c', '.h', '.cs',
-'.go', '.rb', '.php', '.swift', '.kt',
-'.r', '.sql', '.sh', '.bash', '.ps1',
-'.epub', '.eml',
-])
+const SUPPORTED_EXTENSIONS = new Set(['.pdf', '.docx', '.xlsx', '.json', '.txt', '.csv'])
 const RESPONSE_CACHE = new Map()
 const RESPONSE_CACHE_TTL = 10 * 60 * 1000
 const RESPONSE_CACHE_MAX = 1000
@@ -120,6 +99,16 @@ const SYNONYM_MAP = [
 { pattern: /\bocc(upancy)?\s+formula\b/i, canonical: 'occupancy formula' },
 { pattern: /\blead\s+acq(uisition)?\s+cost\b/i, canonical: 'lead acquisition cost' },
 { pattern: /\blead\s+cost\b/i, canonical: 'lead acquisition cost' },
+{ pattern: /\bsec\s+dep(osit)?\b/i, canonical: 'security deposit' },
+{ pattern: /\bsec\.?\s+deposit\b/i, canonical: 'security deposit' },
+{ pattern: /\brent\s+inc\b/i, canonical: 'rent increase' },
+{ pattern: /\bnotice\s+per\b/i, canonical: 'notice period' },
+{ pattern: /\bnotice\s+req\b/i, canonical: 'notice requirement' },
+{ pattern: /\blate\s+fee\b/i, canonical: 'late payment fee' },
+{ pattern: /\bpenalty\s+clause\b/i, canonical: 'penalty clause' },
+{ pattern: /\bterm(ination)?\s+clause\b/i, canonical: 'termination clause' },
+{ pattern: /\beviction\s+proc\b/i, canonical: 'eviction procedure' },
+{ pattern: /\bmaint(enance)?\s+resp\b/i, canonical: 'maintenance responsibility' },
 ]
 function applySynonyms(query) {
 let q = query
@@ -129,37 +118,29 @@ q = q.replace(pattern, canonical)
 return q
 }
 const TYPO_MAP = {
-ehat: 'what',
-waht: 'what',
-whta: 'what',
-whar: 'what',
-hwo: 'how',
-hoe: 'how',
-difine: 'define',
-definr: 'define',
-defien: 'define',
-defne: 'define',
-deifne: 'define',
-expain: 'explain',
-expalin: 'explain',
-explian: 'explain',
-wht: 'what',
-shwo: 'show',
-lsit: 'list',
-lits: 'list',
+ehat: 'what', waht: 'what', whta: 'what', whar: 'what',
+hwo: 'how', hoe: 'how',
+difine: 'define', definr: 'define', defien: 'define', defne: 'define', deifne: 'define',
+expain: 'explain', expalin: 'explain', explian: 'explain',
+wht: 'what', shwo: 'show', lsit: 'list', lits: 'list',
+polcy: 'policy', policiy: 'policy', poilcy: 'policy',
+tennant: 'tenant', tennat: 'tenant', tentant: 'tenant',
+lanlord: 'landlord', landord: 'landlord',
+rentel: 'rental', rentl: 'rental',
+leas: 'lease', laese: 'lease',
+deposite: 'deposit', depoist: 'deposit',
+notise: 'notice', noice: 'notice',
+terminaton: 'termination', termiantion: 'termination',
+maintenence: 'maintenance', maintanence: 'maintenance',
 }
 function applyTypos(query) {
-return query
-.split(/\s+/)
-.map(w => {
+return query.split(/\s+/).map(w => {
 const lower = w.toLowerCase()
 return TYPO_MAP[lower] !== undefined ? TYPO_MAP[lower] : w
-})
-.join(' ')
+}).join(' ')
 }
 function levenshteinDistance(a, b) {
-const m = a.length
-const n = b.length
+const m = a.length, n = b.length
 const dp = Array.from({ length: m + 1 }, (_, i) => Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0)))
 for (let i = 1; i <= m; i++) {
 for (let j = 1; j <= n; j++) {
@@ -176,9 +157,7 @@ const dist = levenshteinDistance(a.toLowerCase(), b.toLowerCase())
 return 1 - dist / Math.max(a.length, b.length)
 }
 function normalizeQueryForCache(query) {
-return applySynonyms(query)
-.toLowerCase()
-.trim()
+return applySynonyms(query).toLowerCase().trim()
 .replace(/\bweek\s+(\d)\b/g, (_, n) => `week 0${n}`)
 .replace(/^(what\s+is\s+(the\s+)?(definition|meaning)\s+(of|for|to)\s+)/i, '')
 .replace(/^(define\s+(the\s+)?)/i, '')
@@ -190,8 +169,7 @@ return applySynonyms(query)
 .replace(/^(describe\s+(the\s+|me\s+)?)/i, '')
 .replace(/^(meaning\s+of\s+(the\s+)?)/i, '')
 .replace(/[?!.]+$/, '')
-.replace(/\s+/g, ' ')
-.trim()
+.replace(/\s+/g, ' ').trim()
 }
 function getCacheKey(clientId, query) {
 return `${clientId}:${normalizeQueryForCache(query)}`
@@ -217,9 +195,7 @@ tryRun()
 })
 }
 function drainAskedataQueue() {
-if (askedataQueue.length > 0 && askedataActiveCount < ASKDATA_MAX_CONCURRENT) {
-askedataQueue.shift()()
-}
+if (askedataQueue.length > 0 && askedataActiveCount < ASKDATA_MAX_CONCURRENT) askedataQueue.shift()()
 }
 let askedataFailures = 0
 let askedataBlockedUntil = 0
@@ -231,10 +207,7 @@ return false
 function askedataRecordSuccess() { askedataFailures = 0; askedataBlockedUntil = 0 }
 function askedataRecordFailure() {
 askedataFailures++
-if (askedataFailures >= 3) {
-askedataBlockedUntil = Date.now() + 30000
-console.error('[ASKDATA] Circuit breaker OPEN for 30s')
-}
+if (askedataFailures >= 3) { askedataBlockedUntil = Date.now() + 30000; console.error('[ASKDATA] Circuit breaker OPEN for 30s') }
 }
 async function fetchWithTimeout(url, options, timeoutMs) {
 const controller = new AbortController()
@@ -252,33 +225,12 @@ function withRequestTimeout(fn, timeoutMs = REQUEST_TIMEOUT_MS) {
 return async (req, res, next) => {
 let settled = false
 const timer = setTimeout(() => {
-if (!settled) {
-settled = true
-if (!res.headersSent) res.status(503).json({ error: 'Request timed out. Please try again.' })
-}
+if (!settled) { settled = true; if (!res.headersSent) res.status(503).json({ error: 'Request timed out. Please try again.' }) }
 }, timeoutMs)
-try {
-await fn(req, res, next)
-} catch (err) {
-if (!settled) next(err)
-} finally {
-settled = true
-clearTimeout(timer)
+try { await fn(req, res, next) } catch (err) { if (!settled) next(err) } finally { settled = true; clearTimeout(timer) }
 }
 }
-}
-function escapeRegex(str) {
-return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-function cosineSim(a, b) {
-let dot = 0, normA = 0, normB = 0
-for (let i = 0; i < a.length; i++) {
-dot += a[i] * b[i]
-normA += a[i] * a[i]
-normB += b[i] * b[i]
-}
-return dot / (Math.sqrt(normA) * Math.sqrt(normB) + 1e-9)
-}
+function escapeRegex(str) { return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }
 function buildInvertedIndex(chunks) {
 const index = new Map()
 for (let i = 0; i < chunks.length; i++) {
@@ -292,12 +244,9 @@ index.get(w).add(i)
 return index
 }
 function normalizeQuery(query) {
-return applySynonyms(query)
-.toLowerCase()
-.trim()
+return applySynonyms(query).toLowerCase().trim()
 .replace(/\bweek\s+(\d)\b/g, (_, n) => `week 0${n}`)
-.replace(/[?!.]+$/, '')
-.replace(/\s+/g, ' ')
+.replace(/[?!.]+$/, '').replace(/\s+/g, ' ')
 }
 function validateQuery(query) {
 if (!query || typeof query !== 'string') return { valid: false, message: 'Please enter a complete question to get an accurate answer.' }
@@ -306,6 +255,22 @@ if (trimmed.length <= 1) return { valid: false, message: 'Please enter a complet
 const words = trimmed.split(/\s+/).filter(w => w.length > 0)
 if (words.length < 2) return { valid: false, message: 'Please enter a more detailed question so I can provide an accurate answer.' }
 return { valid: true }
+}
+function detectDocumentType(chunks) {
+if (!chunks || chunks.length === 0) return 'mixed'
+let policySignals = 0, dictSignals = 0
+const sample = chunks.slice(0, Math.min(50, chunks.length))
+for (const c of sample) {
+const t = (c.text || '').toLowerCase()
+if (c.metadata && (c.metadata.measure || c.metadata.formula !== undefined)) dictSignals += 3
+if (/\b(shall|must|tenant|landlord|lessee|lessor|clause|section|article|policy|agreement|herein|thereof|pursuant|notwithstanding|whereas|hereby)\b/.test(t)) policySignals++
+if (/\b(rent|lease|deposit|notice|termination|eviction|maintenance|penalty|breach|obligation|liability)\b/.test(t)) policySignals++
+if (/\b(is defined as|formula|calculated as|computed as|measure|attribute|kpi|metric)\b/.test(t)) dictSignals++
+if (/^\d+\.\d+\s+[A-Z]/.test(c.text || '') || /^(Section|Article|Clause)\s+\d+/i.test(c.text || '')) policySignals += 2
+}
+if (policySignals > dictSignals * 1.5) return 'policy'
+if (dictSignals > policySignals * 1.5) return 'dictionary'
+return 'mixed'
 }
 function detectQueryIntent(query) {
 const q = normalizeQuery(query)
@@ -317,6 +282,20 @@ if (
 /what\s+is\s+the\s+(formula|calculation)\s+for/i.test(q) ||
 /how\s+do\s+you\s+(calculate|compute)/i.test(q)
 ) return 'calculation'
+if (
+/\b(what\s+(happens|is\s+the\s+penalty|is\s+the\s+consequence|are\s+the\s+consequences)|penalty|consequence|breach|violation|non.compliance)\b/i.test(q)
+) return 'policy_consequence'
+if (
+/\b(allowed|permitted|can\s+(tenant|landlord|i)|is\s+it\s+allowed|may\s+(tenant|landlord)|right\s+to|entitled\s+to|allowed\s+to)\b/i.test(q)
+) return 'policy_permission'
+if (
+/\b(how\s+(many|much|long|often)|duration|period|days|months|amount|limit|maximum|minimum|deadline)\b/i.test(q) &&
+/\b(notice|deposit|rent|fee|penalty|maintenance|payment)\b/i.test(q)
+) return 'policy_numeric'
+if (
+/\b(what\s+is\s+the\s+(policy|rule|procedure|process|requirement|condition|clause|term)|explain\s+the\s+(policy|rule|clause|condition))\b/i.test(q) ||
+/\b(policy|clause|rule|requirement|condition|obligation|responsibility|procedure)\b/i.test(q)
+) return 'policy_lookup'
 if (
 /^(what\s+is\s+(the\s+)?(definition|meaning)\s+(of|for|to)\s+)/i.test(q) ||
 /^(define\s+(the\s+)?)/i.test(q) ||
@@ -454,17 +433,10 @@ if (m && m[1] && m[1].trim().length > 3) return m[1].trim()
 return ''
 }
 const NEGATIVE_PAIRS = [
-['non-recurring', 'recurring'],
-['non recurring', 'recurring'],
-['denied', 'approved'],
-['inactive', 'active'],
-['rejected', 'accepted'],
-['unapproved', 'approved'],
-['unpaid', 'paid'],
-['cancelled', 'active'],
-['canceled', 'active'],
-['delinquent', 'current'],
-['non-', ''],
+['non-recurring', 'recurring'], ['non recurring', 'recurring'], ['denied', 'approved'],
+['inactive', 'active'], ['rejected', 'accepted'], ['unapproved', 'approved'],
+['unpaid', 'paid'], ['cancelled', 'active'], ['canceled', 'active'],
+['delinquent', 'current'], ['non-', ''],
 ]
 function computeNegativePenalty(querySubject, chunkText) {
 const qs = querySubject.toLowerCase()
@@ -475,14 +447,10 @@ if (posTerm === null || posTerm === undefined) continue
 const queryHasPositive = posTerm.length > 0 && new RegExp(`\\b${escapeRegex(posTerm)}\\b`, 'i').test(qs)
 const queryHasNegative = new RegExp(`\\b${escapeRegex(negTerm)}\\b`, 'i').test(qs)
 if (queryHasPositive && !queryHasNegative) {
-if (new RegExp(`\\b${escapeRegex(negTerm)}\\b`, 'i').test(ct)) {
-penalty += 30
-}
+if (new RegExp(`\\b${escapeRegex(negTerm)}\\b`, 'i').test(ct)) penalty += 30
 }
 if (queryHasNegative) {
-if (posTerm.length > 0 && !new RegExp(`\\b${escapeRegex(negTerm)}\\b`, 'i').test(ct) && new RegExp(`\\b${escapeRegex(posTerm)}\\b`, 'i').test(ct)) {
-penalty += 20
-}
+if (posTerm.length > 0 && !new RegExp(`\\b${escapeRegex(negTerm)}\\b`, 'i').test(ct) && new RegExp(`\\b${escapeRegex(posTerm)}\\b`, 'i').test(ct)) penalty += 20
 }
 }
 return penalty
@@ -509,6 +477,7 @@ const DOMAIN_SHORT_SAFELIST = new Set([
 'base', 'gross', 'net', 'avg', 'sum', 'min', 'max', 'ytd', 'mtd', 'per', 'fee',
 'tax', 'due', 'paid', 'void', 'open', 'loss', 'gain', 'flow', 'days', 'beds',
 'bath', 'sqft', 'tier', 'band', 'code', 'flag', 'rank', 'sort', 'key', 'ref',
+'clause', 'rule', 'policy', 'lease', 'notice', 'deposit', 'penalty', 'breach',
 ])
 function fuzzyCorrectQuery(query, chunks) {
 if (!chunks || chunks.length === 0) return query
@@ -526,7 +495,7 @@ const { bestMatch } = stringSimilarity.findBestMatch(wordLower, vocabulary)
 const levSim = levenshteinSimilarity(wordLower, bestMatch.target)
 const combinedScore = bestMatch.rating * 0.6 + levSim * 0.4
 if (combinedScore >= 0.72 && bestMatch.target !== wordLower) {
-console.log(`[fuzzyCorrect] "${word}" → "${bestMatch.target}" (combined: ${combinedScore.toFixed(3)}, trigram: ${bestMatch.rating.toFixed(3)}, lev: ${levSim.toFixed(3)})`)
+console.log(`[fuzzyCorrect] "${word}" → "${bestMatch.target}" (combined: ${combinedScore.toFixed(3)})`)
 return bestMatch.target
 }
 return word
@@ -539,7 +508,7 @@ const words = trimmed.split(/\s+/).filter(Boolean)
 if (words.length <= 2) return true
 if (/[^\x00-\x7F]/.test(trimmed) && words.length < 5) return true
 if (/(.)\1{3,}/.test(trimmed)) return true
-const commonTypos = /\b(ocupan|occup[ae]ncy|occupncy|appl?ic|applicton|applcation|leas[ei]|tennat|tentant|vacnt|vacanc|porperty|proprty|reveneu|revenu[^e]|anuall|anual|montly|mounthly|efftive|efective|efftiv|ehat|difine|definr)\b/i
+const commonTypos = /\b(ocupan|occup[ae]ncy|occupncy|appl?ic|applicton|applcation|leas[ei]|tennat|tentant|vacnt|vacanc|porperty|proprty|reveneu|revenu[^e]|anuall|anual|montly|mounthly|efftive|efective|efftiv|ehat|difine|definr|polcy|tennant|deposite)\b/i
 if (commonTypos.test(trimmed)) return true
 if (words.length < 4 && !/\b(what|how|define|explain|formula|calculate|list|show|find|url|link)\b/i.test(trimmed)) return true
 const hasNoVerb = !/\b(is|are|was|were|what|how|why|when|where|who|define|explain|calculate|show|list|find|get|give|tell)\b/i.test(trimmed)
@@ -563,7 +532,7 @@ model: ASKDATA2_MODEL,
 messages: [
 {
 role: 'system',
-content: 'You are a query rewriter for a real estate analytics data dictionary RAG system. Fix spelling, grammar, ambiguity, and structure. Expand abbreviations (app→application, occ→occupancy). Normalize week numbers (week 5→week 05). Return ONLY the rewritten query as plain text. No explanation. If already correct, return unchanged.',
+content: 'You are a query rewriter for a document RAG system that handles real estate data dictionaries and building rent/lease policy documents. Fix spelling, grammar, ambiguity, and structure. Expand abbreviations (app→application, occ→occupancy, sec dep→security deposit, notice per→notice period). Normalize week numbers (week 5→week 05). Return ONLY the rewritten query as plain text. No explanation. If already correct, return unchanged.',
 },
 { role: 'user', content: query },
 ],
@@ -591,6 +560,680 @@ return query
 async function preprocessQuery(query) {
 if (!needsQueryRewrite(query)) return query
 return rewriteQueryWithAskdata2(query)
+}
+function expandQueryForPolicy(query) {
+const q = query.toLowerCase()
+const expansions = []
+if (/\bsecurity\s+deposit\b/.test(q)) expansions.push('security deposit refund return conditions deduction')
+if (/\bnotice\s+period\b/.test(q) || /\bnotice\s+to\s+(vacate|quit|terminate)\b/.test(q)) expansions.push('notice period days written termination vacate')
+if (/\blate\s+(fee|payment|rent)\b/.test(q)) expansions.push('late fee penalty grace period overdue payment')
+if (/\btermination\b/.test(q) || /\bend\s+of\s+lease\b/.test(q)) expansions.push('termination clause early termination penalty break lease')
+if (/\bmaintenance\b/.test(q) || /\brepair\b/.test(q)) expansions.push('maintenance repair responsibility landlord tenant obligation')
+if (/\beviction\b/.test(q)) expansions.push('eviction process procedure notice breach non-payment')
+if (/\brent\s+increase\b/.test(q) || /\bescalation\b/.test(q)) expansions.push('rent increase escalation annual percentage notice')
+if (/\bpet\b/.test(q)) expansions.push('pet policy allowed permitted deposit fee')
+if (/\bsublease\b/.test(q) || /\bsublet\b/.test(q)) expansions.push('sublease sublet permission consent landlord approval')
+if (/\brenewal\b/.test(q)) expansions.push('lease renewal term extension option notice')
+if (expansions.length === 0) return query
+return query + ' ' + expansions.join(' ')
+}
+function computeBM25Score(queryTerms, chunkText, avgChunkLen, k1 = 1.5, b = 0.75) {
+const text = chunkText.toLowerCase()
+const words = text.replace(/[^\w\s]/g, ' ').split(/\s+/)
+const docLen = words.length
+const termFreq = {}
+for (const w of words) { termFreq[w] = (termFreq[w] || 0) + 1 }
+let score = 0
+for (const term of queryTerms) {
+const tf = termFreq[term] || 0
+if (tf === 0) continue
+const idfApprox = 1.5
+const tfNorm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * docLen / avgChunkLen))
+score += idfApprox * tfNorm
+}
+return score
+}
+function computePolicyRelevanceScore(query, chunkText, intent) {
+const q = query.toLowerCase()
+const t = chunkText.toLowerCase()
+let score = 0
+const POLICY_SIGNAL_TERMS = ['shall', 'must', 'may', 'tenant', 'landlord', 'lessee', 'lessor', 'pursuant', 'hereby', 'thereof', 'herein', 'notwithstanding', 'whereas', 'obligation', 'liability', 'clause', 'section', 'article']
+const policyTermCount = POLICY_SIGNAL_TERMS.filter(term => t.includes(term)).length
+score += policyTermCount * 2
+if (intent === 'policy_consequence') {
+if (/\b(penalty|penalt|consequence|liable|breach|default|eviction|forfeit|charge|fine)\b/.test(t)) score += 20
+if (/\b(shall|must|will)\s+(pay|be\s+subject|result|face)\b/.test(t)) score += 15
+}
+if (intent === 'policy_permission') {
+if (/\b(permitted|allowed|may|shall\s+not|must\s+not|prohibited|forbidden|cannot|restricted)\b/.test(t)) score += 20
+if (/\b(right\s+to|entitled\s+to|subject\s+to\s+approval)\b/.test(t)) score += 15
+}
+if (intent === 'policy_numeric') {
+if (/\b\d+\s*(days?|months?|years?|weeks?|percent|%)\b/.test(t)) score += 25
+if (/\b(within|at\s+least|no\s+more\s+than|not\s+less\s+than|not\s+exceed)\b/.test(t)) score += 15
+}
+if (intent === 'policy_lookup' || intent === 'policy_consequence' || intent === 'policy_permission' || intent === 'policy_numeric') {
+const hasHeading = /^(section|article|clause|\d+\.\d+)/im.test(chunkText)
+if (hasHeading) score += 10
+if (chunkText.trim().length > 200 && chunkText.trim().length < 1000) score += 5
+}
+return score
+}
+function lightweightRerank(query, chunks, intent, docType) {
+if (chunks.length === 0) return chunks
+const queryLower = query.toLowerCase()
+const queryTerms = queryLower.replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 2)
+const totalLen = chunks.reduce((sum, c) => sum + (c.text || '').split(/\s+/).length, 0)
+const avgChunkLen = totalLen / chunks.length || 100
+const isPolicyQuery = ['policy_lookup', 'policy_consequence', 'policy_permission', 'policy_numeric'].includes(intent)
+return chunks.map(c => {
+const text = c.text || ''
+const bm25 = computeBM25Score(queryTerms, text, avgChunkLen)
+let rerankScore = bm25 * 10
+if (docType === 'policy' || isPolicyQuery) {
+rerankScore += computePolicyRelevanceScore(query, text, intent)
+}
+if (c.metadata) {
+if (c.metadata.section_heading) {
+const headingLower = (c.metadata.section_heading || '').toLowerCase()
+const headingTermMatches = queryTerms.filter(t => headingLower.includes(t)).length
+rerankScore += headingTermMatches * 8
+}
+if (c.metadata.is_definition_chunk) rerankScore += (intent === 'definition' ? 12 : 0)
+if (c.metadata.is_clause_chunk) rerankScore += (isPolicyQuery ? 12 : 0)
+if (c.metadata.chunk_position === 'early' && (intent === 'definition' || intent === 'policy_lookup')) rerankScore += 3
+}
+const queryPhraseRegex = new RegExp(escapeRegex(queryLower.slice(0, 30)), 'i')
+if (queryPhraseRegex.test(text)) rerankScore += 8
+const sentenceCount = (text.match(/[.!?]+/g) || []).length
+if (sentenceCount >= 2 && sentenceCount <= 8) rerankScore += 3
+return { ...c, _rerankScore: rerankScore, _score: (c._score || 0) + rerankScore * 0.3 }
+}).sort((a, b) => b._rerankScore - a._rerankScore)
+}
+function scoreHeaderMatch(header, patterns) {
+const h = header.toLowerCase().trim()
+for (const [regex, score] of patterns) {
+if (regex.test(h)) return score
+}
+return 0
+}
+function detectColumns(headers) {
+const NAME_PATTERNS = [
+[/\b(measure|attribute|field|metric|kpi)\s*name\b/, 100],
+[/^name$/, 90], [/report.?name/i, 85], [/\bname\b/, 70], [/\btitle\b/, 50],
+]
+const TABLE_PATTERNS = [
+[/\b(table|module|category|group|domain|section|workspace)\b/, 100], [/^table$/, 90],
+]
+const DESC_PATTERNS = [
+[/\b(description|desc|definition|about|summary|detail)\b/, 100], [/^desc$/, 90],
+]
+const FORMULA_PATTERNS = [
+[/\b(formula|calculation|calc|how\s+calculated|computed\s+as)\b/, 100], [/^formula$/, 90],
+]
+const URL_PATTERNS = [[/\b(url|link|href|report\s+link|dashboard)\b/, 100]]
+const ADDITIONAL_PATTERNS = [[/\b(additional|extra|notes?|info|configuration|config|mdm)\b/, 100]]
+const colIdx = {}
+const scored = headers.map((h, i) => ({
+i,
+table: scoreHeaderMatch(h, TABLE_PATTERNS),
+name: scoreHeaderMatch(h, NAME_PATTERNS),
+description: scoreHeaderMatch(h, DESC_PATTERNS),
+formula: scoreHeaderMatch(h, FORMULA_PATTERNS),
+url: scoreHeaderMatch(h, URL_PATTERNS),
+additional: scoreHeaderMatch(h, ADDITIONAL_PATTERNS),
+}))
+for (const field of ['table', 'name', 'description', 'formula', 'url', 'additional']) {
+const best = scored.filter(c => c[field] > 0).sort((a, b) => b[field] - a[field])[0]
+if (best) colIdx[field] = best.i
+}
+if (colIdx.url !== undefined && colIdx.name === undefined) {
+const usedIdx = new Set(Object.values(colIdx))
+for (let i = 0; i < headers.length; i++) {
+if (!usedIdx.has(i) && headers[i].trim()) { colIdx.name = i; break }
+}
+}
+return colIdx
+}
+function extractSpreadsheet(buffer) {
+const workbook = XLSX.read(buffer, { type: 'buffer', cellNF: true })
+const rows = []
+for (const sheetName of workbook.SheetNames) {
+const sheet = workbook.Sheets[sheetName]
+const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: '', header: 1, raw: false })
+if (!rawRows.length) continue
+let headerRowIdx = -1
+for (let i = 0; i < Math.min(15, rawRows.length); i++) {
+const cells = rawRows[i].map(c => String(c).trim()).filter(Boolean)
+if (cells.length < 2) continue
+if (cells.length === 1 && cells[0].length > 60) continue
+const shortCells = cells.filter(c => c.length <= 60)
+if (shortCells.length >= 2) { headerRowIdx = i; break }
+}
+if (headerRowIdx === -1) headerRowIdx = 0
+const rawHeaders = rawRows[headerRowIdx].map(h => String(h).trim())
+const headers = []
+let lastNonBlank = ''
+for (const h of rawHeaders) {
+if (h !== '') { lastNonBlank = h; headers.push(h) }
+else headers.push(lastNonBlank || `Col${headers.length + 1}`)
+}
+const colIdx = detectColumns(headers)
+let rowsEmitted = 0
+for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
+const row = rawRows[i]
+if (!row.some(cell => String(cell).trim() !== '')) continue
+const cells = row.map(cell => String(cell || '').replace(/\r?\n/g, ' ').trim())
+const nameVal = colIdx.name !== undefined ? (cells[colIdx.name] || '').trim() : ''
+const tableVal = colIdx.table !== undefined ? (cells[colIdx.table] || '').trim() : sheetName
+const descVal = colIdx.description !== undefined ? (cells[colIdx.description] || '').trim() : ''
+const urlVal = colIdx.url !== undefined ? (cells[colIdx.url] || '').trim() : ''
+const additionalVal = colIdx.additional !== undefined ? (cells[colIdx.additional] || '').trim() : ''
+let formulaVal = colIdx.formula !== undefined ? (cells[colIdx.formula] || '').trim() : ''
+if (!formulaVal && descVal) {
+const formulaPatterns = [/(.*?\/.*?)/i, /(=.*?)/i, /(calculated\s+as.*)/i, /(computed\s+as.*)/i, /(divided\s+by.*)/i, /(multiplied\s+by.*)/i, /(sum\s+of.*)/i]
+for (const pattern of formulaPatterns) {
+const match = descVal.match(pattern)
+if (match && match[0].trim().length > 3) { formulaVal = match[0].trim(); break }
+}
+}
+if (nameVal) {
+let synthesis = `${nameVal}`
+if (tableVal && tableVal !== sheetName) synthesis += ` (${tableVal})`
+if (descVal) synthesis += ` is defined as: ${descVal}`
+if (formulaVal && !descVal.toLowerCase().includes(formulaVal.toLowerCase())) synthesis += `. Formula: ${formulaVal}`
+if (additionalVal) synthesis += `. Additional Info: ${additionalVal}`
+if (urlVal) synthesis += `. URL: ${urlVal}`
+rows.push({
+text: synthesis,
+metadata: { measure: nameVal, table: tableVal || sheetName, formula: formulaVal || '', description: descVal || '', url: urlVal || '', sourceSheet: sheetName }
+})
+if (formulaVal) {
+rows.push({ text: `How to calculate ${nameVal}: ${formulaVal}`, metadata: { measure: nameVal, table: tableVal || sheetName, formula: formulaVal, description: descVal || '', url: '', sourceSheet: sheetName } })
+rows.push({ text: `Formula for ${nameVal}: ${formulaVal}`, metadata: { measure: nameVal, table: tableVal || sheetName, formula: formulaVal, description: descVal || '', url: '', sourceSheet: sheetName } })
+}
+if (urlVal) {
+rows.push({ text: `Report URL for ${nameVal}: ${urlVal}`, metadata: { measure: nameVal, table: tableVal || sheetName, formula: '', description: '', url: urlVal, sourceSheet: sheetName } })
+rows.push({ text: `Power BI link for ${nameVal}: ${urlVal}`, metadata: { measure: nameVal, table: tableVal || sheetName, formula: '', description: '', url: urlVal, sourceSheet: sheetName } })
+if (tableVal && tableVal !== sheetName) {
+rows.push({ text: `Report URL for ${nameVal} (${tableVal}): ${urlVal}`, metadata: { measure: nameVal, table: tableVal, formula: '', description: '', url: urlVal, sourceSheet: sheetName } })
+}
+}
+rowsEmitted++
+} else if (descVal) {
+rows.push({ text: descVal, metadata: { measure: '', table: tableVal || sheetName, formula: '', description: descVal, url: '', sourceSheet: sheetName } })
+}
+}
+if (rowsEmitted === 0) {
+for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
+const row = rawRows[i]
+const cells = row.map(c => String(c || '').trim()).filter(Boolean)
+if (cells.length) rows.push({ text: cells.join(' | '), metadata: { measure: '', table: sheetName, formula: '', description: '', url: '', sourceSheet: sheetName } })
+}
+}
+}
+return rows
+}
+function keywordSearch(query, chunks, topK, intent, invertedIndex) {
+const subject = extractSubject(query)
+const subjectWords = subject.toLowerCase().split(/\s+/).filter(w => w.length > 1)
+const queryLower = normalizeQuery(query)
+const isMultiWord = subjectWords.length > 1
+const subjectPhraseRegex = isMultiWord
+? new RegExp(escapeRegex(subject.toLowerCase()), 'i')
+: new RegExp(`\\b${escapeRegex(subject.toLowerCase())}\\b`, 'i')
+let candidateIndices
+if (invertedIndex && subjectWords.length > 0) {
+const wordsToIndex = intent === 'url_lookup' ? extractUrlKeywords(query) : subjectWords
+const union = new Set()
+for (const w of wordsToIndex) {
+for (const idx of (invertedIndex.get(w) || new Set())) union.add(idx)
+for (const variant of normalizeTerms(w)) {
+for (const idx of (invertedIndex.get(variant) || new Set())) union.add(idx)
+}
+}
+if (intent === 'url_lookup') {
+for (const w of ['url', 'link', 'https', 'http', 'powerbi', 'app']) {
+for (const idx of (invertedIndex.get(w) || new Set())) union.add(idx)
+}
+}
+candidateIndices = union
+}
+const source = candidateIndices
+? [...candidateIndices].map(i => chunks[i]).filter(Boolean)
+: chunks.slice(0, 200)
+return source.map(c => {
+const text = (c.text || '').toLowerCase()
+let score = 0
+if (intent === 'all_urls') {
+if (!text.includes('http')) return { ...c, _score: 0 }
+return { ...c, _score: 10 }
+}
+if (intent === 'url_lookup') {
+if (!text.includes('http')) return { ...c, _score: 0 }
+const kws = extractUrlKeywords(query)
+const matched = kws.filter(w => text.includes(w)).length
+if (matched === 0) return { ...c, _score: 0 }
+score += matched * 10
+if (text.includes(kws.join(' '))) score += 15
+} else {
+const phraseFound = subjectPhraseRegex.test(c.text || '')
+if (phraseFound) {
+score += subjectWords.length * 6
+if (new RegExp(`\\|\\s*${escapeRegex(subject.toLowerCase())}\\s*\\|`, 'i').test(c.text || '')) score += subjectWords.length * 4
+if (new RegExp(`\\b${escapeRegex(subject.toLowerCase())}\\b[\\s\\S]{0,30}(is defined as|is calculated as|formula:|shall|must|means)`, 'i').test(c.text || '')) score += subjectWords.length * 8
+}
+const wordCoverage = subjectWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(c.text || '')).length
+score += wordCoverage * 2
+if (new RegExp(`\\b${escapeRegex(queryLower)}\\b`, 'i').test(c.text || '')) score += 3
+if (subjectPhraseRegex.test(c.text || '')) score += 4
+if (intent === 'calculation') {
+if (/\bformula\b/i.test(text)) score += 15
+if (/\bcalculated as\b/i.test(text)) score += 10
+if (/\bcomputed as\b/i.test(text)) score += 10
+if (text.includes('=')) score += 8
+if (text.includes('/')) score += 5
+if (/\bhow to calculate\b/i.test(text)) score += 12
+if (/\bformula for\b/i.test(text)) score += 12
+}
+if (intent === 'policy_consequence') {
+if (/\b(penalty|penalt|consequence|liable|breach|default|eviction|forfeit|charge|fine|shall\s+pay)\b/i.test(text)) score += 20
+}
+if (intent === 'policy_permission') {
+if (/\b(permitted|allowed|may\s+(not)?|shall\s+not|must\s+not|prohibited|forbidden|cannot|restricted)\b/i.test(text)) score += 20
+}
+if (intent === 'policy_numeric') {
+if (/\b\d+\s*(days?|months?|years?|weeks?|percent|%)\b/i.test(text)) score += 20
+if (/\b(within|at\s+least|no\s+more\s+than|not\s+less\s+than)\b/i.test(text)) score += 10
+}
+if (intent === 'policy_lookup' || intent === 'policy_consequence' || intent === 'policy_permission' || intent === 'policy_numeric') {
+if (c.metadata && c.metadata.section_heading) {
+const headingLower = (c.metadata.section_heading || '').toLowerCase()
+if (subjectWords.some(w => headingLower.includes(w))) score += 25
+}
+if (/\b(shall|must|tenant|landlord|lessee|lessor|pursuant|clause|section|article|agreement)\b/i.test(text)) score += 8
+}
+if (c.metadata && c.metadata.measure) {
+const measureLower = (c.metadata.measure || '').toLowerCase().trim()
+if (measureLower === subject.toLowerCase().trim()) score += 100
+else if (subjectWords.some(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(measureLower))) score += 10
+}
+const penalty = computeNegativePenalty(subject, c.text || '')
+score -= penalty
+}
+return { ...c, _score: score }
+}).filter(c => c._score > 0).sort((a, b) => b._score - a._score).slice(0, topK)
+}
+function relaxedKeywordSearch(query, chunks, topK, invertedIndex) {
+const subject = extractSubject(query)
+const allWords = [
+...subject.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1),
+...query.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 2),
+]
+const uniqueWords = [...new Set(allWords)]
+const union = new Set()
+if (invertedIndex) {
+for (const w of uniqueWords) {
+for (const idx of (invertedIndex.get(w) || new Set())) union.add(idx)
+for (const variant of normalizeTerms(w)) {
+for (const idx of (invertedIndex.get(variant) || new Set())) union.add(idx)
+}
+}
+}
+const source = union.size > 0 ? [...union].map(i => chunks[i]).filter(Boolean) : chunks.slice(0, 300)
+return source.map(c => {
+const text = (c.text || '').toLowerCase()
+const matched = uniqueWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(text)).length
+const subjectMatch = subject.length > 2 && new RegExp(`\\b${escapeRegex(subject.toLowerCase())}\\b`, 'i').test(text) ? 5 : 0
+let metaBoost = 0
+if (c.metadata && c.metadata.measure) {
+const ml = c.metadata.measure.toLowerCase()
+if (ml === subject.toLowerCase().trim()) metaBoost += 50
+else {
+const subjectMatched = uniqueWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(ml)).length
+metaBoost = subjectMatched * 3
+}
+}
+if (c.metadata && c.metadata.section_heading) {
+const headingLower = (c.metadata.section_heading || '').toLowerCase()
+const headingMatched = uniqueWords.filter(w => headingLower.includes(w)).length
+metaBoost += headingMatched * 5
+}
+const penalty = computeNegativePenalty(subject, c.text || '')
+return { ...c, _score: Math.max(0, matched + subjectMatch + metaBoost - penalty) }
+}).filter(c => c._score > 0).sort((a, b) => b._score - a._score).slice(0, topK)
+}
+async function retrieveChunks(query, chunks, topK, invertedIndex, docType, _isRetry = false) {
+const intent = detectQueryIntent(query)
+const isPolicyIntent = ['policy_lookup', 'policy_consequence', 'policy_permission', 'policy_numeric'].includes(intent)
+let searchQuery = normalizeQuery(query).replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
+if (isPolicyIntent || docType === 'policy' || docType === 'mixed') {
+searchQuery = expandQueryForPolicy(searchQuery)
+}
+const MAX_HITS = MAX_HITS_GLOBAL
+if (intent === 'all_urls') {
+return chunks.filter(c => /https?:\/\/\S+/.test(c.text || '')).slice(0, 100)
+}
+const candidates = keywordSearch(searchQuery, chunks, Math.min(150, chunks.length), intent, invertedIndex)
+const pool = candidates.length > 0 ? candidates : chunks.slice(0, 150)
+const topScore = pool[0]?._score || 0
+let topCandidates = []
+if (topScore >= 6) topCandidates = pool.slice(0, Math.min(MAX_HITS, pool.length))
+else if ((intent === 'definition' || intent === 'calculation') && topScore >= 3) topCandidates = pool.slice(0, Math.min(MAX_HITS, pool.length))
+else if (isPolicyIntent && topScore >= 2) topCandidates = pool.slice(0, Math.min(MAX_HITS, pool.length))
+else if (intent === 'url_lookup' && pool.length > 0) return pool.slice(0, Math.min(topK, 6))
+if (topCandidates.length === 0 && !_isRetry) {
+const corrected = fuzzyCorrectQuery(query, chunks)
+if (corrected.toLowerCase() !== query.toLowerCase()) {
+console.log(`[QueryPipeline] Self-healing retry with fuzzy-corrected query: "${corrected}"`)
+return retrieveChunks(corrected, chunks, topK, invertedIndex, docType, true)
+}
+}
+if (topCandidates.length === 0) {
+topCandidates = relaxedKeywordSearch(searchQuery, chunks, Math.min(topK * 2, 64), invertedIndex).slice(0, Math.min(topK, MAX_HITS))
+}
+if (topCandidates.length > 1) {
+topCandidates = lightweightRerank(query, topCandidates, intent, docType)
+}
+return topCandidates.slice(0, Math.min(topK, MAX_HITS))
+}
+function buildContext(hits) {
+const seen = new Set()
+const deduped = []
+for (const h of hits) {
+const fp = (h.text || '').trim().slice(0, 80).toLowerCase()
+if (!seen.has(fp)) { seen.add(fp); deduped.push(h) }
+if (deduped.length >= 8) break
+}
+return deduped.map((h, i) => {
+const limit = i === 0 ? 1200 : 900
+let header = `[Source ${i + 1}]`
+if (h.metadata && h.metadata.section_heading) header += ` [Section: ${h.metadata.section_heading}]`
+if (h.source_file) header += ` [File: ${h.source_file}]`
+return `${header}\n${(h.text || '').trim().slice(0, limit)}`
+}).join('\n\n---\n\n')
+}
+function buildSystemPrompt(intent, docType) {
+const isPolicyIntent = ['policy_lookup', 'policy_consequence', 'policy_permission', 'policy_numeric'].includes(intent)
+if (docType === 'policy' || isPolicyIntent) {
+const intentRule = intent === 'policy_consequence'
+? 'Consequence: State the exact penalty, consequence, or action that applies. Include specific amounts, timeframes, or procedures if present in context.'
+: intent === 'policy_permission'
+? 'Permission: Clearly state whether the action is permitted or prohibited, and any conditions that apply.'
+: intent === 'policy_numeric'
+? 'Numeric: State the exact number (days, months, amount, percentage) found in the context. Do not round or approximate.'
+: 'Policy: Explain the relevant rule, clause, or requirement in clear plain language.'
+return `You are a document assistant for building rent and lease policy documents. Answer ONLY from the provided context.
+Rules: Answer in plain, direct language. Cite specific clause details (amounts, days, conditions) when present. Do not invent rules not found in context. No source references like [1] or [Source 1]. Keep answers to 2-4 sentences maximum unless listing multiple rules.
+If the context does not contain the answer, say: "I could not find this in your documents."
+Intent rule (highest priority): ${intentRule}
+Be specific: if a clause says "30 days written notice", say exactly that.`
+}
+const intentRule = intent === 'definition'
+? 'Definition: Bold measure name, one sentence definition only. No formula or calculation details.'
+: intent === 'calculation'
+? 'Calculation: Output ONLY "**Formula for [Name]:** [formula]." No definition or description.'
+: intent === 'comparison'
+? 'Comparison: Bold each name. Write a concise definition for each. End with a "**Key Difference:**" sentence derived strictly from the context. Do not invent differences.'
+: 'General: Answer directly in 2-4 sentences. Do not volunteer formulas or definitions unprompted.'
+return `You are a data dictionary assistant for a real estate analytics platform. Answer ONLY from context.
+Rules: Bold the subject with **Name**. Write complete sentences only. No pipe-delimited data. No double periods. No source references like [1]. No sheet references. Keep answers concise.
+If context lacks the answer, say: "I could not find this in your documents."
+Intent rule (highest priority): ${intentRule}
+Formats: Definition: "**[Name]** is [desc]." | Calculation: "**Formula for [Name]:** [formula]." | URL: return URL only. | Comparison: "**[A]:** [desc]. **[B]:** [desc]. **Key Difference:** [one sentence derived from context]."`
+}
+function buildDynamicSystemPrompt(intent, docType) {
+const basePrompt = buildSystemPrompt(intent, docType)
+const isPolicyDoc = docType === 'policy' || ['policy_lookup', 'policy_consequence', 'policy_permission', 'policy_numeric'].includes(intent)
+const recoveryInstructions = isPolicyDoc
+? `
+RECOVERY MODE: The initial retrieval may have returned partial results. Apply these strategies:
+1. Look for semantically related terms: "tenant" and "lessee" mean the same, "landlord" and "lessor" mean the same.
+2. A rule about "30-day notice" answers queries about "notice period", "how much notice", "notice requirement".
+3. Conditions on deposits answer questions about "security deposit return", "deposit refund", "when do I get deposit back".
+4. If multiple clauses are partially relevant, synthesize them into a coherent answer.
+5. Identify implied answers: if the document says rent is due on the 1st and mentions a grace period, that answers "when is rent due".
+6. Look for numerical values that answer the query even if phrased differently.
+Answer from what IS in context, even if imperfect. Do not say "I could not find" if there is any relevant information present.`
+: `
+RECOVERY MODE: The initial retrieval may have returned partial results. Apply these strategies:
+1. Look for semantically equivalent terms and acronyms for the measure name.
+2. Check if the measure is referenced differently (abbreviated, reordered words).
+3. If a partial definition exists, use it rather than returning empty.
+4. Synthesize an answer from related chunks if direct definition is missing.
+Answer from what IS in context, even if imperfect.`
+return basePrompt + recoveryInstructions
+}
+function buildUserMessage(query, hits, intent, docType) {
+const context = buildContext(hits)
+const subject = extractSubject(query)
+const isPolicyIntent = ['policy_lookup', 'policy_consequence', 'policy_permission', 'policy_numeric'].includes(intent)
+let instruction = ''
+if (intent === 'definition' && docType !== 'policy') {
+instruction = `\n\nFrom the context, write a one-sentence definition of "${subject}". Bold the name. No formula or calculation. End with one period.`
+} else if (intent === 'calculation') {
+instruction = `\n\nFrom the context, return only: "**Formula for ${capFirst(subject)}:** [formula]." No definition or description.`
+} else if (intent === 'url_lookup') {
+instruction = `\n\nFrom the context, return only the full URL for "${extractUrlKeywords(query).join(' ')}".`
+} else if (intent === 'all_urls') {
+instruction = `\n\nFrom the context, list ALL URLs. Format: name: URL. One per line.`
+} else if (intent === 'comparison') {
+instruction = `\n\nFrom the context, compare: ${query}. Bold each name. Provide a concise definition for each based strictly on the context. End with a "**Key Difference:**" sentence. One period at end.`
+} else if (isPolicyIntent || docType === 'policy') {
+instruction = `\n\nUsing ONLY the context provided, answer this question about the policy/lease/agreement: "${query}"\n\nBe specific and direct. Include exact numbers, timeframes, or conditions if present. Do not add information not found in the context. 2-4 sentences maximum.`
+} else {
+instruction = `\n\nFrom the context, answer in clear sentences: ${query}. Answer only what was asked. No pipe characters. One period at end.`
+}
+return `CONTEXT:\n${context}${instruction}`
+}
+function isWeakAnswer(answer) {
+if (!answer || answer.trim().length < 15) return true
+const weakPhrases = [
+'i could not find',
+'no relevant information',
+'not found in',
+'i don\'t have information',
+'i don\'t see',
+'unable to find',
+'not mentioned in',
+'not present in',
+'no information about',
+'cannot find',
+'does not contain',
+'not available in',
+'i couldn\'t find',
+]
+const lower = answer.toLowerCase().trim()
+return weakPhrases.some(phrase => lower.startsWith(phrase) || (lower.length < 80 && lower.includes(phrase)))
+}
+function extractAllUrlsFromChunks(chunks) {
+const results = []
+const seen = new Set()
+const urlRegex = /https?:\/\/[^\s"'<>]+/g
+for (const chunk of chunks) {
+const lines = (chunk.text || '').split('\n')
+for (const line of lines) {
+const urls = line.match(urlRegex)
+if (!urls) continue
+for (const url of urls) {
+const cleanUrl = url.replace(/[.,;)]+$/, '').trim()
+if (!cleanUrl.startsWith('http') || seen.has(cleanUrl)) continue
+seen.add(cleanUrl)
+let name = 'Report'
+const reportUrlMatch = line.match(/^(?:Report URL|Power BI link)\s+for\s+(.+?)(?:\s*\([^)]+\))?\s*:\s*https?:/i)
+if (reportUrlMatch) {
+name = reportUrlMatch[1].trim()
+} else {
+const beforeUrl = line.slice(0, line.indexOf('http')).trim()
+if (beforeUrl) {
+const cleaned = beforeUrl.replace(/\.\s*URL\s*:?\s*$/i, '').replace(/\s*:\s*$/, '').replace(/^(URL|Link|Dashboard|Report)\s*:?\s*/i, '').trim()
+if (cleaned.length > 1 && cleaned.length < 120) name = cleaned
+}
+}
+results.push({ name, url: cleanUrl })
+}
+}
+}
+return results
+}
+function buildFallbackAnswer(query, hits, intent, docType) {
+if (!hits || hits.length === 0) return "I could not find relevant information about this in your documents."
+const resolvedIntent = intent || detectQueryIntent(query)
+const subject = extractSubject(query)
+const subjectLower = subject.toLowerCase()
+const escapedSubject = escapeRegex(subjectLower)
+const isPolicyDoc = docType === 'policy' || ['policy_lookup', 'policy_consequence', 'policy_permission', 'policy_numeric'].includes(resolvedIntent)
+if (resolvedIntent === 'all_urls') {
+const urlEntries = extractAllUrlsFromChunks(hits)
+if (urlEntries.length === 0) return "I could not find any URLs in your documents."
+return urlEntries.map(e => `**${e.name}:** ${e.url}`).join('\n')
+}
+if (resolvedIntent === 'url_lookup') {
+const urlKeywords = extractUrlKeywords(query)
+const urlRegex = /https?:\/\/[^\s"'<>]+/
+for (const h of hits) {
+for (const line of (h.text || '').split('\n')) {
+if (!urlRegex.test(line)) continue
+const matched = urlKeywords.filter(w => line.toLowerCase().includes(w)).length
+if (matched > 0) {
+const urlMatch = line.match(urlRegex)
+if (urlMatch) return urlMatch[0].replace(/[.,;)]+$/, '').trim()
+}
+}
+}
+for (const h of hits) {
+for (const line of (h.text || '').split('\n')) {
+const urlMatch = line.match(urlRegex)
+if (urlMatch) return urlMatch[0].replace(/[.,;)]+$/, '').trim()
+}
+}
+return "I could not find a matching URL in your documents."
+}
+if (isPolicyDoc) {
+const relevantLines = []
+for (const h of hits) {
+const lines = (h.text || '').split(/\n+/)
+for (const line of lines) {
+if (!new RegExp(`\\b${escapedSubject}\\b`, 'i').test(line) && line.trim().length < 50) continue
+if (line.trim().length < 20) continue
+const isMeaningful = /\b(shall|must|may|tenant|landlord|days?|months?|\d+|notice|deposit|rent|fee|penalty|require|allow|permit|prohibit|right|obligation)\b/i.test(line)
+if (isMeaningful || new RegExp(`\\b${escapedSubject}\\b`, 'i').test(line)) {
+relevantLines.push(line.trim())
+}
+}
+}
+if (relevantLines.length > 0) {
+const unique = [...new Set(relevantLines)].slice(0, 3)
+const joined = unique.join(' ')
+return ensureSinglePeriod(trimToCompleteSentence(joined, 600))
+}
+const firstHit = hits[0]
+if (firstHit && firstHit.text) {
+const excerpt = trimToCompleteSentence(firstHit.text.trim(), 400)
+if (excerpt.length > 30) return ensureSinglePeriod(excerpt)
+}
+return "I could not find specific information about this in your documents."
+}
+if (resolvedIntent === 'calculation') {
+for (const h of hits) {
+if (h.metadata && h.metadata.formula && new RegExp(`\\b${escapedSubject}\\b`, 'i').test(h.metadata.measure || '')) {
+const cap = capFirst(h.metadata.measure)
+return ensureSinglePeriod(`**Formula for ${cap}:** ${h.metadata.formula}.`)
+}
+}
+for (const h of hits) {
+const m = (h.text || '').match(new RegExp(`how to calculate ${escapedSubject}:\\s*([^\\n]+)`, 'im'))
+if (m) return ensureSinglePeriod(`**Formula for ${capFirst(subject)}:** ${trimToCompleteSentence(m[1].trim(), 500)}.`)
+}
+for (const h of hits) {
+const m = (h.text || '').match(new RegExp(`formula for ${escapedSubject}:\\s*([^\\n]+)`, 'im'))
+if (m) return ensureSinglePeriod(`**Formula for ${capFirst(subject)}:** ${trimToCompleteSentence(m[1].trim(), 500)}.`)
+}
+for (const h of hits) {
+if (!new RegExp(`\\b${escapedSubject}\\b`, 'i').test(h.text || '')) continue
+const extracted = extractFormulaFromText(h.text || '')
+if (extracted) return ensureSinglePeriod(`**Formula for ${capFirst(subject)}:** ${extracted}.`)
+}
+return `I could not find a formula for ${capFirst(subject)} in your documents.`
+}
+for (const h of hits) {
+if (h.metadata && h.metadata.measure) {
+const measureLower = (h.metadata.measure || '').toLowerCase().trim()
+if (measureLower === subjectLower || new RegExp(`\\b${escapedSubject}\\b`, 'i').test(measureLower) || new RegExp(`\\b${escapeRegex(measureLower)}\\b`, 'i').test(subjectLower)) {
+const cap = capFirst(h.metadata.measure)
+if (resolvedIntent === 'definition' && h.metadata.description) return ensureSinglePeriod(`**${cap}** is defined as: ${h.metadata.description}.`)
+let answer = `**${cap}**`
+if (h.metadata.description) answer += ` is defined as: ${h.metadata.description}`
+if (!answer.endsWith('.')) answer += '.'
+return ensureSinglePeriod(answer)
+}
+}
+}
+const synthesisPattern = new RegExp(
+`${escapedSubject}[^\\n]*is defined as:\\s*([^.\\n]+(?:\\.[^.\\n]+)?)(?:\\.\\s*Formula:\\s*([^.\\n]+(?:\\.[^.\\n]+)?))?(?:\\.\\s*Additional Info:\\s*([^.\\n]+))?`,
+'im'
+)
+for (const h of hits) {
+const m = (h.text || '').match(synthesisPattern)
+if (m) {
+const desc = trimToCompleteSentence((m[1] || '').trim(), 600)
+const additional = (m[3] || '').trim().slice(0, 300)
+const cap = capFirst(subject)
+let answer = `**${cap}** is ${desc}`
+if (!answer.endsWith('.')) answer += '.'
+if (resolvedIntent !== 'definition' && m[2]) {
+const formula = (m[2] || '').trim().slice(0, 400)
+if (formula) { answer += `\n\n**Formula:** ${formula}`; if (!answer.endsWith('.')) answer += '.' }
+}
+if (additional) { answer += `\n\n**Additional Info:** ${additional}`; if (!answer.endsWith('.')) answer += '.' }
+return ensureSinglePeriod(answer)
+}
+}
+const matchingLines = []
+for (const h of hits) {
+for (const line of (h.text || '').split('\n')) {
+if (!new RegExp(`\\b${escapedSubject}\\b`, 'i').test(line)) continue
+if (line.trim().length <= 20) continue
+if ((line.match(/\|/g) || []).length > 2) continue
+if (/^===\s*Sheet:/.test(line.trim())) continue
+if (resolvedIntent === 'definition' && /formula|calculated as|computed as/i.test(line)) continue
+const cleaned = line.trim().replace(/\(from\s+[A-Za-z\s]+\)/g, '').trim()
+if (cleaned.length > 15) matchingLines.push(cleaned)
+}
+}
+if (matchingLines.length > 0) {
+const cap = capFirst(subject)
+const joined = trimToCompleteSentence([...new Set(matchingLines)].slice(0, 3).join(' '), 600)
+return ensureSinglePeriod(`**${cap}:** ${joined}.`)
+}
+return "I could not find that specific information in your documents."
+}
+function cleanAnswer(rawAnswer) {
+if (!rawAnswer) return ''
+let cleaned = fixBrokenUrls(rawAnswer)
+.replace(/^\s*\[Source\s*\d+\]\s*/gm, '')
+.replace(/^[^\n]*(\|[^\n]*){3,}$/gm, '')
+.replace(/=== .+ ===\s*/gm, '')
+.replace(/\(from\s+[A-Za-z\s]+\)\s*/g, '')
+.replace(/\n{3,}/g, '\n\n')
+.replace(/\.{2,}/g, '.')
+.replace(/\.\s*\./g, '.')
+.trim()
+cleaned = trimToLastCompleteSentence(cleaned)
+if (cleaned.length > 0 && !/[.!?]$/.test(cleaned)) cleaned += '.'
+return ensureSinglePeriod(cleaned)
+}
+function trimToLastCompleteSentence(text) {
+if (!text) return ''
+const lastIdx = Math.max(text.lastIndexOf('. '), text.lastIndexOf('.\n'), text.lastIndexOf('! '), text.lastIndexOf('? '))
+if (lastIdx > text.length * 0.5) {
+const trimmed = text.slice(0, lastIdx + 1).trim()
+if (trimmed.length > 20) return trimmed
+}
+if (/[.!?]$/.test(text)) return text
+const periodIdx = text.lastIndexOf('.')
+if (periodIdx > text.length * 0.5) return text.slice(0, periodIdx + 1).trim()
+return text
 }
 async function callASKDATA(systemPrompt, userMessage, maxTokens = 1024) {
 if (!ASKDATA_ENDPOINT || !ASKDATA_KEY) throw new Error('ASKDATA_ENDPOINT and ASKDATA_KEY are required')
@@ -689,691 +1332,69 @@ console.error(`[ASKDATA2] Also failed: ${err.message}`)
 }
 return ''
 }
-async function embedQueryAzure(query) {
-if (!AZURE_EMBED_ENDPOINT || !AZURE_EMBED_KEY) return null
-try {
-const response = await fetchWithTimeout(
-AZURE_EMBED_ENDPOINT,
-{
-method: 'POST',
-headers: { 'Content-Type': 'application/json', 'api-key': AZURE_EMBED_KEY },
-body: JSON.stringify({ input: query, model: AZURE_EMBED_MODEL }),
-},
-EMBED_TIMEOUT_MS
-)
-if (!response.ok) return null
-const data = await response.json()
-return data.data?.[0]?.embedding || null
-} catch { return null }
+async function generateAnswer(query, hits, intent, docType) {
+return callBestAvailableEngine(buildSystemPrompt(intent, docType), buildUserMessage(query, hits, intent, docType), 1024)
 }
-async function embedBatch(texts) {
-if (!AZURE_EMBED_ENDPOINT || !AZURE_EMBED_KEY || !texts.length) return []
-try {
-const response = await fetchWithTimeout(
-AZURE_EMBED_ENDPOINT,
-{
-method: 'POST',
-headers: { 'Content-Type': 'application/json', 'api-key': AZURE_EMBED_KEY },
-body: JSON.stringify({ input: texts, model: AZURE_EMBED_MODEL }),
-},
-EMBED_TIMEOUT_MS
-)
-if (!response.ok) return []
-const data = await response.json()
-return (data.data || []).sort((a, b) => a.index - b.index).map(d => d.embedding)
-} catch { return [] }
-}
-async function rerankerScore(query, texts) {
-if (!RERANKER_ENDPOINT) return null
-try {
-const response = await fetchWithTimeout(
-RERANKER_ENDPOINT,
-{
-method: 'POST',
-headers: {
-'Content-Type': 'application/json',
-...(RERANKER_KEY ? { 'Authorization': `Bearer ${RERANKER_KEY}` } : {}),
-},
-body: JSON.stringify({ query, texts }),
-},
-RERANKER_TIMEOUT_MS
-)
-if (!response.ok) return null
-const data = await response.json()
-if (Array.isArray(data)) return data.map(d => (typeof d === 'number' ? d : d.score ?? 0))
-if (Array.isArray(data.scores)) return data.scores
-return null
-} catch (err) {
-console.warn(`[reranker] Failed: ${err.message}`)
-return null
-}
-}
-async function rerankChunks(query, chunks) {
-if (!RERANKER_ENDPOINT || chunks.length === 0) return chunks
-try {
-const texts = chunks.map(c => (c.text || '').slice(0, 512))
-const scores = await rerankerScore(query, texts)
-if (!scores || scores.length !== chunks.length) return chunks
-return chunks
-.map((c, i) => ({ ...c, _rerankerScore: scores[i] }))
-.sort((a, b) => b._rerankerScore - a._rerankerScore)
-} catch (err) {
-console.warn(`[rerankChunks] Reranker error, skipping: ${err.message}`)
-return chunks
-}
-}
-function scoreHeaderMatch(header, patterns) {
-const h = header.toLowerCase().trim()
-for (const [regex, score] of patterns) {
-if (regex.test(h)) return score
-}
-return 0
-}
-function detectColumns(headers) {
-const NAME_PATTERNS = [
-[/\b(measure|attribute|field|metric|kpi)\s*name\b/, 100],
-[/^name$/, 90],
-[/report.?name/i, 85],
-[/\bname\b/, 70],
-[/\btitle\b/, 50],
-]
-const TABLE_PATTERNS = [
-[/\b(table|module|category|group|domain|section|workspace)\b/, 100],
-[/^table$/, 90],
-]
-const DESC_PATTERNS = [
-[/\b(description|desc|definition|about|summary|detail)\b/, 100],
-[/^desc$/, 90],
-]
-const FORMULA_PATTERNS = [
-[/\b(formula|calculation|calc|how\s+calculated|computed\s+as)\b/, 100],
-[/^formula$/, 90],
-]
-const URL_PATTERNS = [
-[/\b(url|link|href|report\s+link|dashboard)\b/, 100],
-]
-const ADDITIONAL_PATTERNS = [
-[/\b(additional|extra|notes?|info|configuration|config|mdm)\b/, 100],
-]
-const colIdx = {}
-const scored = headers.map((h, i) => ({
-i,
-table: scoreHeaderMatch(h, TABLE_PATTERNS),
-name: scoreHeaderMatch(h, NAME_PATTERNS),
-description: scoreHeaderMatch(h, DESC_PATTERNS),
-formula: scoreHeaderMatch(h, FORMULA_PATTERNS),
-url: scoreHeaderMatch(h, URL_PATTERNS),
-additional: scoreHeaderMatch(h, ADDITIONAL_PATTERNS),
-}))
-for (const field of ['table', 'name', 'description', 'formula', 'url', 'additional']) {
-const best = scored.filter(c => c[field] > 0).sort((a, b) => b[field] - a[field])[0]
-if (best) colIdx[field] = best.i
-}
-if (colIdx.url !== undefined && colIdx.name === undefined) {
-const usedIdx = new Set(Object.values(colIdx))
-for (let i = 0; i < headers.length; i++) {
-if (!usedIdx.has(i) && headers[i].trim()) { colIdx.name = i; break }
-}
-}
-return colIdx
-}
-function extractSpreadsheet(buffer) {
-const workbook = XLSX.read(buffer, { type: 'buffer', cellNF: true })
-const rows = []
-const headerParts = []
-for (const sheetName of workbook.SheetNames) {
-const sheet = workbook.Sheets[sheetName]
-const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: '', header: 1, raw: false })
-if (!rawRows.length) continue
-let headerRowIdx = -1
-for (let i = 0; i < Math.min(15, rawRows.length); i++) {
-const cells = rawRows[i].map(c => String(c).trim()).filter(Boolean)
-if (cells.length < 2) continue
-if (cells.length === 1 && cells[0].length > 60) continue
-const shortCells = cells.filter(c => c.length <= 60)
-if (shortCells.length >= 2) { headerRowIdx = i; break }
-}
-if (headerRowIdx === -1) headerRowIdx = 0
-const rawHeaders = rawRows[headerRowIdx].map(h => String(h).trim())
-const headers = []
-let lastNonBlank = ''
-for (const h of rawHeaders) {
-if (h !== '') { lastNonBlank = h; headers.push(h) }
-else headers.push(lastNonBlank || `Col${headers.length + 1}`)
-}
-const colIdx = detectColumns(headers)
-headerParts.push(`=== Sheet: ${sheetName} ===`)
-let rowsEmitted = 0
-for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
-const row = rawRows[i]
-if (!row.some(cell => String(cell).trim() !== '')) continue
-const cells = row.map(cell => String(cell || '').replace(/\r?\n/g, ' ').trim())
-const nameVal = colIdx.name !== undefined ? (cells[colIdx.name] || '').trim() : ''
-const tableVal = colIdx.table !== undefined ? (cells[colIdx.table] || '').trim() : sheetName
-const descVal = colIdx.description !== undefined ? (cells[colIdx.description] || '').trim() : ''
-const urlVal = colIdx.url !== undefined ? (cells[colIdx.url] || '').trim() : ''
-const additionalVal = colIdx.additional !== undefined ? (cells[colIdx.additional] || '').trim() : ''
-let formulaVal = colIdx.formula !== undefined ? (cells[colIdx.formula] || '').trim() : ''
-if (!formulaVal && descVal) {
-const formulaPatterns = [
-/(.*?\/.*?)/i,
-/(=.*?)/i,
-/(calculated\s+as.*)/i,
-/(computed\s+as.*)/i,
-/(divided\s+by.*)/i,
-/(multiplied\s+by.*)/i,
-/(sum\s+of.*)/i,
-]
-for (const pattern of formulaPatterns) {
-const match = descVal.match(pattern)
-if (match && match[0].trim().length > 3) {
-formulaVal = match[0].trim()
-break
-}
-}
-}
-if (nameVal) {
-let synthesis = `${nameVal}`
-if (tableVal && tableVal !== sheetName) synthesis += ` (${tableVal})`
-if (descVal) synthesis += ` is defined as: ${descVal}`
-if (formulaVal && !descVal.toLowerCase().includes(formulaVal.toLowerCase())) {
-synthesis += `. Formula: ${formulaVal}`
-}
-if (additionalVal) synthesis += `. Additional Info: ${additionalVal}`
-if (urlVal) synthesis += `. URL: ${urlVal}`
-rows.push({
-text: synthesis,
-metadata: {
-measure: nameVal,
-table: tableVal || sheetName,
-formula: formulaVal || '',
-description: descVal || '',
-url: urlVal || '',
-sourceSheet: sheetName,
-}
-})
-if (formulaVal) {
-rows.push({
-text: `How to calculate ${nameVal}: ${formulaVal}`,
-metadata: { measure: nameVal, table: tableVal || sheetName, formula: formulaVal, description: descVal || '', url: '', sourceSheet: sheetName }
-})
-rows.push({
-text: `Formula for ${nameVal}: ${formulaVal}`,
-metadata: { measure: nameVal, table: tableVal || sheetName, formula: formulaVal, description: descVal || '', url: '', sourceSheet: sheetName }
-})
-}
-if (urlVal) {
-rows.push({
-text: `Report URL for ${nameVal}: ${urlVal}`,
-metadata: { measure: nameVal, table: tableVal || sheetName, formula: '', description: '', url: urlVal, sourceSheet: sheetName }
-})
-rows.push({
-text: `Power BI link for ${nameVal}: ${urlVal}`,
-metadata: { measure: nameVal, table: tableVal || sheetName, formula: '', description: '', url: urlVal, sourceSheet: sheetName }
-})
-if (tableVal && tableVal !== sheetName) {
-rows.push({
-text: `Report URL for ${nameVal} (${tableVal}): ${urlVal}`,
-metadata: { measure: nameVal, table: tableVal, formula: '', description: '', url: urlVal, sourceSheet: sheetName }
-})
-}
-}
-rowsEmitted++
-} else if (descVal) {
-rows.push({
-text: descVal,
-metadata: { measure: '', table: tableVal || sheetName, formula: '', description: descVal, url: '', sourceSheet: sheetName }
-})
-}
-}
-if (rowsEmitted === 0) {
-for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
-const row = rawRows[i]
-const cells = row.map(c => String(c || '').trim()).filter(Boolean)
-if (cells.length) {
-rows.push({
-text: cells.join(' | '),
-metadata: { measure: '', table: sheetName, formula: '', description: '', url: '', sourceSheet: sheetName }
-})
-}
-}
-}
-}
-return rows
-}
-function keywordSearch(query, chunks, topK, intent, invertedIndex) {
-const subject = extractSubject(query)
-const subjectWords = subject.toLowerCase().split(/\s+/).filter(w => w.length > 1)
-const queryLower = normalizeQuery(query)
-const isMultiWord = subjectWords.length > 1
-const subjectPhraseRegex = isMultiWord
-? new RegExp(escapeRegex(subject.toLowerCase()), 'i')
-: new RegExp(`\\b${escapeRegex(subject.toLowerCase())}\\b`, 'i')
-let candidateIndices
-if (invertedIndex && subjectWords.length > 0) {
-const wordsToIndex = intent === 'url_lookup' ? extractUrlKeywords(query) : subjectWords
-const union = new Set()
-for (const w of wordsToIndex) {
-for (const idx of (invertedIndex.get(w) || new Set())) union.add(idx)
-for (const variant of normalizeTerms(w)) {
-for (const idx of (invertedIndex.get(variant) || new Set())) union.add(idx)
-}
-}
-if (intent === 'url_lookup') {
-for (const w of ['url', 'link', 'https', 'http', 'powerbi', 'app']) {
-for (const idx of (invertedIndex.get(w) || new Set())) union.add(idx)
-}
-}
-candidateIndices = union
-}
-const source = candidateIndices
-? [...candidateIndices].map(i => chunks[i]).filter(Boolean)
-: chunks.slice(0, 200)
-return source
-.map(c => {
-const text = (c.text || '').toLowerCase()
-let score = 0
-if (intent === 'all_urls') {
-if (!text.includes('http')) return { ...c, _score: 0 }
-return { ...c, _score: 10 }
-}
-if (intent === 'url_lookup') {
-if (!text.includes('http')) return { ...c, _score: 0 }
-const kws = extractUrlKeywords(query)
-const matched = kws.filter(w => text.includes(w)).length
-if (matched === 0) return { ...c, _score: 0 }
-score += matched * 10
-if (text.includes(kws.join(' '))) score += 15
-} else {
-const phraseFound = subjectPhraseRegex.test(c.text || '')
-if (phraseFound) {
-score += subjectWords.length * 6
-if (new RegExp(`\\|\\s*${escapeRegex(subject.toLowerCase())}\\s*\\|`, 'i').test(c.text || '')) score += subjectWords.length * 4
-if (new RegExp(`\\b${escapeRegex(subject.toLowerCase())}\\b[\\s\\S]{0,30}(is defined as|is calculated as|formula:)`, 'i').test(c.text || '')) score += subjectWords.length * 8
-}
-const wordCoverage = subjectWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(c.text || '')).length
-score += wordCoverage * 2
-if (new RegExp(`\\b${escapeRegex(queryLower)}\\b`, 'i').test(c.text || '')) score += 3
-if (subjectPhraseRegex.test(c.text || '')) score += 4
-if (intent === 'calculation') {
-if (/\bformula\b/i.test(text)) score += 15
-if (/\bcalculated as\b/i.test(text)) score += 10
-if (/\bcomputed as\b/i.test(text)) score += 10
-if (text.includes('=')) score += 8
-if (text.includes('/')) score += 5
-if (/\bhow to calculate\b/i.test(text)) score += 12
-if (/\bformula for\b/i.test(text)) score += 12
-}
-if (c.metadata && c.metadata.measure) {
-const measureLower = (c.metadata.measure || '').toLowerCase().trim()
-if (measureLower === subject.toLowerCase().trim()) {
-score += 100
-} else if (subjectWords.some(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(measureLower))) {
-score += 10
-}
-}
-const penalty = computeNegativePenalty(subject, c.text || '')
-score -= penalty
-}
-return { ...c, _score: score }
-})
-.filter(c => c._score > 0)
-.sort((a, b) => b._score - a._score)
-.slice(0, topK)
-}
-function relaxedKeywordSearch(query, chunks, topK, invertedIndex) {
-const subject = extractSubject(query)
-const allWords = [
-...subject.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1),
-...query.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 2),
-]
-const uniqueWords = [...new Set(allWords)]
-const union = new Set()
-if (invertedIndex) {
-for (const w of uniqueWords) {
-for (const idx of (invertedIndex.get(w) || new Set())) union.add(idx)
-for (const variant of normalizeTerms(w)) {
-for (const idx of (invertedIndex.get(variant) || new Set())) union.add(idx)
-}
-}
-}
-const source = union.size > 0 ? [...union].map(i => chunks[i]).filter(Boolean) : chunks.slice(0, 300)
-return source
-.map(c => {
-const text = (c.text || '').toLowerCase()
-const matched = uniqueWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(text)).length
-const subjectMatch = subject.length > 2 && new RegExp(`\\b${escapeRegex(subject.toLowerCase())}\\b`, 'i').test(text) ? 5 : 0
-let metaBoost = 0
-if (c.metadata && c.metadata.measure) {
-const ml = c.metadata.measure.toLowerCase()
-if (ml === subject.toLowerCase().trim()) {
-metaBoost += 50
-} else {
-const subjectMatched = uniqueWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(ml)).length
-metaBoost = subjectMatched * 3
-}
-}
-const penalty = computeNegativePenalty(subject, c.text || '')
-return { ...c, _score: Math.max(0, matched + subjectMatch + metaBoost - penalty) }
-})
-.filter(c => c._score > 0)
-.sort((a, b) => b._score - a._score)
-.slice(0, topK)
-}
-async function retrieveChunks(query, chunks, topK, invertedIndex, _isRetry = false) {
-const intent = detectQueryIntent(query)
-const normalizedQuery = normalizeQuery(query).replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
-const MAX_HITS = MAX_HITS_GLOBAL
-if (intent === 'all_urls') {
-return chunks.filter(c => /https?:\/\/\S+/.test(c.text || '')).slice(0, 100)
-}
-const candidates = keywordSearch(normalizedQuery, chunks, Math.min(150, chunks.length), intent, invertedIndex)
-const pool = candidates.length > 0 ? candidates : chunks.slice(0, 150)
-const topScore = pool[0]?._score || 0
-let topCandidates = []
-if (topScore >= 6) topCandidates = pool.slice(0, Math.min(MAX_HITS, pool.length))
-else if ((intent === 'definition' || intent === 'calculation') && topScore >= 3) topCandidates = pool.slice(0, Math.min(MAX_HITS, pool.length))
-else if (intent === 'url_lookup' && pool.length > 0) return pool.slice(0, Math.min(topK, 6))
-if (topCandidates.length === 0 && AZURE_EMBED_ENDPOINT && AZURE_EMBED_KEY) {
-try {
-const queryVec = await embedQueryAzure(normalizedQuery)
-if (queryVec) {
-const poolSlice = pool.slice(0, EMBED_POOL_LIMIT)
-const embeddings = await embedBatch(poolSlice.map(c => (c.text || '').slice(0, 512)))
-const maxKeyword = pool[0]?._score || 1
-const weight = (intent === 'definition' || intent === 'calculation')
-? { semantic: 0.35, keyword: 0.65 }
-: { semantic: 0.70, keyword: 0.30 }
-const scored = poolSlice.map((c, i) => {
-if (!embeddings[i]) return c
-const semanticScore = cosineSim(queryVec, embeddings[i])
-const keywordNorm = typeof c._score === 'number' ? c._score / maxKeyword : 0
-return { ...c, _score: semanticScore * weight.semantic + keywordNorm * weight.keyword }
-})
-const remainder = pool.slice(EMBED_POOL_LIMIT).map(c => ({
-...c,
-_score: (typeof c._score === 'number' ? c._score / maxKeyword : 0) * weight.keyword,
-}))
-const result = [...scored, ...remainder].sort((a, b) => b._score - a._score).slice(0, Math.min(MAX_HITS, MAX_HITS_GLOBAL))
-if (result.length > 0) topCandidates = result
-}
-} catch (err) {
-console.warn('[retrieveChunks] Embedding failed, using keyword fallback:', err.message)
-}
-}
-if (topCandidates.length === 0 && pool.length > 0) {
-topCandidates = pool.slice(0, Math.min(MAX_HITS, pool.length))
-}
-if (topCandidates.length === 0 && !_isRetry) {
-const corrected = fuzzyCorrectQuery(query, chunks)
-if (corrected.toLowerCase() !== query.toLowerCase()) {
-console.log(`[QueryPipeline] Self-healing retry with fuzzy-corrected query: "${corrected}"`)
-return retrieveChunks(corrected, chunks, topK, invertedIndex, true)
-}
-}
-if (topCandidates.length === 0) {
-topCandidates = relaxedKeywordSearch(normalizedQuery, chunks, Math.min(topK * 2, 64), invertedIndex).slice(0, Math.min(topK, MAX_HITS))
-}
-if (RERANKER_ENDPOINT && topCandidates.length > 1) {
-const reranked = await rerankChunks(normalizedQuery, topCandidates)
-return reranked.slice(0, Math.min(topK, 5))
-}
-return topCandidates.slice(0, Math.min(topK, MAX_HITS))
-}
-function buildContext(hits) {
-const seen = new Set()
-const deduped = []
-for (const h of hits) {
-const fp = (h.text || '').trim().slice(0, 80).toLowerCase()
-if (!seen.has(fp)) { seen.add(fp); deduped.push(h) }
-if (deduped.length >= 8) break
-}
-return deduped.map((h, i) => {
-const limit = i === 0 ? 1200 : 900
-return `[Source ${i + 1}]\n${(h.text || '').trim().slice(0, limit)}`
-}).join('\n\n---\n\n')
-}
-function buildSystemPrompt(intent) {
-const intentRule = intent === 'definition'
-? `Definition: Bold measure name, one sentence definition only. No formula or calculation details.`
-: intent === 'calculation'
-? `Calculation: Output ONLY "**Formula for [Name]:** [formula]." No definition or description.`
-: intent === 'comparison'
-? `Comparison: Bold each name. Write a concise definition for each. End with a "**Key Difference:**" sentence derived strictly from the context. Do not invent differences.`
-: `General: Answer directly in 2-4 sentences. Do not volunteer formulas or definitions unprompted.`
-return `You are a data dictionary assistant for a real estate analytics platform. Answer ONLY from context.
-Rules: Bold the subject with **Name**. Write complete sentences only. No pipe-delimited data. No double periods. No source references like [1]. No sheet references. Keep answers concise.
-If context lacks the answer, say: "I could not find this in your documents."
-Intent rule (highest priority): ${intentRule}
-Formats: Definition: "**[Name]** is [desc]." | Calculation: "**Formula for [Name]:** [formula]." | URL: return URL only. | Comparison: "**[A]:** [desc]. **[B]:** [desc]. **Key Difference:** [one sentence derived from context]."`
-}
-function buildUserMessage(query, hits, intent) {
-const context = buildContext(hits)
-const subject = extractSubject(query)
-let instruction = ''
-if (intent === 'definition') {
-instruction = `\n\nFrom the context, write a one-sentence definition of "${subject}". Bold the name. No formula or calculation. End with one period.`
-} else if (intent === 'calculation') {
-instruction = `\n\nFrom the context, return only: "**Formula for ${capFirst(subject)}:** [formula]." No definition or description.`
-} else if (intent === 'url_lookup') {
-instruction = `\n\nFrom the context, return only the full URL for "${extractUrlKeywords(query).join(' ')}".`
-} else if (intent === 'all_urls') {
-instruction = `\n\nFrom the context, list ALL URLs. Format: name: URL. One per line.`
-} else if (intent === 'comparison') {
-instruction = `\n\nFrom the context, compare: ${query}. Bold each name. Provide a concise definition for each based strictly on the context. End with a "**Key Difference:**" sentence that accurately reflects what the context says about these two items. Do not fabricate or assume differences. One period at end.`
-} else {
-instruction = `\n\nFrom the context, answer in clear sentences: ${query}. Answer only what was asked. No pipe characters. One period at end.`
-}
-return `CONTEXT:\n${context}${instruction}`
-}
-function extractAllUrlsFromChunks(chunks) {
-const results = []
-const seen = new Set()
-const urlRegex = /https?:\/\/[^\s"'<>]+/g
-for (const chunk of chunks) {
-const lines = (chunk.text || '').split('\n')
-for (const line of lines) {
-const urls = line.match(urlRegex)
-if (!urls) continue
-for (const url of urls) {
-const cleanUrl = url.replace(/[.,;)]+$/, '').trim()
-if (!cleanUrl.startsWith('http') || seen.has(cleanUrl)) continue
-seen.add(cleanUrl)
-let name = 'Report'
-const reportUrlMatch = line.match(/^(?:Report URL|Power BI link)\s+for\s+(.+?)(?:\s*\([^)]+\))?\s*:\s*https?:/i)
-if (reportUrlMatch) {
-name = reportUrlMatch[1].trim()
-} else {
-const beforeUrl = line.slice(0, line.indexOf('http')).trim()
-if (beforeUrl) {
-const cleaned = beforeUrl
-.replace(/\.\s*URL\s*:?\s*$/i, '')
-.replace(/\s*:\s*$/, '')
-.replace(/^(URL|Link|Dashboard|Report)\s*:?\s*/i, '')
-.trim()
-if (cleaned.length > 1 && cleaned.length < 120) name = cleaned
-}
-}
-results.push({ name, url: cleanUrl })
-}
-}
-}
-return results
-}
-function buildFallbackAnswer(query, hits, intent) {
-if (!hits || hits.length === 0) return "I could not find relevant information about this in your documents."
-const resolvedIntent = intent || detectQueryIntent(query)
-const subject = extractSubject(query)
-const subjectLower = subject.toLowerCase()
-const escapedSubject = escapeRegex(subjectLower)
-if (resolvedIntent === 'all_urls') {
-const urlEntries = extractAllUrlsFromChunks(hits)
-if (urlEntries.length === 0) return "I could not find any URLs in your documents."
-return urlEntries.map(e => `**${e.name}:** ${e.url}`).join('\n')
-}
-if (resolvedIntent === 'url_lookup') {
-const urlKeywords = extractUrlKeywords(query)
-const urlRegex = /https?:\/\/[^\s"'<>]+/
-for (const h of hits) {
-for (const line of (h.text || '').split('\n')) {
-if (!urlRegex.test(line)) continue
-const matched = urlKeywords.filter(w => line.toLowerCase().includes(w)).length
-if (matched > 0) {
-const urlMatch = line.match(urlRegex)
-if (urlMatch) return urlMatch[0].replace(/[.,;)]+$/, '').trim()
-}
-}
-}
-for (const h of hits) {
-for (const line of (h.text || '').split('\n')) {
-const urlMatch = line.match(urlRegex)
-if (urlMatch) return urlMatch[0].replace(/[.,;)]+$/, '').trim()
-}
-}
-return "I could not find a matching URL in your documents."
-}
-if (resolvedIntent === 'calculation') {
-for (const h of hits) {
-if (h.metadata && h.metadata.formula && new RegExp(`\\b${escapedSubject}\\b`, 'i').test(h.metadata.measure || '')) {
-const cap = capFirst(h.metadata.measure)
-return ensureSinglePeriod(`**Formula for ${cap}:** ${h.metadata.formula}.`)
-}
-}
-const calcPattern = new RegExp(`how to calculate ${escapedSubject}:\\s*([^\\n]+)`, 'im')
-for (const h of hits) {
-const m = (h.text || '').match(calcPattern)
-if (m) {
-const cap = capFirst(subject)
-return ensureSinglePeriod(`**Formula for ${cap}:** ${trimToCompleteSentence(m[1].trim(), 500)}.`)
-}
-}
-const formulaPattern = new RegExp(`formula for ${escapedSubject}:\\s*([^\\n]+)`, 'im')
-for (const h of hits) {
-const m = (h.text || '').match(formulaPattern)
-if (m) {
-const cap = capFirst(subject)
-return ensureSinglePeriod(`**Formula for ${cap}:** ${trimToCompleteSentence(m[1].trim(), 500)}.`)
-}
-}
-for (const h of hits) {
-const text = h.text || ''
-if (!new RegExp(`\\b${escapedSubject}\\b`, 'i').test(text)) continue
-const extracted = extractFormulaFromText(text)
-if (extracted) {
-const cap = capFirst(subject)
-return ensureSinglePeriod(`**Formula for ${cap}:** ${extracted}.`)
-}
-}
-return `I could not find a formula for ${capFirst(subject)} in your documents.`
-}
-for (const h of hits) {
-if (h.metadata && h.metadata.measure) {
-const measureLower = (h.metadata.measure || '').toLowerCase().trim()
-if (measureLower === subjectLower || new RegExp(`\\b${escapedSubject}\\b`, 'i').test(measureLower) || new RegExp(`\\b${escapeRegex(measureLower)}\\b`, 'i').test(subjectLower)) {
-const cap = capFirst(h.metadata.measure)
-if (resolvedIntent === 'definition' && h.metadata.description) {
-return ensureSinglePeriod(`**${cap}** is defined as: ${h.metadata.description}.`)
-}
-let answer = `**${cap}**`
-if (h.metadata.description) answer += ` is defined as: ${h.metadata.description}`
-if (!answer.endsWith('.')) answer += '.'
-return ensureSinglePeriod(answer)
-}
-}
-}
-const synthesisPattern = new RegExp(
-`${escapedSubject}[^\\n]*is defined as:\\s*([^.\\n]+(?:\\.[^.\\n]+)?)(?:\\.\\s*Formula:\\s*([^.\\n]+(?:\\.[^.\\n]+)?))?(?:\\.\\s*Additional Info:\\s*([^.\\n]+))?`,
-'im'
-)
-for (const h of hits) {
-const m = (h.text || '').match(synthesisPattern)
-if (m) {
-const desc = trimToCompleteSentence((m[1] || '').trim(), 600)
-const additional = (m[3] || '').trim().slice(0, 300)
-const cap = capFirst(subject)
-let answer = `**${cap}** is ${desc}`
-if (!answer.endsWith('.')) answer += '.'
-if (resolvedIntent !== 'definition' && m[2]) {
-const formula = (m[2] || '').trim().slice(0, 400)
-if (formula) { answer += `\n\n**Formula:** ${formula}`; if (!answer.endsWith('.')) answer += '.' }
-}
-if (additional) { answer += `\n\n**Additional Info:** ${additional}`; if (!answer.endsWith('.')) answer += '.' }
-return ensureSinglePeriod(answer)
-}
-}
-const matchingLines = []
-for (const h of hits) {
-for (const line of (h.text || '').split('\n')) {
-if (!new RegExp(`\\b${escapedSubject}\\b`, 'i').test(line)) continue
-if (line.trim().length <= 20) continue
-if ((line.match(/\|/g) || []).length > 2) continue
-if (/^===\s*Sheet:/.test(line.trim())) continue
-if (resolvedIntent === 'definition' && /formula|calculated as|computed as/i.test(line)) continue
-const cleaned = line.trim().replace(/\(from\s+[A-Za-z\s]+\)/g, '').trim()
-if (cleaned.length > 15) matchingLines.push(cleaned)
-}
-}
-if (matchingLines.length > 0) {
-const cap = capFirst(subject)
-const joined = trimToCompleteSentence([...new Set(matchingLines)].slice(0, 3).join(' '), 600)
-return ensureSinglePeriod(`**${cap}:** ${joined}.`)
-}
-return "I could not find that specific information in your documents."
-}
-function cleanAnswer(rawAnswer) {
-if (!rawAnswer) return ''
-let cleaned = fixBrokenUrls(rawAnswer)
-.replace(/^\s*\[Source\s*\d+\]\s*/gm, '')
-.replace(/^[^\n]*(\|[^\n]*){3,}$/gm, '')
-.replace(/=== .+ ===\s*/gm, '')
-.replace(/\(from\s+[A-Za-z\s]+\)\s*/g, '')
-.replace(/\n{3,}/g, '\n\n')
-.replace(/\.{2,}/g, '.')
-.replace(/\.\s*\./g, '.')
-.trim()
-cleaned = trimToLastCompleteSentence(cleaned)
-if (cleaned.length > 0 && !/[.!?]$/.test(cleaned)) cleaned += '.'
-return ensureSinglePeriod(cleaned)
-}
-function trimToLastCompleteSentence(text) {
-if (!text) return ''
-const lastIdx = Math.max(text.lastIndexOf('. '), text.lastIndexOf('.\n'), text.lastIndexOf('! '), text.lastIndexOf('? '))
-if (lastIdx > text.length * 0.5) {
-const trimmed = text.slice(0, lastIdx + 1).trim()
-if (trimmed.length > 20) return trimmed
-}
-if (/[.!?]$/.test(text)) return text
-const periodIdx = text.lastIndexOf('.')
-if (periodIdx > text.length * 0.5) return text.slice(0, periodIdx + 1).trim()
-return text
-}
-async function generateAnswer(query, hits, intent) {
-return callBestAvailableEngine(buildSystemPrompt(intent), buildUserMessage(query, hits, intent), 1024)
-}
-async function generateAnswerForTopic(topic, chunks, topK, invertedIndex) {
-const topicQuery = `what is ${topic}`
-let hits = await retrieveChunks(topicQuery, chunks, topK, invertedIndex)
-if (hits.length === 0) hits = relaxedKeywordSearch(topicQuery, chunks, 32, invertedIndex)
-if (hits.length === 0) return null
-const intent = 'definition'
+async function generateAnswerWithFallback(query, hits, intent, docType, chunks, invertedIndex, topK) {
 let rawAnswer = ''
 try {
 rawAnswer = await Promise.race([
-generateAnswer(topicQuery, hits, intent),
-new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 25000)),
+generateAnswer(query, hits, intent, docType),
+new Promise((_, reject) => setTimeout(() => reject(new Error('Primary answer timed out')), 45000)),
 ])
 } catch (err) {
-console.warn(`[generateAnswerForTopic] Engine failed for "${topic}": ${err.message}`)
+console.warn(`[generateAnswerWithFallback] Primary failed: ${err.message}`)
 }
-const isBlank = !rawAnswer || rawAnswer.trim().length < 15
-const answer = isBlank ? buildFallbackAnswer(topicQuery, hits, intent) : cleanAnswer(rawAnswer)
+if (!isWeakAnswer(rawAnswer)) return cleanAnswer(rawAnswer)
+console.log(`[DynamicFallback] Weak primary answer detected, triggering fallback recovery for: "${query.slice(0, 60)}"`)
+const expandedQuery = expandQueryForPolicy(query)
+let fallbackHits = await retrieveChunks(expandedQuery, chunks, Math.min(topK * 2, 20), invertedIndex, docType)
+if (fallbackHits.length === 0) fallbackHits = relaxedKeywordSearch(expandedQuery, chunks, 32, invertedIndex)
+if (fallbackHits.length === 0) {
+const subjectWords = extractSubject(query).toLowerCase().split(/\s+/).filter(w => w.length > 3)
+for (const word of subjectWords) {
+const wordHits = relaxedKeywordSearch(word, chunks, 16, invertedIndex)
+if (wordHits.length > 0) { fallbackHits = wordHits; break }
+}
+}
+if (fallbackHits.length === 0) fallbackHits = hits
+const dynamicPrompt = buildDynamicSystemPrompt(intent, docType)
+const fallbackUserMsg = buildUserMessage(query, fallbackHits, intent, docType)
+let fallbackAnswer = ''
+try {
+fallbackAnswer = await Promise.race([
+callBestAvailableEngine(dynamicPrompt, fallbackUserMsg, 1024),
+new Promise((_, reject) => setTimeout(() => reject(new Error('Fallback answer timed out')), 30000)),
+])
+} catch (err) {
+console.warn(`[DynamicFallback] Fallback engine failed: ${err.message}`)
+}
+if (!isWeakAnswer(fallbackAnswer)) {
+console.log(`[DynamicFallback] Recovery succeeded for: "${query.slice(0, 60)}"`)
+return cleanAnswer(fallbackAnswer)
+}
+const ruleBasedAnswer = buildFallbackAnswer(query, fallbackHits, intent, docType)
+if (ruleBasedAnswer && !ruleBasedAnswer.toLowerCase().includes('could not find')) {
+console.log(`[DynamicFallback] Rule-based fallback used for: "${query.slice(0, 60)}"`)
+return ruleBasedAnswer
+}
+if (!isWeakAnswer(rawAnswer)) return cleanAnswer(rawAnswer)
+return buildFallbackAnswer(query, hits, intent, docType)
+}
+async function generateAnswerForTopic(topic, chunks, topK, invertedIndex, docType) {
+const topicQuery = `what is ${topic}`
+let hits = await retrieveChunks(topicQuery, chunks, topK, invertedIndex, docType)
+if (hits.length === 0) hits = relaxedKeywordSearch(topicQuery, chunks, 32, invertedIndex)
+if (hits.length === 0) return null
+const intent = 'definition'
+const answer = await generateAnswerWithFallback(topicQuery, hits, intent, docType, chunks, invertedIndex, topK)
 if (answer && !/[.!?]$/.test(answer)) return answer + '.'
 return answer
 }
-async function generateComparisonAnswer(topicA, topicB, chunks, topK, invertedIndex) {
+async function generateComparisonAnswer(topicA, topicB, chunks, topK, invertedIndex, docType) {
 const comparisonQuery = `difference between ${topicA} and ${topicB}`
-const hitsA = await retrieveChunks(`what is ${topicA}`, chunks, topK, invertedIndex)
-const hitsB = await retrieveChunks(`what is ${topicB}`, chunks, topK, invertedIndex)
+const hitsA = await retrieveChunks(`what is ${topicA}`, chunks, topK, invertedIndex, docType)
+const hitsB = await retrieveChunks(`what is ${topicB}`, chunks, topK, invertedIndex, docType)
 const allHits = [...hitsA, ...hitsB]
 const seen = new Set()
 const deduped = []
@@ -1382,18 +1403,10 @@ const fp = (h.text || '').trim().slice(0, 80).toLowerCase()
 if (!seen.has(fp)) { seen.add(fp); deduped.push(h) }
 }
 if (deduped.length === 0) return null
-let rawAnswer = ''
-try {
-rawAnswer = await Promise.race([
-generateAnswer(comparisonQuery, deduped, 'comparison'),
-new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 25000)),
-])
-} catch (err) {
-console.warn(`[generateComparisonAnswer] Engine failed for "${topicA}" vs "${topicB}": ${err.message}`)
-}
-if (rawAnswer && rawAnswer.trim().length >= 15) return cleanAnswer(rawAnswer)
-const answerA = await generateAnswerForTopic(topicA, chunks, topK, invertedIndex)
-const answerB = await generateAnswerForTopic(topicB, chunks, topK, invertedIndex)
+const answer = await generateAnswerWithFallback(comparisonQuery, deduped, 'comparison', docType, chunks, invertedIndex, topK)
+if (answer && answer.trim().length >= 15) return answer
+const answerA = await generateAnswerForTopic(topicA, chunks, topK, invertedIndex, docType)
+const answerB = await generateAnswerForTopic(topicB, chunks, topK, invertedIndex, docType)
 const parts = []
 if (answerA && !answerA.includes('could not find')) parts.push(`**${capFirst(topicA)}:** ${answerA}`)
 else parts.push(`**${capFirst(topicA)}:** I could not find information about "${capFirst(topicA)}" in your documents.`)
@@ -1401,14 +1414,14 @@ if (answerB && !answerB.includes('could not find')) parts.push(`**${capFirst(top
 else parts.push(`**${capFirst(topicB)}:** I could not find information about "${capFirst(topicB)}" in your documents.`)
 return parts.join('\n\n')
 }
-async function handleMultiTopicQuery(topics, mode, chunks, topK, invertedIndex) {
+async function handleMultiTopicQuery(topics, mode, chunks, topK, invertedIndex, docType) {
 if (mode === 'comparison' && topics.length === 2) {
-const answer = await generateComparisonAnswer(topics[0], topics[1], chunks, topK, invertedIndex)
+const answer = await generateComparisonAnswer(topics[0], topics[1], chunks, topK, invertedIndex, docType)
 if (answer) return answer
 }
 const results = await Promise.all(
 topics.map(async (topic) => {
-const answer = await generateAnswerForTopic(topic, chunks, topK, invertedIndex)
+const answer = await generateAnswerForTopic(topic, chunks, topK, invertedIndex, docType)
 return { topic, answer }
 })
 )
@@ -1434,62 +1447,110 @@ const result = Papa.parse(text, { header: true, skipEmptyLines: true, delimiter 
 if (!result.data?.length) return text
 return result.data.map((row, i) => `Row ${i + 1}: ` + Object.entries(row).map(([k, v]) => `${k}=${v}`).join(' | ')).join('\n')
 }
-async function extractOffice(buffer) {
-return new Promise((resolve, reject) => {
-parseOffice(buffer, (text, err) => { if (err) reject(err); else resolve(text || '') }, { outputErrorToConsole: false })
-})
-}
-function extractHtml(buffer) {
-const root = htmlParse(buffer.toString('utf-8'))
-root.querySelectorAll('script, style').forEach(n => n.remove())
-return root.structuredText || root.innerText || root.rawText || ''
-}
-function extractXml(buffer) { return buffer.toString('utf-8').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() }
-function extractJson(buffer) { try { return JSON.stringify(JSON.parse(buffer.toString('utf-8')), null, 2) } catch { return buffer.toString('utf-8') } }
-function extractJsonl(buffer) {
-return buffer.toString('utf-8').split('\n').filter(Boolean)
-.map(line => { try { return JSON.stringify(JSON.parse(line)) } catch { return line } }).join('\n')
-}
-function extractYaml(buffer) { try { return JSON.stringify(yaml.load(buffer.toString('utf-8')), null, 2) } catch { return buffer.toString('utf-8') } }
-async function extractEml(buffer) {
-const parsed = await simpleParser(buffer)
-const parts = []
-if (parsed.subject) parts.push(`Subject: ${parsed.subject}`)
-if (parsed.from) parts.push(`From: ${parsed.from.text}`)
-if (parsed.to) parts.push(`To: ${parsed.to.text}`)
-if (parsed.date) parts.push(`Date: ${parsed.date}`)
-if (parsed.text) parts.push(`\n${parsed.text}`)
-else if (parsed.html) parts.push(`\n${extractHtml(Buffer.from(parsed.html))}`)
-return parts.join('\n')
-}
-async function extractEpub(buffer) {
-return new Promise(resolve => {
-parseOffice(buffer, (text, err) => { resolve(err || !text ? '[EPUB: convert to PDF for best results]' : text) }, { outputErrorToConsole: false })
-})
+function extractJson(buffer) {
+try { return JSON.stringify(JSON.parse(buffer.toString('utf-8')), null, 2) }
+catch { return buffer.toString('utf-8') }
 }
 async function extractTextFromBuffer(buffer, fileName) {
 const ext = ('.' + fileName.split('.').pop()).toLowerCase()
 if (ext === '.pdf') return extractPdf(buffer)
-if (ext === '.docx' || ext === '.doc') return extractWord(buffer)
-if (ext === '.odt' || ext === '.rtf') return extractOffice(buffer)
-if (['.xlsx', '.xls', '.ods'].includes(ext)) return null
+if (ext === '.docx') return extractWord(buffer)
+if (ext === '.xlsx') return null
 if (ext === '.csv') return extractCsv(buffer, ',')
-if (ext === '.tsv') return extractCsv(buffer, '\t')
-if (ext === '.pptx' || ext === '.ppt') return extractOffice(buffer)
-if (ext === '.html' || ext === '.htm') return extractHtml(buffer)
-if (ext === '.xml') return extractXml(buffer)
-if (['.md', '.markdown', '.rst'].includes(ext)) return buffer.toString('utf-8')
 if (ext === '.json') return extractJson(buffer)
-if (ext === '.jsonl') return extractJsonl(buffer)
-if (ext === '.yaml' || ext === '.yml') return extractYaml(buffer)
-if (ext === '.toml') return buffer.toString('utf-8')
-if (ext === '.epub') return extractEpub(buffer)
-if (ext === '.eml') return extractEml(buffer)
-const plainText = new Set(['.txt', '.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.cpp', '.c', '.h', '.cs', '.go', '.rb', '.php', '.swift', '.kt', '.r', '.sql', '.sh', '.bash', '.ps1'])
-if (plainText.has(ext)) return buffer.toString('utf-8')
+if (ext === '.txt') return buffer.toString('utf-8')
 return ''
 }
-function chunkText(text, sourceFile) {
+function isPolicyDocument(text, fileName) {
+const name = (fileName || '').toLowerCase()
+if (/policy|lease|agreement|contract|terms|conditions|rules|manual|handbook|sop|compliance|procedure/i.test(name)) return true
+const sample = text.slice(0, 3000).toLowerCase()
+let signals = 0
+if (/\b(shall|must|hereby|pursuant|notwithstanding|whereas|thereof|herein)\b/.test(sample)) signals += 3
+if (/\b(tenant|landlord|lessee|lessor|party|parties)\b/.test(sample)) signals += 2
+if (/\b(clause|section|article|exhibit|addendum|schedule)\b/.test(sample)) signals += 2
+if (/\b(agreement|contract|policy|lease|terms and conditions)\b/.test(sample)) signals += 2
+if (/\b(security deposit|notice period|termination|eviction|maintenance|late fee)\b/.test(sample)) signals += 3
+if (/^(section|article|clause|\d+\.\d+)\s/im.test(text.slice(0, 5000))) signals += 3
+return signals >= 5
+}
+function chunkPolicyDocument(text, sourceFile) {
+const chunks = []
+let chunkIndex = 0
+const sectionPattern = /^(?:(?:Section|Article|Clause|SECTION|ARTICLE|CLAUSE)\s+\d+[\.\d]*[:\s]|\d+\.\d+[\.\d]*\s+[A-Z]|\d+\s+[A-Z][A-Z\s]{3,}$)/gm
+const sectionMatches = []
+let match
+while ((match = sectionPattern.exec(text)) !== null) {
+sectionMatches.push({ index: match.index, heading: match[0].trim() })
+}
+if (sectionMatches.length < 2) {
+return chunkText(text, sourceFile, true)
+}
+for (let i = 0; i < sectionMatches.length; i++) {
+const start = sectionMatches[i].index
+const end = i + 1 < sectionMatches.length ? sectionMatches[i + 1].index : text.length
+const sectionText = text.slice(start, end).trim()
+const heading = sectionMatches[i].heading
+if (sectionText.length < 30) continue
+if (sectionText.length <= POLICY_CHUNK_SIZE) {
+chunks.push({
+text: sectionText,
+source_file: sourceFile,
+chunk_index: chunkIndex++,
+embedding: [],
+metadata: {
+section_heading: heading,
+is_clause_chunk: true,
+chunk_position: i < 3 ? 'early' : i > sectionMatches.length - 3 ? 'late' : 'middle',
+}
+})
+} else {
+const subChunks = splitWithOverlap(sectionText, POLICY_CHUNK_SIZE, POLICY_CHUNK_OVERLAP)
+for (const sc of subChunks) {
+chunks.push({
+text: sc,
+source_file: sourceFile,
+chunk_index: chunkIndex++,
+embedding: [],
+metadata: {
+section_heading: heading,
+is_clause_chunk: true,
+chunk_position: i < 3 ? 'early' : i > sectionMatches.length - 3 ? 'late' : 'middle',
+}
+})
+}
+}
+}
+if (chunks.length === 0) return chunkText(text, sourceFile, true)
+return chunks
+}
+function splitWithOverlap(text, maxSize, overlap) {
+const sentences = text.match(/[^.!?]+[.!?]+/g) || [text]
+const subChunks = []
+let current = []
+let currentLen = 0
+for (const sent of sentences) {
+if (currentLen + sent.length > maxSize && current.length > 0) {
+subChunks.push(current.join(' '))
+const overlapSentences = []
+let overlapLen = 0
+for (let i = current.length - 1; i >= 0; i--) {
+if (overlapLen + current[i].length <= overlap) {
+overlapSentences.unshift(current[i])
+overlapLen += current[i].length
+} else break
+}
+current = [...overlapSentences]
+currentLen = overlapLen
+}
+current.push(sent)
+currentLen += sent.length
+}
+if (current.length > 0) subChunks.push(current.join(' '))
+return subChunks.filter(s => s.trim().length > 30)
+}
+function chunkText(text, sourceFile, isPolicy = false) {
+const effectiveChunkSize = isPolicy ? POLICY_CHUNK_SIZE : CHUNK_SIZE
 const chunks = []
 let chunkIndex = 0
 const blocks = text.replace(/\r\n/g, '\n').split(/\n{2,}/).map(b => b.trim()).filter(b => b.length > 0)
@@ -1497,22 +1558,34 @@ let buffer = []
 let bufferLength = 0
 function flush() {
 const chunkStr = buffer.join('\n\n')
-if (chunkStr.length >= 30) chunks.push({ text: chunkStr, source_file: sourceFile, chunk_index: chunkIndex++, embedding: [] })
+if (chunkStr.length >= 30) {
+const isDefinitionChunk = /\b(is defined as|means|refers to|is described as)\b/i.test(chunkStr)
+chunks.push({
+text: chunkStr,
+source_file: sourceFile,
+chunk_index: chunkIndex++,
+embedding: [],
+metadata: {
+is_definition_chunk: isDefinitionChunk,
+chunk_position: chunks.length < 3 ? 'early' : 'middle',
+}
+})
+}
 buffer = []
 bufferLength = 0
 }
 for (let bi = 0; bi < blocks.length; bi++) {
 const block = blocks[bi]
-if (block.length > CHUNK_SIZE * 1.5) {
+if (block.length > effectiveChunkSize * 1.5) {
 if (buffer.length > 0) flush()
 const lines = block.split('\n').filter(l => l.trim())
 let lineBuffer = []
 let lineLength = 0
 for (const line of lines) {
 const projected = lineLength + (lineBuffer.length ? 1 : 0) + line.length
-if (lineBuffer.length > 0 && projected > CHUNK_SIZE) {
+if (lineBuffer.length > 0 && projected > effectiveChunkSize) {
 const s = lineBuffer.join('\n')
-if (s.length >= 30) chunks.push({ text: s, source_file: sourceFile, chunk_index: chunkIndex++, embedding: [] })
+if (s.length >= 30) chunks.push({ text: s, source_file: sourceFile, chunk_index: chunkIndex++, embedding: [], metadata: { chunk_position: 'middle' } })
 lineBuffer = lineBuffer.slice(-CHUNK_OVERLAP)
 lineLength = lineBuffer.join('\n').length
 }
@@ -1521,12 +1594,12 @@ lineLength += (lineLength ? 1 : 0) + line.length
 }
 if (lineBuffer.length) {
 const s = lineBuffer.join('\n')
-if (s.length >= 30) chunks.push({ text: s, source_file: sourceFile, chunk_index: chunkIndex++, embedding: [] })
+if (s.length >= 30) chunks.push({ text: s, source_file: sourceFile, chunk_index: chunkIndex++, embedding: [], metadata: { chunk_position: 'middle' } })
 }
 continue
 }
 const projected = bufferLength + (bufferLength ? 2 : 0) + block.length
-if (buffer.length > 0 && projected > CHUNK_SIZE) {
+if (buffer.length > 0 && projected > effectiveChunkSize) {
 const lastBlock = buffer[buffer.length - 1] || ''
 flush()
 if (lastBlock) { buffer.push(lastBlock); bufferLength = lastBlock.length }
@@ -1564,7 +1637,7 @@ batch.map(async (blobName) => {
 const fileName = blobName.split('/').pop()
 const ext = ('.' + fileName.split('.').pop()).toLowerCase()
 const buffer = await downloadBlobAsBuffer(containerClient, blobName)
-if (['.xlsx', '.xls', '.ods'].includes(ext)) {
+if (ext === '.xlsx') {
 const structuredRows = extractSpreadsheet(buffer)
 return structuredRows.map((row, idx) => ({
 text: row.text,
@@ -1576,7 +1649,12 @@ metadata: row.metadata || null,
 }
 const text = await extractTextFromBuffer(buffer, fileName)
 if (!text?.trim()) return []
-return chunkText(text, fileName)
+const isPolicy = isPolicyDocument(text, fileName)
+if (isPolicy) {
+console.log(`[chunkLoader] Detected policy document: ${fileName}`)
+return chunkPolicyDocument(text, fileName)
+}
+return chunkText(text, fileName, false)
 })
 )
 for (const result of results) {
@@ -1597,13 +1675,14 @@ async function loadChunksForClient(clientId) {
 const now = Date.now()
 const cached = CHUNK_CACHE.get(clientId)
 if (cached && cached.chunks) {
-if (now - cached.ts <= CHUNK_CACHE_TTL) return { chunks: cached.chunks, invertedIndex: cached.invertedIndex }
+if (now - cached.ts <= CHUNK_CACHE_TTL) return { chunks: cached.chunks, invertedIndex: cached.invertedIndex, docType: cached.docType }
 if (!cached.loading) {
 const refreshPromise = _doLoadChunks(clientId)
 .then(chunks => {
 const invertedIndex = buildInvertedIndex(chunks)
-CHUNK_CACHE.set(clientId, { chunks, invertedIndex, ts: Date.now(), loading: null })
-console.log(`[chunkCache] Background refresh done for ${clientId}: ${chunks.length} chunks`)
+const docType = detectDocumentType(chunks)
+CHUNK_CACHE.set(clientId, { chunks, invertedIndex, docType, ts: Date.now(), loading: null })
+console.log(`[chunkCache] Background refresh done for ${clientId}: ${chunks.length} chunks, docType=${docType}`)
 })
 .catch(err => {
 const existing = CHUNK_CACHE.get(clientId)
@@ -1612,28 +1691,29 @@ console.warn(`[chunkCache] Background refresh failed for ${clientId}: ${err.mess
 })
 CHUNK_CACHE.set(clientId, { ...cached, loading: refreshPromise })
 }
-return { chunks: cached.chunks, invertedIndex: cached.invertedIndex }
+return { chunks: cached.chunks, invertedIndex: cached.invertedIndex, docType: cached.docType }
 }
 if (cached && cached.loading) {
 await cached.loading
 const entry = CHUNK_CACHE.get(clientId)
-return { chunks: entry?.chunks || [], invertedIndex: entry?.invertedIndex || null }
+return { chunks: entry?.chunks || [], invertedIndex: entry?.invertedIndex || null, docType: entry?.docType || 'mixed' }
 }
 const loadPromise = _doLoadChunks(clientId)
 .then(chunks => {
 const invertedIndex = buildInvertedIndex(chunks)
-CHUNK_CACHE.set(clientId, { chunks, invertedIndex, ts: Date.now(), loading: null })
-console.log(`[chunkCache] Loaded ${chunks.length} chunks for ${clientId}`)
+const docType = detectDocumentType(chunks)
+CHUNK_CACHE.set(clientId, { chunks, invertedIndex, docType, ts: Date.now(), loading: null })
+console.log(`[chunkCache] Loaded ${chunks.length} chunks for ${clientId}, docType=${docType}`)
 return chunks
 })
 .catch(err => {
-CHUNK_CACHE.set(clientId, { chunks: null, invertedIndex: null, ts: 0, loading: null })
+CHUNK_CACHE.set(clientId, { chunks: null, invertedIndex: null, docType: 'mixed', ts: 0, loading: null })
 throw err
 })
-CHUNK_CACHE.set(clientId, { chunks: null, invertedIndex: null, ts: 0, loading: loadPromise })
+CHUNK_CACHE.set(clientId, { chunks: null, invertedIndex: null, docType: 'mixed', ts: 0, loading: loadPromise })
 await loadPromise
 const entry = CHUNK_CACHE.get(clientId)
-return { chunks: entry?.chunks || [], invertedIndex: entry?.invertedIndex || null }
+return { chunks: entry?.chunks || [], invertedIndex: entry?.invertedIndex || null, docType: entry?.docType || 'mixed' }
 }
 function invalidateChunkCache(clientId) {
 CHUNK_CACHE.delete(clientId)
@@ -1751,13 +1831,14 @@ app.get('/health', (req, res) => res.json({
 ok: true,
 service: 'ask-data',
 engines: { primary: ASKDATA_ENDPOINT ? 'configured' : 'missing', fallback: ASKDATA2_ENDPOINT ? 'configured' : 'missing' },
-embeddings: AZURE_EMBED_ENDPOINT ? `azure (${AZURE_EMBED_MODEL})` : 'keyword-only',
-reranker: RERANKER_ENDPOINT ? 'configured' : 'disabled',
+embeddings: 'keyword-bm25-hybrid (no external API)',
+reranker: 'lightweight-in-code',
 chunkCacheSize: CHUNK_CACHE.size,
 responseCacheSize: RESPONSE_CACHE.size,
 primaryCircuitOpen: askedataCircuitOpen(),
 primaryFailures: askedataFailures,
 maxHits: MAX_HITS_GLOBAL,
+supportedExtensions: [...SUPPORTED_EXTENSIONS],
 }))
 app.post('/client/verify', async (req, res) => {
 try {
@@ -1948,7 +2029,7 @@ const { clientId, name } = req.client
 const intent = detectQueryIntent(query.trim())
 if (intent === 'greeting') {
 return res.json({
-answer: "Hello! I'm your data dictionary assistant. Ask me anything about your measures, attributes, or reports.",
+answer: "Hello! I'm your document assistant. Ask me anything about your data dictionary measures or building rent policies.",
 sources: [],
 conversationId: conversationId || null,
 client: { clientId, name },
@@ -1968,27 +2049,22 @@ return res.json({ ...result, conversationId: activeConversationId })
 } catch { }
 }
 const requestPromise = (async () => {
-const { chunks, invertedIndex } = await loadChunksForClient(clientId)
+const { chunks, invertedIndex, docType } = await loadChunksForClient(clientId)
 if (chunks.length === 0) {
 return { answer: 'No documents found for your account. Please ensure your documents have been ingested first.', sources: [], client: { clientId, name } }
 }
 let processedQuery = applyTypos(query.trim())
-console.log(`[QueryPipeline] Original: "${query.trim()}"`)
-if (processedQuery !== query.trim()) {
-console.log(`[QueryPipeline] After typos: "${processedQuery}"`)
-}
+if (processedQuery !== query.trim()) console.log(`[QueryPipeline] After typos: "${processedQuery}"`)
 processedQuery = applySynonyms(processedQuery)
 const fuzzyResult = fuzzyCorrectQuery(processedQuery, chunks)
-if (fuzzyResult !== processedQuery) {
-console.log(`[QueryPipeline] After fuzzy: "${fuzzyResult}"`)
-}
+if (fuzzyResult !== processedQuery) console.log(`[QueryPipeline] After fuzzy: "${fuzzyResult}"`)
 processedQuery = fuzzyResult
 const rewritten = await preprocessQuery(processedQuery)
-if (rewritten !== processedQuery) {
-console.log(`[QueryPipeline] After rewrite: "${rewritten}"`)
-}
+if (rewritten !== processedQuery) console.log(`[QueryPipeline] After rewrite: "${rewritten}"`)
 processedQuery = rewritten
-if (intent === 'all_urls') {
+const effectiveDocType = docType || 'mixed'
+const effectiveIntent = detectQueryIntent(processedQuery)
+if (effectiveIntent === 'all_urls') {
 const urlChunks = chunks.filter(c => /https?:\/\/\S+/.test(c.text || ''))
 const urlEntries = extractAllUrlsFromChunks(urlChunks)
 const answer = urlEntries.length > 0 ? urlEntries.map(e => `**${e.name}:** ${e.url}`).join('\n') : "I could not find any URLs in your documents."
@@ -1998,29 +2074,16 @@ return { answer, sources, client: { clientId, name } }
 const multiTopicCheck = detectMultiTopicQuery(processedQuery)
 if (multiTopicCheck.isMulti) {
 console.log(`[chat/message] Multi-topic detected: ${JSON.stringify(multiTopicCheck.topics)} mode=${multiTopicCheck.mode}`)
-const answer = await handleMultiTopicQuery(multiTopicCheck.topics, multiTopicCheck.mode, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndex)
+const answer = await handleMultiTopicQuery(multiTopicCheck.topics, multiTopicCheck.mode, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndex, effectiveDocType)
 return { answer, sources: [], client: { clientId, name } }
 }
-let hits = await retrieveChunks(processedQuery, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndex)
+let hits = await retrieveChunks(processedQuery, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndex, effectiveDocType)
 if (hits.length === 0) hits = relaxedKeywordSearch(processedQuery, chunks, 64, invertedIndex)
-console.log(`[chat/message] "${query.slice(0, 60)}" → intent=${intent}, subject="${extractSubject(processedQuery)}", hits=${hits.length}, topScore=${hits[0]?._score?.toFixed(2) || 0}`)
+console.log(`[chat/message] "${query.slice(0, 60)}" → intent=${effectiveIntent}, docType=${effectiveDocType}, subject="${extractSubject(processedQuery)}", hits=${hits.length}, topScore=${hits[0]?._score?.toFixed(2) || 0}`)
 if (hits.length === 0) {
 return { answer: "I could not find relevant information about this in your documents. Try rephrasing your question.", sources: [], client: { clientId, name } }
 }
-let rawAnswer = ''
-if (intent !== 'url_lookup') {
-try {
-rawAnswer = await Promise.race([
-generateAnswer(processedQuery, hits, intent),
-new Promise((_, reject) => setTimeout(() => reject(new Error('All engines timed out')), 55000)),
-])
-} catch (err) {
-console.warn(`[chat/message] All engines failed, using rule-based fallback: ${err.message}`)
-}
-}
-const isBlank = !rawAnswer || rawAnswer.trim().length < 15
-const answer = isBlank ? buildFallbackAnswer(processedQuery, hits, intent) : cleanAnswer(rawAnswer)
-if (isBlank) console.warn(`[chat/message] Blank from all engines, used rule-based fallback for: "${query.slice(0, 60)}"`)
+const answer = await generateAnswerWithFallback(processedQuery, hits, effectiveIntent, effectiveDocType, chunks, invertedIndex, Math.min(topK, MAX_HITS_GLOBAL))
 const sources = hits.map(h => ({
 source_file: h.source_file || 'unknown',
 chunk_index: h.chunk_index ?? 0,
@@ -2048,7 +2111,8 @@ const PORT = process.env.PORT || 4000
 app.listen(PORT, () => {
 console.log(`Service running on port ${PORT}`)
 console.log(`ASKDATA: ${ASKDATA_ENDPOINT ? 'configured' : 'MISSING'} | ASKDATA2: ${ASKDATA2_ENDPOINT ? 'configured' : 'missing'}`)
-console.log(`Embedding model: ${AZURE_EMBED_MODEL} | Reranker: ${RERANKER_ENDPOINT ? 'configured' : 'disabled'} | MAX_HITS: ${MAX_HITS_GLOBAL}`)
+console.log(`Embeddings: keyword-BM25-hybrid (no external API) | Reranker: in-code lightweight | MAX_HITS: ${MAX_HITS_GLOBAL}`)
+console.log(`Supported formats: ${[...SUPPORTED_EXTENSIONS].join(', ')}`)
 startApiKeyHealthChecker()
 warmupChunkCaches()
 })
