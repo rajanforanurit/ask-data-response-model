@@ -1,4 +1,3 @@
-
 require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
@@ -10,6 +9,7 @@ const XLSX = require('xlsx')
 const Papa = require('papaparse')
 const stringSimilarity = require('string-similarity')
 const crypto = require('crypto')
+const { resolveIntent } = require('./ed')
 const app = express()
 const allowedOrigins = [
 'http://localhost:8080',
@@ -635,10 +635,6 @@ if (/\b(accuracy|precision|recall|f1)\b/.test(q) && /\b(accuracy|precision|recal
 if (/\b(cnn|resnet|mobilenet|vgg|inception|densenet|xception|efficientnet)\b/.test(q)) {
 const modelName = q.match(/\b(cnn|resnet|mobilenet|vgg|inception|densenet|xception|efficientnet)\b/)?.[0] || ''
 if (modelName && new RegExp(`\\b${escapeRegex(modelName)}\\b`, 'i').test(t)) score += 20
-}
-if (c && c.metadata && c.metadata.section_heading) {
-const headingLower = (c.metadata.section_heading || '').toLowerCase()
-if (/\b(result|performance|experiment|evaluation|comparison|accuracy)\b/.test(headingLower)) score += 10
 }
 if (/\b(table|figure)\s+\d/.test(t)) score += 5
 return score
@@ -2138,18 +2134,14 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req, res) 
 try {
 const { query, topK = 6, conversationId } = req.body
 if (!query?.trim()) return res.status(400).json({ error: 'query is required' })
-const validation = validateQuery(query)
-if (!validation.valid) return res.json({ answer: validation.message, sources: [], conversationId: conversationId || null, client: req.client })
 const { clientId, name } = req.client
-const intent = detectQueryIntent(query.trim())
-if (intent === 'greeting') {
-return res.json({
-answer: "Hello! I'm your document assistant. Ask me anything about your data dictionary measures, building rent policies, or research papers.",
-sources: [],
-conversationId: conversationId || null,
-client: { clientId, name },
-})
+const intentResult = resolveIntent(query.trim())
+if (intentResult) {
+const activeConversationId = await saveConversationMessage(clientId, conversationId || null, query.trim(), intentResult.response, [])
+return res.json({ answer: intentResult.response, sources: [], conversationId: activeConversationId, client: { clientId, name } })
 }
+const validation = validateQuery(query)
+if (!validation.valid) return res.json({ answer: validation.message, sources: [], conversationId: conversationId || null, client: { clientId, name } })
 const cacheKey = getCacheKey(clientId, query)
 const cached = responseCacheGet(cacheKey)
 if (cached) {
