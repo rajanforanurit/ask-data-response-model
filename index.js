@@ -1,3 +1,4 @@
+
 require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
@@ -65,6 +66,8 @@ const CHUNK_SIZE = 1200
 const CHUNK_OVERLAP = 2
 const POLICY_CHUNK_SIZE = 900
 const POLICY_CHUNK_OVERLAP = 150
+const RESEARCH_CHUNK_SIZE = 600
+const RESEARCH_CHUNK_OVERLAP = 100
 const BLOB_CONCURRENCY = parseInt(process.env.BLOB_CONCURRENCY || '8', 10)
 const CHUNK_CACHE_TTL = parseInt(process.env.CHUNK_CACHE_TTL_MS || '300000', 10)
 const MAX_HITS_GLOBAL = 50
@@ -258,18 +261,21 @@ return { valid: true }
 }
 function detectDocumentType(chunks) {
 if (!chunks || chunks.length === 0) return 'mixed'
-let policySignals = 0, dictSignals = 0
+let policySignals = 0, dictSignals = 0, researchSignals = 0
 const sample = chunks.slice(0, Math.min(50, chunks.length))
 for (const c of sample) {
 const t = (c.text || '').toLowerCase()
 if (c.metadata && (c.metadata.measure || c.metadata.formula !== undefined)) dictSignals += 3
-if (/\b(shall|must|tenant|landlord|lessee|lessor|clause|section|article|policy|agreement|herein|thereof|pursuant|notwithstanding|whereas|hereby)\b/.test(t)) policySignals++
+if (/\b(shall|must|tenant|landlord|lessee|lessor|clause|policy|agreement|herein|thereof|pursuant|notwithstanding|whereas|hereby)\b/.test(t)) policySignals++
 if (/\b(rent|lease|deposit|notice|termination|eviction|maintenance|penalty|breach|obligation|liability)\b/.test(t)) policySignals++
 if (/\b(is defined as|formula|calculated as|computed as|measure|attribute|kpi|metric)\b/.test(t)) dictSignals++
-if (/^\d+\.\d+\s+[A-Z]/.test(c.text || '') || /^(Section|Article|Clause)\s+\d+/i.test(c.text || '')) policySignals += 2
+if (/^(section|article|clause|\d+\.\d+)/im.test(c.text || '')) policySignals += 2
+if (/\b(abstract|introduction|methodology|conclusion|accuracy|precision|recall|epoch|neural|dataset|training|validation|classification|model|algorithm|experiment|results?)\b/.test(t)) researchSignals++
+if (/\b(figure\s+\d|table\s+\d|et\s+al|doi:|references?|bibliography|ieee|arxiv)\b/.test(t)) researchSignals += 2
 }
-if (policySignals > dictSignals * 1.5) return 'policy'
-if (dictSignals > policySignals * 1.5) return 'dictionary'
+if (researchSignals > policySignals * 2 && researchSignals > dictSignals * 2) return 'research'
+if (policySignals > dictSignals * 1.5 && policySignals > researchSignals * 1.5) return 'policy'
+if (dictSignals > policySignals * 1.5 && dictSignals > researchSignals * 1.5) return 'dictionary'
 return 'mixed'
 }
 function detectQueryIntent(query) {
@@ -478,6 +484,7 @@ const DOMAIN_SHORT_SAFELIST = new Set([
 'tax', 'due', 'paid', 'void', 'open', 'loss', 'gain', 'flow', 'days', 'beds',
 'bath', 'sqft', 'tier', 'band', 'code', 'flag', 'rank', 'sort', 'key', 'ref',
 'clause', 'rule', 'policy', 'lease', 'notice', 'deposit', 'penalty', 'breach',
+'cnn', 'rnn', 'lstm', 'gru', 'svm', 'mlp', 'knn', 'pca', 'gan', 'vgg',
 ])
 function fuzzyCorrectQuery(query, chunks) {
 if (!chunks || chunks.length === 0) return query
@@ -495,7 +502,7 @@ const { bestMatch } = stringSimilarity.findBestMatch(wordLower, vocabulary)
 const levSim = levenshteinSimilarity(wordLower, bestMatch.target)
 const combinedScore = bestMatch.rating * 0.6 + levSim * 0.4
 if (combinedScore >= 0.72 && bestMatch.target !== wordLower) {
-console.log(`[fuzzyCorrect] "${word}" → "${bestMatch.target}" (combined: ${combinedScore.toFixed(3)})`)
+console.log(`[fuzzyCorrect] "${word}" -> "${bestMatch.target}" (combined: ${combinedScore.toFixed(3)})`)
 return bestMatch.target
 }
 return word
@@ -532,7 +539,7 @@ model: ASKDATA2_MODEL,
 messages: [
 {
 role: 'system',
-content: 'You are a query rewriter for a document RAG system that handles real estate data dictionaries and building rent/lease policy documents. Fix spelling, grammar, ambiguity, and structure. Expand abbreviations (app→application, occ→occupancy, sec dep→security deposit, notice per→notice period). Normalize week numbers (week 5→week 05). Return ONLY the rewritten query as plain text. No explanation. If already correct, return unchanged.',
+content: 'You are a query rewriter for a document RAG system handling data dictionaries, rent/lease policy documents, and research papers. Fix spelling, grammar, ambiguity, and structure. Expand abbreviations (app->application, occ->occupancy, sec dep->security deposit, notice per->notice period, CNN->Convolutional Neural Network when context is research). Normalize week numbers (week 5->week 05). Return ONLY the rewritten query as plain text. No explanation. If already correct, return unchanged.',
 },
 { role: 'user', content: query },
 ],
@@ -619,6 +626,23 @@ if (chunkText.trim().length > 200 && chunkText.trim().length < 1000) score += 5
 }
 return score
 }
+function computeResearchRelevanceScore(query, chunkText) {
+const q = query.toLowerCase()
+const t = chunkText.toLowerCase()
+let score = 0
+if (/\b(accuracy|precision|recall|f1|f-score|auc|roc)\b/.test(q) && /\b\d+\.?\d*\s*%?\b/.test(t)) score += 20
+if (/\b(accuracy|precision|recall|f1)\b/.test(q) && /\b(accuracy|precision|recall|f1)\b/.test(t)) score += 15
+if (/\b(cnn|resnet|mobilenet|vgg|inception|densenet|xception|efficientnet)\b/.test(q)) {
+const modelName = q.match(/\b(cnn|resnet|mobilenet|vgg|inception|densenet|xception|efficientnet)\b/)?.[0] || ''
+if (modelName && new RegExp(`\\b${escapeRegex(modelName)}\\b`, 'i').test(t)) score += 20
+}
+if (c && c.metadata && c.metadata.section_heading) {
+const headingLower = (c.metadata.section_heading || '').toLowerCase()
+if (/\b(result|performance|experiment|evaluation|comparison|accuracy)\b/.test(headingLower)) score += 10
+}
+if (/\b(table|figure)\s+\d/.test(t)) score += 5
+return score
+}
 function lightweightRerank(query, chunks, intent, docType) {
 if (chunks.length === 0) return chunks
 const queryLower = query.toLowerCase()
@@ -626,12 +650,22 @@ const queryTerms = queryLower.replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => 
 const totalLen = chunks.reduce((sum, c) => sum + (c.text || '').split(/\s+/).length, 0)
 const avgChunkLen = totalLen / chunks.length || 100
 const isPolicyQuery = ['policy_lookup', 'policy_consequence', 'policy_permission', 'policy_numeric'].includes(intent)
+const isResearchDoc = docType === 'research'
 return chunks.map(c => {
 const text = c.text || ''
 const bm25 = computeBM25Score(queryTerms, text, avgChunkLen)
 let rerankScore = bm25 * 10
 if (docType === 'policy' || isPolicyQuery) {
 rerankScore += computePolicyRelevanceScore(query, text, intent)
+}
+if (isResearchDoc || docType === 'mixed') {
+if (/\b(accuracy|precision|recall|f1|result|performance|model|training|epoch)\b/i.test(queryLower)) {
+if (c.metadata && c.metadata.section_heading) {
+const hl = (c.metadata.section_heading || '').toLowerCase()
+if (/\b(result|performance|experiment|evaluation|comparison|accuracy|discussion)\b/.test(hl)) rerankScore += 15
+}
+if (/\b\d+\.?\d*\s*%\b/.test(text)) rerankScore += 8
+}
 }
 if (c.metadata) {
 if (c.metadata.section_heading) {
@@ -641,6 +675,7 @@ rerankScore += headingTermMatches * 8
 }
 if (c.metadata.is_definition_chunk) rerankScore += (intent === 'definition' ? 12 : 0)
 if (c.metadata.is_clause_chunk) rerankScore += (isPolicyQuery ? 12 : 0)
+if (c.metadata.is_research_section) rerankScore += (isResearchDoc ? 5 : 0)
 if (c.metadata.chunk_position === 'early' && (intent === 'definition' || intent === 'policy_lookup')) rerankScore += 3
 }
 const queryPhraseRegex = new RegExp(escapeRegex(queryLower.slice(0, 30)), 'i')
@@ -853,6 +888,10 @@ if (subjectWords.some(w => headingLower.includes(w))) score += 25
 }
 if (/\b(shall|must|tenant|landlord|lessee|lessor|pursuant|clause|section|article|agreement)\b/i.test(text)) score += 8
 }
+if (c.metadata && c.metadata.section_heading) {
+const headingLower = (c.metadata.section_heading || '').toLowerCase()
+if (subjectWords.some(w => new RegExp(`\\b${escapeRegex(w)}\\b`).test(headingLower))) score += 15
+}
 if (c.metadata && c.metadata.measure) {
 const measureLower = (c.metadata.measure || '').toLowerCase().trim()
 if (measureLower === subject.toLowerCase().trim()) score += 100
@@ -921,7 +960,7 @@ let topCandidates = []
 if (topScore >= 6) topCandidates = pool.slice(0, Math.min(MAX_HITS, pool.length))
 else if ((intent === 'definition' || intent === 'calculation') && topScore >= 3) topCandidates = pool.slice(0, Math.min(MAX_HITS, pool.length))
 else if (isPolicyIntent && topScore >= 2) topCandidates = pool.slice(0, Math.min(MAX_HITS, pool.length))
-else if (intent === 'url_lookup' && pool.length > 0) return pool.slice(0, Math.min(topK, 6))
+else if (topScore >= 2) topCandidates = pool.slice(0, Math.min(20, pool.length))
 if (topCandidates.length === 0 && !_isRetry) {
 const corrected = fuzzyCorrectQuery(query, chunks)
 if (corrected.toLowerCase() !== query.toLowerCase()) {
@@ -969,6 +1008,12 @@ If the context does not contain the answer, say: "I could not find this in your 
 Intent rule (highest priority): ${intentRule}
 Be specific: if a clause says "30 days written notice", say exactly that.`
 }
+if (docType === 'research') {
+return `You are a research paper assistant. Answer ONLY from the provided context sections of the research paper.
+Rules: Answer in clear, factual language. For accuracy/performance questions, state the exact numbers found. For methodology questions, describe the approach used. For concept questions, give a precise technical explanation. No source references like [1]. Keep answers to 2-4 sentences unless listing items.
+If the context does not contain the answer, say: "I could not find this in your documents."
+Intent rule (highest priority): For performance metrics (accuracy, precision, recall), state exact numbers. For model descriptions, describe architecture and purpose. For comparisons, list each model with its metric side by side.`
+}
 const intentRule = intent === 'definition'
 ? 'Definition: Bold measure name, one sentence definition only. No formula or calculation details.'
 : intent === 'calculation'
@@ -985,23 +1030,13 @@ Formats: Definition: "**[Name]** is [desc]." | Calculation: "**Formula for [Name
 function buildDynamicSystemPrompt(intent, docType) {
 const basePrompt = buildSystemPrompt(intent, docType)
 const isPolicyDoc = docType === 'policy' || ['policy_lookup', 'policy_consequence', 'policy_permission', 'policy_numeric'].includes(intent)
+const isResearchDoc = docType === 'research'
+if (isResearchDoc) {
+return basePrompt + `\nRECOVERY MODE: Look for semantically related terms. Model names may appear abbreviated (CNN, MobileNetV2, ResNet50). Performance metrics may appear in tables or result sections. Synthesize from any relevant context found.`
+}
 const recoveryInstructions = isPolicyDoc
-? `
-RECOVERY MODE: The initial retrieval may have returned partial results. Apply these strategies:
-1. Look for semantically related terms: "tenant" and "lessee" mean the same, "landlord" and "lessor" mean the same.
-2. A rule about "30-day notice" answers queries about "notice period", "how much notice", "notice requirement".
-3. Conditions on deposits answer questions about "security deposit return", "deposit refund", "when do I get deposit back".
-4. If multiple clauses are partially relevant, synthesize them into a coherent answer.
-5. Identify implied answers: if the document says rent is due on the 1st and mentions a grace period, that answers "when is rent due".
-6. Look for numerical values that answer the query even if phrased differently.
-Answer from what IS in context, even if imperfect. Do not say "I could not find" if there is any relevant information present.`
-: `
-RECOVERY MODE: The initial retrieval may have returned partial results. Apply these strategies:
-1. Look for semantically equivalent terms and acronyms for the measure name.
-2. Check if the measure is referenced differently (abbreviated, reordered words).
-3. If a partial definition exists, use it rather than returning empty.
-4. Synthesize an answer from related chunks if direct definition is missing.
-Answer from what IS in context, even if imperfect.`
+? `\nRECOVERY MODE: The initial retrieval may have returned partial results. Apply these strategies:\n1. Look for semantically related terms: "tenant" and "lessee" mean the same, "landlord" and "lessor" mean the same.\n2. A rule about "30-day notice" answers queries about "notice period", "how much notice", "notice requirement".\n3. Conditions on deposits answer questions about "security deposit return", "deposit refund", "when do I get deposit back".\n4. If multiple clauses are partially relevant, synthesize them into a coherent answer.\n5. Identify implied answers: if the document says rent is due on the 1st and mentions a grace period, that answers "when is rent due".\n6. Look for numerical values that answer the query even if phrased differently.\nAnswer from what IS in context, even if imperfect. Do not say "I could not find" if there is any relevant information present.`
+: `\nRECOVERY MODE: The initial retrieval may have returned partial results. Apply these strategies:\n1. Look for semantically equivalent terms and acronyms for the measure name.\n2. Check if the measure is referenced differently (abbreviated, reordered words).\n3. If a partial definition exists, use it rather than returning empty.\n4. Synthesize an answer from related chunks if direct definition is missing.\nAnswer from what IS in context, even if imperfect.`
 return basePrompt + recoveryInstructions
 }
 function buildUserMessage(query, hits, intent, docType) {
@@ -1009,7 +1044,7 @@ const context = buildContext(hits)
 const subject = extractSubject(query)
 const isPolicyIntent = ['policy_lookup', 'policy_consequence', 'policy_permission', 'policy_numeric'].includes(intent)
 let instruction = ''
-if (intent === 'definition' && docType !== 'policy') {
+if (intent === 'definition' && docType !== 'policy' && docType !== 'research') {
 instruction = `\n\nFrom the context, write a one-sentence definition of "${subject}". Bold the name. No formula or calculation. End with one period.`
 } else if (intent === 'calculation') {
 instruction = `\n\nFrom the context, return only: "**Formula for ${capFirst(subject)}:** [formula]." No definition or description.`
@@ -1021,6 +1056,8 @@ instruction = `\n\nFrom the context, list ALL URLs. Format: name: URL. One per l
 instruction = `\n\nFrom the context, compare: ${query}. Bold each name. Provide a concise definition for each based strictly on the context. End with a "**Key Difference:**" sentence. One period at end.`
 } else if (isPolicyIntent || docType === 'policy') {
 instruction = `\n\nUsing ONLY the context provided, answer this question about the policy/lease/agreement: "${query}"\n\nBe specific and direct. Include exact numbers, timeframes, or conditions if present. Do not add information not found in the context. 2-4 sentences maximum.`
+} else if (docType === 'research') {
+instruction = `\n\nUsing ONLY the context provided from the research paper, answer this question: "${query}"\n\nBe factual and precise. If the answer involves numbers (accuracy, epochs, dataset size), state them exactly. 2-4 sentences maximum.`
 } else {
 instruction = `\n\nFrom the context, answer in clear sentences: ${query}. Answer only what was asked. No pipe characters. One period at end.`
 }
@@ -1083,6 +1120,7 @@ const subject = extractSubject(query)
 const subjectLower = subject.toLowerCase()
 const escapedSubject = escapeRegex(subjectLower)
 const isPolicyDoc = docType === 'policy' || ['policy_lookup', 'policy_consequence', 'policy_permission', 'policy_numeric'].includes(resolvedIntent)
+const isResearchDoc = docType === 'research'
 if (resolvedIntent === 'all_urls') {
 const urlEntries = extractAllUrlsFromChunks(hits)
 if (urlEntries.length === 0) return "I could not find any URLs in your documents."
@@ -1109,14 +1147,16 @@ if (urlMatch) return urlMatch[0].replace(/[.,;)]+$/, '').trim()
 }
 return "I could not find a matching URL in your documents."
 }
-if (isPolicyDoc) {
+if (isPolicyDoc || isResearchDoc) {
 const relevantLines = []
 for (const h of hits) {
 const lines = (h.text || '').split(/\n+/)
 for (const line of lines) {
 if (!new RegExp(`\\b${escapedSubject}\\b`, 'i').test(line) && line.trim().length < 50) continue
 if (line.trim().length < 20) continue
-const isMeaningful = /\b(shall|must|may|tenant|landlord|days?|months?|\d+|notice|deposit|rent|fee|penalty|require|allow|permit|prohibit|right|obligation)\b/i.test(line)
+const isMeaningful = isResearchDoc
+? /\b(\d+\.?\d*\s*%?|accuracy|precision|recall|epoch|model|training|validation|classification|detection|dataset|result|performance)\b/i.test(line)
+: /\b(shall|must|may|tenant|landlord|days?|months?|\d+|notice|deposit|rent|fee|penalty|require|allow|permit|prohibit|right|obligation)\b/i.test(line)
 if (isMeaningful || new RegExp(`\\b${escapedSubject}\\b`, 'i').test(line)) {
 relevantLines.push(line.trim())
 }
@@ -1347,7 +1387,7 @@ console.warn(`[generateAnswerWithFallback] Primary failed: ${err.message}`)
 }
 if (!isWeakAnswer(rawAnswer)) return cleanAnswer(rawAnswer)
 console.log(`[DynamicFallback] Weak primary answer detected, triggering fallback recovery for: "${query.slice(0, 60)}"`)
-const expandedQuery = expandQueryForPolicy(query)
+const expandedQuery = docType === 'policy' ? expandQueryForPolicy(query) : query
 let fallbackHits = await retrieveChunks(expandedQuery, chunks, Math.min(topK * 2, 20), invertedIndex, docType)
 if (fallbackHits.length === 0) fallbackHits = relaxedKeywordSearch(expandedQuery, chunks, 32, invertedIndex)
 if (fallbackHits.length === 0) {
@@ -1461,6 +1501,20 @@ if (ext === '.json') return extractJson(buffer)
 if (ext === '.txt') return buffer.toString('utf-8')
 return ''
 }
+function isResearchDocument(text, fileName) {
+const name = (fileName || '').toLowerCase()
+if (/research|paper|study|survey|journal|conference|thesis|dissertation|preprint/i.test(name)) return true
+const sample = text.slice(0, 4000).toLowerCase()
+let signals = 0
+if (/\b(abstract|introduction|methodology|related\s+work|literature\s+review)\b/.test(sample)) signals += 3
+if (/\b(conclusion|results?|discussion|experiments?|evaluation)\b/.test(sample)) signals += 2
+if (/\b(accuracy|precision|recall|f1.score|auc|roc|confusion\s+matrix)\b/.test(sample)) signals += 3
+if (/\b(neural\s+network|deep\s+learning|machine\s+learning|convolutional|classification|detection)\b/.test(sample)) signals += 2
+if (/\b(dataset|training\s+set|test\s+set|validation|epoch|batch\s+size|learning\s+rate)\b/.test(sample)) signals += 2
+if (/\b(et\s+al|doi:|arxiv|ieee|figure\s+\d|table\s+\d|references)\b/.test(sample)) signals += 3
+if (/\b(proposed\s+(model|method|approach|framework)|our\s+(model|method|approach))\b/.test(sample)) signals += 2
+return signals >= 6
+}
 function isPolicyDocument(text, fileName) {
 const name = (fileName || '').toLowerCase()
 if (/policy|lease|agreement|contract|terms|conditions|rules|manual|handbook|sop|compliance|procedure/i.test(name)) return true
@@ -1468,11 +1522,63 @@ const sample = text.slice(0, 3000).toLowerCase()
 let signals = 0
 if (/\b(shall|must|hereby|pursuant|notwithstanding|whereas|thereof|herein)\b/.test(sample)) signals += 3
 if (/\b(tenant|landlord|lessee|lessor|party|parties)\b/.test(sample)) signals += 2
-if (/\b(clause|section|article|exhibit|addendum|schedule)\b/.test(sample)) signals += 2
+if (/\b(clause|exhibit|addendum|schedule)\b/.test(sample)) signals += 2
+if (/\b(section|article)\b/.test(sample)) signals += 1
 if (/\b(agreement|contract|policy|lease|terms and conditions)\b/.test(sample)) signals += 2
 if (/\b(security deposit|notice period|termination|eviction|maintenance|late fee)\b/.test(sample)) signals += 3
 if (/^(section|article|clause|\d+\.\d+)\s/im.test(text.slice(0, 5000))) signals += 3
+if (/\b(abstract|methodology|conclusion|accuracy|precision|recall|epoch|neural|model|dataset|training|validation|figure|table\s+\d)\b/.test(sample)) signals -= 3
 return signals >= 5
+}
+function chunkResearchDocument(text, sourceFile) {
+const chunks = []
+let chunkIndex = 0
+const sectionPattern = /^(?:(?:Abstract|Introduction|Background|Related\s+Work|Literature\s+Review|Methodology|Methods?|Proposed\s+(?:Method|Model|Approach|Framework)|(?:Experimental\s+)?(?:Results?|Evaluation|Discussion)|Conclusion|References?|Acknowledgements?|Appendix)\s*\n|(?:\d+\.?\s+[A-Z][A-Za-z\s]{3,})\n)/gm
+const sectionMatches = []
+let match
+while ((match = sectionPattern.exec(text)) !== null) {
+sectionMatches.push({ index: match.index, heading: match[0].trim() })
+}
+if (sectionMatches.length < 2) {
+return chunkTextWithSize(text, sourceFile, RESEARCH_CHUNK_SIZE, RESEARCH_CHUNK_OVERLAP, false)
+}
+for (let i = 0; i < sectionMatches.length; i++) {
+const start = sectionMatches[i].index
+const end = i + 1 < sectionMatches.length ? sectionMatches[i + 1].index : text.length
+const sectionText = text.slice(start, end).trim()
+const heading = sectionMatches[i].heading
+if (sectionText.length < 30) continue
+if (sectionText.length <= RESEARCH_CHUNK_SIZE) {
+chunks.push({
+text: sectionText,
+source_file: sourceFile,
+chunk_index: chunkIndex++,
+embedding: [],
+metadata: {
+section_heading: heading,
+is_research_section: true,
+chunk_position: i < 2 ? 'early' : i > sectionMatches.length - 2 ? 'late' : 'middle',
+}
+})
+} else {
+const subChunks = splitWithOverlap(sectionText, RESEARCH_CHUNK_SIZE, RESEARCH_CHUNK_OVERLAP)
+for (const sc of subChunks) {
+chunks.push({
+text: sc,
+source_file: sourceFile,
+chunk_index: chunkIndex++,
+embedding: [],
+metadata: {
+section_heading: heading,
+is_research_section: true,
+chunk_position: i < 2 ? 'early' : i > sectionMatches.length - 2 ? 'late' : 'middle',
+}
+})
+}
+}
+}
+if (chunks.length === 0) return chunkTextWithSize(text, sourceFile, RESEARCH_CHUNK_SIZE, RESEARCH_CHUNK_OVERLAP, false)
+return chunks
 }
 function chunkPolicyDocument(text, sourceFile) {
 const chunks = []
@@ -1484,7 +1590,7 @@ while ((match = sectionPattern.exec(text)) !== null) {
 sectionMatches.push({ index: match.index, heading: match[0].trim() })
 }
 if (sectionMatches.length < 2) {
-return chunkText(text, sourceFile, true)
+return chunkTextWithSize(text, sourceFile, POLICY_CHUNK_SIZE, POLICY_CHUNK_OVERLAP, true)
 }
 for (let i = 0; i < sectionMatches.length; i++) {
 const start = sectionMatches[i].index
@@ -1521,7 +1627,7 @@ chunk_position: i < 3 ? 'early' : i > sectionMatches.length - 3 ? 'late' : 'midd
 }
 }
 }
-if (chunks.length === 0) return chunkText(text, sourceFile, true)
+if (chunks.length === 0) return chunkTextWithSize(text, sourceFile, POLICY_CHUNK_SIZE, POLICY_CHUNK_OVERLAP, true)
 return chunks
 }
 function splitWithOverlap(text, maxSize, overlap) {
@@ -1549,8 +1655,7 @@ currentLen += sent.length
 if (current.length > 0) subChunks.push(current.join(' '))
 return subChunks.filter(s => s.trim().length > 30)
 }
-function chunkText(text, sourceFile, isPolicy = false) {
-const effectiveChunkSize = isPolicy ? POLICY_CHUNK_SIZE : CHUNK_SIZE
+function chunkTextWithSize(text, sourceFile, effectiveChunkSize, overlap, isPolicy) {
 const chunks = []
 let chunkIndex = 0
 const blocks = text.replace(/\r\n/g, '\n').split(/\n{2,}/).map(b => b.trim()).filter(b => b.length > 0)
@@ -1586,7 +1691,7 @@ const projected = lineLength + (lineBuffer.length ? 1 : 0) + line.length
 if (lineBuffer.length > 0 && projected > effectiveChunkSize) {
 const s = lineBuffer.join('\n')
 if (s.length >= 30) chunks.push({ text: s, source_file: sourceFile, chunk_index: chunkIndex++, embedding: [], metadata: { chunk_position: 'middle' } })
-lineBuffer = lineBuffer.slice(-CHUNK_OVERLAP)
+lineBuffer = lineBuffer.slice(-overlap)
 lineLength = lineBuffer.join('\n').length
 }
 lineBuffer.push(line)
@@ -1609,6 +1714,10 @@ bufferLength += (bufferLength ? 2 : 0) + block.length
 }
 if (buffer.length > 0) flush()
 return chunks
+}
+function chunkText(text, sourceFile, isPolicy = false) {
+const effectiveChunkSize = isPolicy ? POLICY_CHUNK_SIZE : CHUNK_SIZE
+return chunkTextWithSize(text, sourceFile, effectiveChunkSize, CHUNK_OVERLAP, isPolicy)
 }
 async function downloadBlobAsBuffer(containerClient, blobName) {
 const download = await containerClient.getBlobClient(blobName).download()
@@ -1649,11 +1758,15 @@ metadata: row.metadata || null,
 }
 const text = await extractTextFromBuffer(buffer, fileName)
 if (!text?.trim()) return []
-const isPolicy = isPolicyDocument(text, fileName)
-if (isPolicy) {
+if (isResearchDocument(text, fileName)) {
+console.log(`[chunkLoader] Detected research document: ${fileName}`)
+return chunkResearchDocument(text, fileName)
+}
+if (isPolicyDocument(text, fileName)) {
 console.log(`[chunkLoader] Detected policy document: ${fileName}`)
 return chunkPolicyDocument(text, fileName)
 }
+console.log(`[chunkLoader] Using general chunking for: ${fileName}`)
 return chunkText(text, fileName, false)
 })
 )
@@ -1724,8 +1837,8 @@ if (!WARMUP_CLIENT_IDS.length || !blobServiceClient) return
 console.log(`[warmup] Pre-loading chunks for: ${WARMUP_CLIENT_IDS.join(', ')}`)
 for (const clientId of WARMUP_CLIENT_IDS) {
 loadChunksForClient(clientId)
-.then(({ chunks }) => console.log(`[warmup] ${clientId} — ${chunks.length} chunks ready`))
-.catch(err => console.warn(`[warmup] ${clientId} — ${err.message}`))
+.then(({ chunks }) => console.log(`[warmup] ${clientId} -- ${chunks.length} chunks ready`))
+.catch(err => console.warn(`[warmup] ${clientId} -- ${err.message}`))
 }
 }
 let db = null
@@ -1799,7 +1912,7 @@ next()
 function generateApiKey() { return `rak_${crypto.randomBytes(32).toString('hex')}` }
 function generateTitle(query) {
 const cleaned = query.trim().replace(/[?!.]+$/, '')
-return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned
+return cleaned.length > 50 ? cleaned.slice(0, 50) + '...' : cleaned
 }
 async function saveConversationMessage(clientId, conversationId, query, answer, sources) {
 try {
@@ -1839,6 +1952,8 @@ primaryCircuitOpen: askedataCircuitOpen(),
 primaryFailures: askedataFailures,
 maxHits: MAX_HITS_GLOBAL,
 supportedExtensions: [...SUPPORTED_EXTENSIONS],
+docTypes: ['dictionary', 'policy', 'research', 'mixed'],
+chunkSizes: { dictionary: CHUNK_SIZE, policy: POLICY_CHUNK_SIZE, research: RESEARCH_CHUNK_SIZE },
 }))
 app.post('/client/verify', async (req, res) => {
 try {
@@ -2029,7 +2144,7 @@ const { clientId, name } = req.client
 const intent = detectQueryIntent(query.trim())
 if (intent === 'greeting') {
 return res.json({
-answer: "Hello! I'm your document assistant. Ask me anything about your data dictionary measures or building rent policies.",
+answer: "Hello! I'm your document assistant. Ask me anything about your data dictionary measures, building rent policies, or research papers.",
 sources: [],
 conversationId: conversationId || null,
 client: { clientId, name },
@@ -2079,7 +2194,7 @@ return { answer, sources: [], client: { clientId, name } }
 }
 let hits = await retrieveChunks(processedQuery, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndex, effectiveDocType)
 if (hits.length === 0) hits = relaxedKeywordSearch(processedQuery, chunks, 64, invertedIndex)
-console.log(`[chat/message] "${query.slice(0, 60)}" → intent=${effectiveIntent}, docType=${effectiveDocType}, subject="${extractSubject(processedQuery)}", hits=${hits.length}, topScore=${hits[0]?._score?.toFixed(2) || 0}`)
+console.log(`[chat/message] "${query.slice(0, 60)}" -> intent=${effectiveIntent}, docType=${effectiveDocType}, subject="${extractSubject(processedQuery)}", hits=${hits.length}, topScore=${hits[0]?._score?.toFixed(2) || 0}`)
 if (hits.length === 0) {
 return { answer: "I could not find relevant information about this in your documents. Try rephrasing your question.", sources: [], client: { clientId, name } }
 }
@@ -2112,6 +2227,7 @@ app.listen(PORT, () => {
 console.log(`Service running on port ${PORT}`)
 console.log(`ASKDATA: ${ASKDATA_ENDPOINT ? 'configured' : 'MISSING'} | ASKDATA2: ${ASKDATA2_ENDPOINT ? 'configured' : 'missing'}`)
 console.log(`Embeddings: keyword-BM25-hybrid (no external API) | Reranker: in-code lightweight | MAX_HITS: ${MAX_HITS_GLOBAL}`)
+console.log(`Chunk sizes: dictionary=${CHUNK_SIZE} | policy=${POLICY_CHUNK_SIZE} | research=${RESEARCH_CHUNK_SIZE}`)
 console.log(`Supported formats: ${[...SUPPORTED_EXTENSIONS].join(', ')}`)
 startApiKeyHealthChecker()
 warmupChunkCaches()
