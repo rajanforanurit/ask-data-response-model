@@ -9,7 +9,7 @@ const XLSX = require('xlsx')
 const Papa = require('papaparse')
 const stringSimilarity = require('string-similarity')
 const crypto = require('crypto')
-const { resolveIntent } = require('./ed')
+const { resolveIntent } = require('./src/ed')
 const app = express()
 const allowedOrigins = [
 'http://localhost:8080',
