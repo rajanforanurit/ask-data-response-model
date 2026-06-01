@@ -9,7 +9,7 @@ const XLSX = require('xlsx')
 const Papa = require('papaparse')
 const stringSimilarity = require('string-similarity')
 const crypto = require('crypto')
-const { resolveIntent } = require('./src/ed')
+const { resolveIntent, isOutOfScope } = require('./src/ed')
 const app = express()
 const allowedOrigins = ['http://localhost:8080','http://localhost:3000','https://app.powerbi.com','https://msit.powerbi.com','https://anuritchat.vercel.app','https://askdatatest.vercel.app','https://ragadminpanel.vercel.app','https://df.powerbi.com','https://www.anuritinnovation.com/','https://api.powerbi.com']
 const originAllowed = o => !o || o === 'null' || allowedOrigins.includes(o) || /\.(powerbi|microsoft|office)\.com$/.test(o)
@@ -50,6 +50,9 @@ const CONTEXT_CHAR_LIMIT = 2800
 const RELATED_KEYWORDS_COUNT = 5
 const RELATED_KEYWORDS_MIN_SCORE = 1
 const SENTENCE_WINDOW_SIZE = 2
+const MIN_HIT_SCORE_DICT = 3
+const MIN_HIT_SCORE_POLICY = 2
+const MIN_HIT_SCORE_DEFAULT = 4
 const blobServiceClient = AZURE_CONNECTION_STRING ? BlobServiceClient.fromConnectionString(AZURE_CONNECTION_STRING) : null
 const SUPPORTED_EXTENSIONS = new Set(['.pdf', '.docx', '.xlsx', '.json', '.txt', '.csv'])
 const RESPONSE_CACHE = new Map()
@@ -636,6 +639,13 @@ async function retrieveChunks(q, chunks, topK, invertedIndex, docType, _retry=fa
   if (top.length > 1) top = lightweightRerank(q, top, intent, docType)
   const effectiveTopK = intent === 'definition' ? 3 : intent === 'calculation' ? 3 : isPolicy ? 5 : 4
   return top.slice(0, Math.min(effectiveTopK, MAX_HITS_GLOBAL))
+}
+function getMinRelevanceThreshold(docType, intent) {
+  if (docType === 'dictionary') return MIN_HIT_SCORE_DICT
+  if (docType === 'policy') return MIN_HIT_SCORE_POLICY
+  const isPolicy = ['policy_lookup','policy_consequence','policy_permission','policy_numeric'].includes(intent)
+  if (isPolicy) return MIN_HIT_SCORE_POLICY
+  return MIN_HIT_SCORE_DEFAULT
 }
 function buildContext(hits, intent, docType) {
   const seen = new Set()
@@ -1850,6 +1860,9 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req,res) =
       pq=applySynonyms(pq)
       pq=fuzzyCorrectQuery(pq,chunks)
       pq=await preprocessQuery(pq)
+      if (isOutOfScope(pq)) {
+        return {answer:'I can only answer questions based on your uploaded documents. That topic isn\'t covered in them. Please ask something related to your enterprise data, KPIs, or reports.',sources:[],relatedKeywords:[],relatedMetrics:[],client:{clientId,name}}
+      }
       const eDocType=docType||'mixed'
       const eIntent=detectQueryIntent(pq)
       if (eIntent==='all_urls') {
@@ -1864,7 +1877,12 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req,res) =
       }
       let hits=await retrieveChunks(pq,chunks,Math.min(topK,MAX_HITS_GLOBAL),invertedIndex,eDocType)
       if (!hits.length) hits=relaxedKeywordSearch(pq,chunks,32,invertedIndex)
-      if (!hits.length) return {answer:'I could not find relevant information. Try rephrasing your question.',sources:[],relatedKeywords:[],relatedMetrics:[],client:{clientId,name}}
+      if (!hits.length) return {answer:'I could not find relevant information about this in your documents. Please try rephrasing your question.',sources:[],relatedKeywords:[],relatedMetrics:[],client:{clientId,name}}
+      const topHitScore=hits[0]?._score??0
+      const minRelevance=getMinRelevanceThreshold(eDocType,eIntent)
+      if (topHitScore < minRelevance) {
+        return {answer:'I could not find relevant information about this in your documents. Please try rephrasing your question.',sources:[],relatedKeywords:[],relatedMetrics:[],client:{clientId,name}}
+      }
       const answer=await generateAnswerWithFallback(pq,hits,eIntent,eDocType,chunks,invertedIndex,Math.min(topK,MAX_HITS_GLOBAL))
       const sources=buildDedupedSources(hits)
       const subject=extractSubject(pq)
