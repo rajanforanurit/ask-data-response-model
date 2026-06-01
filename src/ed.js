@@ -1,6 +1,7 @@
 'use strict'
-const INTENTS = [
+const INTENTS=[
 {id:'greeting',patterns:[/^\s*(hi|hello|hey|hii|helo|howdy|greetings|good\s*(morning|afternoon|evening|day))\s*[!.,]*\s*$/i,/^(hi|hello|hey)\s+there\s*[!.,]*$/i,/^(sup|what'?s\s+up|yo)\s*[!.,]*$/i,/^(hiya|heya|helo+|h+i+)\s*[!.,]*$/i,/^good\s*(morning|afternoon|evening|day)\s*[!.,]*$/i],responses:['Hello! How can I assist you with your data today?','Hi there! Ask me anything related to your enterprise data or reports.','Hey! I\'m Ask Data, your AI assistant. What insights can I help you uncover?','Hello! Ready to help you explore your enterprise data. What would you like to know?']},
+{id:'how_are_you',patterns:[/^how\s+are\s+you\s*[?!.,]*$/i,/^how\s+are\s+you\s+doing\s*[?!.,]*$/i,/^how\s+(r|are)\s+(u|you)\s*[?!.,]*$/i,/^(you\s+ok|you\s+good|u\s+ok|u\s+good)\s*[?!.,]*$/i,/^(what'?s?\s+up|wassup|wazzup)\s*[?!.,]*$/i,/^(you\s+there|are\s+you\s+there|anyone\s+there|you\s+awake|you\s+alive)\s*[?!.,]*$/i,/^(still\s+there|still\s+here|hello\?)\s*[?!.,]*$/i],responses:['I\'m doing great and ready to help! Ask me anything about your enterprise data.','All good here! What data question can I help you with today?','I\'m here and ready to assist! What would you like to explore in your data?']},
 {id:'identity_builder',patterns:[/who\s+(built|created|developed|made|designed|coded|engineered)\s+(this|it|you|the\s+(tool|app|chatbot|assistant|platform|system|visual|dashboard))/i,/who\s+is\s+behind\s+(this|the\s+(tool|platform|system|visual|chatbot|assistant))/i,/who\s+owns\s+(this|the\s+(tool|platform|system|visual|chatbot|assistant))/i,/who\s+maintains\s+(this|the\s+(tool|platform|system|visual|chatbot|assistant|dashboard))/i,/which\s+company\s+(made|built|created|developed|designed|owns)\s+(this|it|the\s+(tool|app|platform))/i,/what\s+company\s+(made|built|created|developed|is\s+behind)\s+(this|it)/i,/who\s+(designed|created)\s+this\s+(dashboard|visual|tool|app|platform|system)/i,/who\s+developed\s+this/i,/who\s+built\s+this/i,/who\s+made\s+this/i,/who\s+is\s+the\s+(developer|creator|author|maker|owner|builder)\s+of\s+(this|it|ask\s*data)/i,/who\s+(wrote|programmed|launched)\s+(this|it|ask\s*data)/i,/which\s+(team|group|org|organization)\s+(built|made|created|developed)\s+(this|it)/i],responses:['Ask Data is an adaptive AI assistant developed by Anurit Innovation, designed to deliver fast, contextual insights from enterprise data.\n\nLearn more at https://www.anuritinnovation.com/']},
 {id:'identity_self',patterns:[/what\s+(is\s+)?your\s+name/i,/who\s+are\s+you/i,/what\s+are\s+you/i,/tell\s+me\s+about\s+yourself/i,/introduce\s+yourself/i,/what\s+(is|are)\s+(this|the\s+(tool|assistant|chatbot|app|platform))/i,/what('s| is) ask\s*data/i,/are\s+you\s+an\s+(ai|bot|assistant|chatbot)/i,/what\s+kind\s+of\s+(ai|bot|assistant|tool)\s+are\s+you/i,/describe\s+yourself/i,/what\s+do\s+you\s+do/i],responses:['I\'m Ask Data — an adaptive AI assistant developed by Anurit Innovation, designed to deliver fast, contextual insights from your enterprise data and Power BI reports.\n\nLearn more at https://www.anuritinnovation.com/']},
 {id:'company_anurit',patterns:[/who\s+(is|are)\s+anurit(\s+innovation)?/i,/what\s+is\s+anurit(\s+innovation)?/i,/tell\s+me\s+about\s+anurit(\s+innovation)?/i,/about\s+anurit(\s+innovation)?/i,/anurit\s+innovation\s+(company|team|services|products|website|contact)/i,/anurit\s+(company|team|services|products|website|contact)/i,/what\s+does\s+anurit(\s+innovation)?\s+do/i,/anurit\s+innovation\s+kya\s+hai/i],responses:['Anurit Innovation is a technology company specializing in intelligent enterprise data solutions and AI-powered analytics. They build tools like Ask Data — adaptive AI assistants embedded in platforms like Power BI — to help organizations make faster, smarter decisions from their data.\n\nVisit: https://www.anuritinnovation.com/']},
@@ -13,19 +14,46 @@ const INTENTS = [
 {id:'help',patterns:[/^\s*help\s*[!?,]*\s*$/i,/i\s+need\s+help/i,/how\s+does\s+this\s+(work|tool\s+work)/i,/how\s+do\s+i\s+(use|start|begin)/i,/getting\s+started/i,/how\s+to\s+(use|start|begin|get\s+started)/i,/can\s+you\s+guide\s+me/i,/show\s+me\s+how\s+to\s+(use|start)/i,/i('m|\s+am)\s+(new|lost|confused|not\s+sure)/i],responses:['Welcome to Ask Data! Here\'s how to get started:\n\n1. Ask a business question — type any question about your data in plain English.\n2. Be specific — the more context you provide, the more accurate the answer.\n3. Explore insights — ask for trends, comparisons, summaries, or specific metrics.\n\nExample questions:\n- "What is the total revenue for Q2 2026?"\n- "Which products had declining sales last month?"\n- "Compare performance across regions"\n\nLearn more: https://www.anuritinnovation.com/']},
 {id:'irrelevant_general',patterns:[/^(bored|boredom|nothing)\s*[!.,]*$/i,/tell\s+me\s+a\s+(joke|story|fun\s+fact)/i,/what('s|\s+is)\s+the\s+weather/i,/what\s+(time|day|date)\s+is\s+it/i,/play\s+(music|song|video)/i,/can\s+you\s+(sing|dance|draw|paint)/i,/do\s+you\s+(dream|sleep|eat|feel)/i,/are\s+you\s+(human|real|alive|sentient|conscious)/i,/do\s+you\s+have\s+(feelings|emotions|a\s+soul)/i,/what\s+is\s+(life|love|happiness|the\s+meaning)/i],responses:['I\'m Ask Data — purpose-built for enterprise data queries. I\'m not able to help with that, but I can answer questions about your business data, KPIs, reports, and more. What would you like to explore?','That\'s outside my area! I specialize in enterprise data analysis and Power BI insights. Try asking me a business question — like revenue trends, top products, or regional performance.']},
 ]
-function pickRandom(arr) {
-return arr[Math.floor(Math.random() * arr.length)]
+const OUT_OF_DOMAIN_PATTERNS=[
+/^[a-z]+\s+(first\s+citizen|president|prime\s+minister|king|queen|ruler|leader|head\s+of\s+(state|government))\s*[?!.]*$/i,
+/^(who\s+is|what\s+is)\s+the\s+(president|prime\s+minister|king|queen|ceo|founder|director)\s+of\s+[a-z\s]+[?!.]*$/i,
+/^(capital\s+of|currency\s+of|population\s+of|flag\s+of)\s+[a-z\s]+[?!.]*$/i,
+/^(what\s+is\s+)?(ebita|ebitda|gdp|gni|cpi|roi|irr|npv|wacc)\s*[?!.]*$/i,
+/^define\s+(ebita|ebitda|gdp|gni|inflation|recession|depression|stagflation)\s*[?!.]*$/i,
+/^(what\s+is\s+)?(ebita|ebitda)\s*[?!.]*$/i,
+/^(name|tell\s+me|list)\s+(a\s+few\s+)?(countries|capitals|cities|states|rivers|mountains)\s*[?!.]*$/i,
+/^(how\s+(tall|old|big|large|small|far|long|wide|deep)\s+is)\s+.+[?!.]*$/i,
+/^(when\s+(was|did|were|is))\s+.{3,50}(born|died|invented|founded|discovered|happen|start|end)\s*[?!.]*$/i,
+/^(who\s+(invented|discovered|founded|wrote|composed|directed|painted))\s+.+[?!.]*$/i,
+/^(what\s+year\s+(was|did|were))\s+.+[?!.]*$/i,
+/^(translate|meaning\s+in\s+(hindi|english|french|spanish|arabic|urdu))\s+.+[?!.]*$/i,
+/^[a-z\s]{2,30}\s+kya\s+(hai|hota\s+hai|hoti\s+hai|hote\s+hain)\s*[?!.]*$/i,
+/^(mujhe|muje|mujhe\s+batao|batao|bata)\s+.+/i,
+/^(aap|tum|tujhe)\s+.+/i,
+]
+function isOutOfDomain(query){
+const n=query.trim()
+for(const p of OUT_OF_DOMAIN_PATTERNS){
+if(p.test(n)) return true
 }
-function resolveIntent(query) {
-if (!query || !query.trim()) return null
-const normalized = query.trim().replace(/\s+/g, ' ')
-for (const intent of INTENTS) {
-for (const pattern of intent.patterns) {
-if (pattern.test(normalized)) {
-return {intent: intent.id, response: pickRandom(intent.responses)}
+return false
+}
+function pickRandom(arr){
+return arr[Math.floor(Math.random()*arr.length)]
+}
+function resolveIntent(query){
+if(!query||!query.trim()) return null
+const normalized=query.trim().replace(/\s+/g,' ')
+for(const intent of INTENTS){
+for(const pattern of intent.patterns){
+if(pattern.test(normalized)){
+return {intent:intent.id,response:pickRandom(intent.responses)}
 }
 }
+}
+if(isOutOfDomain(normalized)){
+return {intent:'out_of_domain',response:'I\'m Ask Data — specialized for enterprise data and business intelligence queries. That question is outside my scope. Try asking about your business metrics, KPIs, reports, or data definitions!'}
 }
 return null
 }
-module.exports = {resolveIntent}
+module.exports={resolveIntent}
