@@ -30,30 +30,78 @@ const OUT_OF_DOMAIN_PATTERNS=[
 /^[a-z\s]{2,30}\s+kya\s+(hai|hota\s+hai|hoti\s+hai|hote\s+hain)\s*[?!.]*$/i,
 /^(mujhe|muje|mujhe\s+batao|batao|bata)\s+.+/i,
 /^(aap|tum|tujhe)\s+.+/i,
+/\b(pm modi|modi ji|prime minister|rahul gandhi|president|cm|chief minister|politician)\b/i,
+/where\s+(is|does|live|stay|reside|house|residence|located)\s+(pm|modi|president|shimla|delhi|mumbai|goa|jaipur|taj|red fort)/i,
+/\b(capital|population|currency|flag|richest|wealthiest|tallest|biggest)\b/i,
+/who is the (richest|wealthiest|prime minister|president)/i,
+/^(what|where|who|when|how).*(capital|location|stay|live|residence|born|died|invented)/i,
 ]
+let _callASKDATA2=null
+function setLLMCaller(fn){_callASKDATA2=fn}
+function pickRandom(arr){return arr[Math.floor(Math.random()*arr.length)]}
 function isOutOfDomain(query){
 const n=query.trim()
-for(const p of OUT_OF_DOMAIN_PATTERNS){
-if(p.test(n)) return true
-}
+for(const p of OUT_OF_DOMAIN_PATTERNS) if(p.test(n)) return true
 return false
 }
-function pickRandom(arr){
-return arr[Math.floor(Math.random()*arr.length)]
+function isUrlIntent(query){
+const l=query.toLowerCase()
+return /\b(url|link|report\s+url|dashboard\s+url|power\s*bi\s+(url|link|report)|open\s+in|navigate\s+to|access\s+(the\s+)?(report|dashboard))\b/.test(l)||
+(/\b(where|how)\b/.test(l)&&/\b(find|get|access|open|view)\b/.test(l)&&/\b(report|dashboard)\b/.test(l))
 }
-function resolveIntent(query){
-if(!query||!query.trim()) return null
-const normalized=query.trim().replace(/\s+/g,' ')
-for(const intent of INTENTS){
-for(const pattern of intent.patterns){
-if(pattern.test(normalized)){
-return {intent:intent.id,response:pickRandom(intent.responses)}
+async function classifyIntentWithLLM(query){
+if(!_callASKDATA2) return null
+const systemPrompt=`You are a strict intent classifier for "Ask Data", an enterprise BI assistant.
+
+Classify the query into exactly one of these intents:
+- in_domain: business metrics, KPIs, reports, policies, data definitions, formulas, trends, comparisons, summaries, Power BI, URL/link requests for reports/dashboards
+- greeting: hi, hello, hey, good morning etc
+- how_are_you: how are you, you ok etc
+- identity_builder: who built/created/made this tool
+- identity_self: who are you, what are you, what is ask data
+- company_anurit: about anurit innovation company
+- capabilities_general: what can you do, your features
+- capabilities_powerbi: power bi support questions
+- capabilities_analysis: can you analyze data
+- capabilities_summarize: can you summarize reports
+- capabilities_database: are you connected to a database
+- thanks: thank you, thanks, great, awesome
+- help: help, how to use, getting started
+- irrelevant_general: jokes, weather, songs, feelings
+- out_of_domain: general knowledge, politics, geography, history, celebrities, anything not enterprise data
+
+IMPORTANT: Any question asking for a report URL, dashboard link, or Power BI link is ALWAYS in_domain even if phrased as a simple request.
+IMPORTANT: Any question about a business metric, KPI, measure, definition, formula, or data from documents is in_domain.
+IMPORTANT: Only classify as out_of_domain if clearly unrelated to enterprise data.
+
+Return ONLY valid JSON with no extra text:
+{"intent":"<intent_name>","confidence":0.95}`
+try{
+const responseText=await _callASKDATA2(systemPrompt,`Classify this query: "${query}"`,120)
+let parsed
+try{parsed=JSON.parse(responseText.trim())}
+catch{const m=responseText.match(/\{[\s\S]*?\}/);if(m) parsed=JSON.parse(m[0]);else throw new Error('No JSON')}
+if(parsed?.intent){
+const intentObj=INTENTS.find(i=>i.id===parsed.intent)
+if(intentObj) return{intent:parsed.intent,response:pickRandom(intentObj.responses),confidence:parsed.confidence||0.85,source:'llm'}
+if(parsed.intent==='in_domain') return{intent:'in_domain',response:null,confidence:parsed.confidence||0.9,source:'llm'}
+if(parsed.intent==='out_of_domain') return{intent:'out_of_domain',response:'I\'m Ask Data — specialized for enterprise data, metrics, KPIs, and business intelligence. That question is outside my scope. Please ask about your reports, data analysis, or Power BI insights.',confidence:parsed.confidence||0.9,source:'llm'}
 }
-}
-}
-if(isOutOfDomain(normalized)){
-return {intent:'out_of_domain',response:'I\'m Ask Data — specialized for enterprise data and business intelligence queries. That question is outside my scope. Try asking about your business metrics, KPIs, reports, or data definitions!'}
-}
+}catch(err){console.warn('[LLM Intent]',err.message)}
 return null
 }
-module.exports={resolveIntent}
+async function resolveIntent(query){
+if(!query||typeof query!=='string'||!query.trim()) return null
+const normalized=query.trim().replace(/\s+/g,' ')
+if(isUrlIntent(normalized)) return{intent:'in_domain',response:null,source:'url_heuristic'}
+for(const intent of INTENTS){
+for(const pattern of intent.patterns){
+if(pattern.test(normalized)) return{intent:intent.id,response:pickRandom(intent.responses),source:'regex'}
+}
+}
+if(isOutOfDomain(normalized)) return{intent:'out_of_domain',response:'I\'m Ask Data — specialized for enterprise data, metrics, KPIs, and business intelligence. That question is outside my scope. Please ask about your reports, data analysis, or Power BI insights.',source:'regex'}
+const llmResult=await classifyIntentWithLLM(query)
+if(llmResult) return llmResult
+return null
+}
+module.exports={resolveIntent,setLLMCaller}
