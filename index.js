@@ -10,7 +10,7 @@ const XLSX=require('xlsx')
 const Papa=require('papaparse')
 const stringSimilarity=require('string-similarity')
 const crypto=require('crypto')
-const {resolveIntent}=require('./src/ed')
+const {resolveIntent,setLLMCaller}=require('./src/ed')
 const app=express()
 const allowedOrigins=['http://localhost:8080','http://localhost:3000','https://app.powerbi.com','https://msit.powerbi.com','https://anuritchat.vercel.app','https://askdatatest.vercel.app','https://ragadminpanel.vercel.app','https://df.powerbi.com','https://www.anuritinnovation.com/','https://api.powerbi.com']
 const originAllowed=o=>!o||o==='null'||allowedOrigins.includes(o)||/\.(powerbi|microsoft|office)\.com$/.test(o)
@@ -150,7 +150,15 @@ return 'mixed'
 function detectQueryIntent(q){
 const n=normalizeQuery(q)
 if(/^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening)|how\s+are\s+you)\b/.test(n)) return 'greeting'
-if(/\b(url|link|dashboard|power\s*bi|report\s+url)\b/.test(n)) return 'url_lookup'
+const urlSignals=[
+/\b(url|link|href|web\s+address|website)\b/i,
+/\b(power\s*bi\s+(url|link|report|dashboard))\b/i,
+/\b(report\s+(url|link))\b/i,
+/\b(dashboard\s+(url|link))\b/i,
+/\b(open|navigate|access|view|find|get|show|give)\b.*\b(report|dashboard)\b/i,
+/\b(where\s+(is|can\s+i\s+find))\b.*\b(report|dashboard)\b/i,
+]
+if(urlSignals.some(p=>p.test(n))) return 'url_lookup'
 if(/\b(formula|equation|calculate|calculation|calculated|computed|derived)\b/i.test(n)||
 /how\s+(is|are|was|were)\s+.+\s+(calculated|computed|determined|derived)/i.test(n)||
 /what\s+is\s+the\s+(formula|calculation)\s+for/i.test(n)||
@@ -223,6 +231,24 @@ if(s.length>0) return s
 }
 return n.replace(/[?!.]+$/,'').trim()
 }
+function extractUrlSubject(q){
+const l=q.toLowerCase().trim().replace(/[?!.]+$/,'').trim()
+const urlStripPats=[
+/^(?:what\s+is\s+(?:the\s+)?)?(?:power\s*bi\s+)?(?:report\s+)?url\s+(?:of|for)\s+(?:the\s+)?(.+)$/i,
+/^(?:get|show|give|find|fetch)\s+(?:me\s+)?(?:the\s+)?(?:power\s*bi\s+)?(?:report\s+)?(?:url|link)\s+(?:for|of)\s+(?:the\s+)?(.+)$/i,
+/^(?:power\s*bi\s+)?(?:report\s+)?(?:url|link)\s+(?:for|of)\s+(?:the\s+)?(.+)$/i,
+/^(?:where\s+(?:is|can\s+i\s+find)\s+(?:the\s+)?(?:report|dashboard)\s+(?:for|of)\s+(?:the\s+)?(.+))$/i,
+/^(?:open|access|navigate\s+to)\s+(?:the\s+)?(?:report|dashboard)\s+(?:for|of)\s+(?:the\s+)?(.+)$/i,
+]
+for(const p of urlStripPats){
+const m=l.match(p)
+if(m&&m[1]){
+return m[1].trim().replace(/[?!.]+$/,'').replace(/^(the|a|an)\s+/i,'').trim()
+}
+}
+const stops=new Set(['power','bi','report','url','link','for','the','a','an','of','in','get','me','show','give','find','fetch','what','is','where','can','i','open','access'])
+return l.replace(/[^\w\s-]/g,' ').split(/\s+/).filter(w=>w.length>1&&!stops.has(w)).join(' ')
+}
 function extractMeasureSubject(q){
 const raw=q.trim().replace(/[?!]+$/,'').trim()
 const prefixes=[
@@ -274,10 +300,6 @@ if(score>0) scored.push({chunk:c,score})
 }
 scored.sort((a,b)=>b.score-a.score)
 return scored.slice(0,topN).map(x=>({...x.chunk,_measureScore:x.score}))
-}
-function extractUrlKeywords(q){
-const stops=new Set(['power','bi','report','url','link','for','the','a','an','of','in','get','me','show','give','find','fetch'])
-return q.toLowerCase().replace(/[^\w\s-]/g,' ').split(/\s+/).filter(w=>w.length>1&&!stops.has(w))
 }
 function fixBrokenUrls(t){return t.replace(/https:\/\/[^\s]+(\s+[^\s]+)/g,m=>m.replace(/\s/g,''))}
 function normalizeTerms(t){
@@ -494,7 +516,7 @@ idx.get(w).add(i)
 return idx
 }
 function keywordSearch(q,chunks,topK,intent,invertedIndex){
-const subject=extractSubject(q)
+const subject=intent==='url_lookup'?extractUrlSubject(q):extractSubject(q)
 const subjectWords=subject.toLowerCase().split(/\s+/).filter(w=>w.length>1)
 const qLower=normalizeQuery(q)
 const subjectRegex=subjectWords.length>1
@@ -503,12 +525,12 @@ const subjectRegex=subjectWords.length>1
 let candidateSet
 if(invertedIndex){
 const union=new Set()
-const words=intent==='url_lookup'?extractUrlKeywords(q):subjectWords
+const words=intent==='url_lookup'?subjectWords:subjectWords
 for(const w of words){
 for(const i of(invertedIndex.get(w)||new Set())) union.add(i)
 for(const v of normalizeTerms(w)) for(const i of(invertedIndex.get(v)||new Set())) union.add(i)
 }
-if(intent==='url_lookup') for(const w of['url','link','https','powerbi']) for(const i of(invertedIndex.get(w)||new Set())) union.add(i)
+if(intent==='url_lookup') for(const w of['url','link','https','powerbi','report','dashboard']) for(const i of(invertedIndex.get(w)||new Set())) union.add(i)
 candidateSet=union
 }
 const source=candidateSet?[...candidateSet].map(i=>chunks[i]).filter(Boolean):chunks.slice(0,200)
@@ -517,11 +539,13 @@ const text=(c.text||'').toLowerCase()
 const focusSentence=(c.metadata?.focus_sentence||'').toLowerCase()
 let score=0
 if(intent==='url_lookup'){
-if(!text.includes('http')) return{...c,_score:0}
-const kws=extractUrlKeywords(q)
-const matched=kws.filter(w=>text.includes(w)).length
-if(!matched) return{...c,_score:0}
-score+=matched*10
+const hasUrl=/https?:\/\/\S+/.test(c.text||'')||c.metadata?.url
+if(!hasUrl) return{...c,_score:0}
+const matchedWords=subjectWords.filter(w=>text.includes(w)).length
+if(!matchedWords&&!text.includes('http')&&!c.metadata?.url) return{...c,_score:0}
+score+=matchedWords*10
+if(c.metadata?.url&&subjectWords.some(w=>new RegExp(`\\b${escapeRegex(w)}\\b`,'i').test((c.metadata.measure||'').toLowerCase()))) score+=100
+if(c.metadata?.url) score+=20
 }else{
 if(subjectRegex.test(c.text||'')){
 score+=subjectWords.length*6
@@ -596,7 +620,7 @@ return{...c,_score:Math.max(0,matched+focusMatched+subjectMatch+meta-penalty)}
 function hasMinimumRelevance(hits,query,intent){
 if(!hits||!hits.length) return false
 const topScore=hits[0]._score||0
-const subject=extractSubject(query).toLowerCase()
+const subject=intent==='url_lookup'?extractUrlSubject(query):extractSubject(query)
 const subjectWords=subject.replace(/[^\w\s]/g,' ').split(/\s+/).filter(w=>w.length>2)
 if(!subjectWords.length) return topScore>=MIN_RELEVANCE_SCORE
 const hasMeasureHit=hits.some(h=>{
@@ -605,6 +629,9 @@ const ms=scoreMeasureMatch(subject,h.metadata.measure)
 return ms>=300
 })
 if(hasMeasureHit) return true
+if(intent==='url_lookup'){
+return hits.some(h=>/https?:\/\/\S+/.test(h.text||'')||h.metadata?.url)
+}
 const hasSubjectInTopChunk=subjectWords.some(w=>
 new RegExp(`\\b${escapeRegex(w)}\\b`,'i').test(hits[0].text||'')
 )
@@ -617,6 +644,13 @@ const isPolicy=['policy_lookup','policy_consequence','policy_permission','policy
 let sq=normalizeQuery(q).replace(/[^\w\s]/g,' ').replace(/\s+/g,' ')
 if(isPolicy||docType==='policy'||docType==='mixed') sq=expandQueryForPolicy(sq)
 if(intent==='all_urls') return chunks.filter(c=>/https?:\/\/\S+/.test(c.text||'')).slice(0,100)
+if(intent==='url_lookup'){
+const urlSubject=extractUrlSubject(q)
+const urlHits=keywordSearch(q,chunks,Math.min(topK*2,20),intent,invertedIndex)
+if(urlHits.length) return urlHits.slice(0,Math.min(topK,MAX_HITS_GLOBAL))
+const relaxed=relaxedKeywordSearch(urlSubject,chunks,20,invertedIndex)
+return relaxed.filter(h=>/https?:\/\/\S+/.test(h.text||'')||h.metadata?.url).slice(0,Math.min(topK,MAX_HITS_GLOBAL))
+}
 const hasMeasureData=chunks.some(c=>c.metadata?.measure)
 if(hasMeasureData&&docType!=='policy'){
 const measureSubject=extractMeasureSubject(q)
@@ -705,6 +739,15 @@ return parts.join('\n').slice(0,maxLen)
 function buildSystemPrompt(intent,docType){
 const isPolicy=docType==='policy'||['policy_lookup','policy_consequence','policy_permission','policy_numeric'].includes(intent)
 const isMeasure=docType==='dictionary'||(docType==='mixed'&&intent!=='policy_lookup')
+if(intent==='url_lookup'){
+return `You are an enterprise BI assistant. The user wants a report or dashboard URL.
+RULES:
+1. Extract the URL from the context and return it directly.
+2. If multiple URLs exist, return the one most relevant to the user's query subject.
+3. Return ONLY the URL with a one-line label. Format: "**[Report Name]:** <url>"
+4. Do not add explanations or definitions.
+5. If no URL is found, say "No URL found for that report."`
+}
 if(isMeasure){
 if(intent==='calculation'){
 return `You are a data dictionary assistant. Answer ONLY from the provided context.
@@ -747,12 +790,14 @@ return `Answer from context only. Bold subject. Complete sentences. No source re
 }
 function buildUserMessage(q,hits,intent,docType){
 const context=buildContext(hits,intent,docType)
-const subject=extractSubject(q)
+const subject=intent==='url_lookup'?extractUrlSubject(q):extractSubject(q)
 const measureSubject=extractMeasureSubject(q)
 const isPolicy=['policy_lookup','policy_consequence','policy_permission','policy_numeric'].includes(intent)
 const isMeasure=hits.some(h=>h.metadata?.measure)
 let inst=''
-if(isMeasure&&intent==='calculation'){
+if(intent==='url_lookup'){
+inst=`\nReturn the URL for "${subject}". Extract it directly from the context above.`
+}else if(isMeasure&&intent==='calculation'){
 inst=`\nReturn only: "**Formula for ${capFirst(measureSubject)}:** [formula from context]."`
 }else if(isMeasure){
 inst=`\nQuestion: "${q}"\nThe context contains structured data for the measure "${measureSubject}". Use the Description and Formula fields to answer directly. Bold the measure name.`
@@ -760,8 +805,6 @@ inst=`\nQuestion: "${q}"\nThe context contains structured data for the measure "
 inst=`\nOne-sentence definition of "${subject}". Bold name. No formula.`
 }else if(intent==='calculation'){
 inst=`\nReturn only: "**Formula for ${capFirst(subject)}:** [formula]."`
-}else if(intent==='url_lookup'){
-inst=`\nReturn only the URL for "${extractUrlKeywords(q).join(' ')}".`
 }else if(intent==='comparison'){
 inst=`\nCompare: ${q}. Bold each. Short definition each. "**Key Difference:**" at end.`
 }else if(isPolicy||docType==='policy'){
@@ -803,6 +846,34 @@ const match=hit.text.match(/is defined as:?\s*([^.]{10,}\.)/i)
 if(match) return ensureSinglePeriod(`**${capName}** is defined as: ${match[1].trim()}`)
 }
 return null
+}
+function buildDirectUrlAnswer(q,hits){
+const subject=extractUrlSubject(q)
+const subjectWords=subject.toLowerCase().split(/\s+/).filter(w=>w.length>1)
+const urlRe=/https?:\/\/[^\s"'<>]+/g
+const scored=[]
+for(const h of hits){
+const urlsInMeta=h.metadata?.url?[h.metadata.url]:[]
+const urlsInText=(h.text||'').match(urlRe)||[]
+const allUrls=[...urlsInMeta,...urlsInText].map(u=>u.replace(/[.,;)]+$/,'').trim()).filter(u=>u.startsWith('http'))
+for(const url of allUrls){
+const measureName=(h.metadata?.measure||'').toLowerCase()
+const textLower=(h.text||'').toLowerCase()
+let score=0
+score+=subjectWords.filter(w=>new RegExp(`\\b${escapeRegex(w)}\\b`,'i').test(measureName)).length*30
+score+=subjectWords.filter(w=>new RegExp(`\\b${escapeRegex(w)}\\b`,'i').test(textLower)).length*5
+if(h.metadata?.url) score+=10
+const ms=scoreMeasureMatch(subject,h.metadata?.measure||'')
+if(ms>=700) score+=80
+else if(ms>=400) score+=40
+scored.push({url,measureName:h.metadata?.measure||'',score})
+}
+}
+if(!scored.length) return null
+scored.sort((a,b)=>b.score-a.score)
+const best=scored[0]
+const label=best.measureName?capFirst(best.measureName):'Report'
+return `**${label}:** ${best.url}`
 }
 function buildDirectPolicyAnswer(q,hits,intent){
 const subject=extractSubject(q)
@@ -851,7 +922,7 @@ return results
 }
 function buildFallbackAnswer(q,hits,intent,docType){
 if(!hits?.length) return "I could not find relevant information about this in your documents."
-const subject=extractSubject(q)
+const subject=intent==='url_lookup'?extractUrlSubject(q):extractSubject(q)
 const esc=escapeRegex(subject.toLowerCase())
 const isPolicy=docType==='policy'||['policy_lookup','policy_consequence','policy_permission','policy_numeric'].includes(intent)
 if(intent==='all_urls'){
@@ -859,20 +930,20 @@ const entries=extractAllUrlsFromChunks(hits)
 return entries.length?entries.map(e=>`**${e.name}:** ${e.url}`).join('\n'):"No URLs found."
 }
 if(intent==='url_lookup'){
+const directUrl=buildDirectUrlAnswer(q,hits)
+if(directUrl) return directUrl
 const urlRe=/https?:\/\/[^\s"'<>]+/
-const kws=extractUrlKeywords(q)
-for(const h of hits) for(const line of(h.text||'').split('\n')){
-if(!urlRe.test(line)) continue
-if(kws.some(w=>line.toLowerCase().includes(w))){
-const m=line.match(urlRe)
-if(m) return m[0].replace(/[.,;)]+$/,'').trim()
+for(const h of hits){
+const url=(h.metadata?.url||'')
+if(url&&subjectWords(subject).some(w=>new RegExp(`\\b${escapeRegex(w)}\\b`,'i').test((h.metadata?.measure||'').toLowerCase()))){
+return url
 }
 }
 for(const h of hits) for(const line of(h.text||'').split('\n')){
 const m=line.match(urlRe)
 if(m) return m[0].replace(/[.,;)]+$/,'').trim()
 }
-return "No matching URL found."
+return "No matching URL found for that report."
 }
 const directMeasureAns=buildDirectMeasureAnswer(q,hits,intent)
 if(directMeasureAns) return directMeasureAns
@@ -925,6 +996,9 @@ lines.push(line.trim().replace(/\(from\s+[A-Za-z\s]+\)/g,'').trim())
 }
 if(lines.length) return ensureSinglePeriod(`**${capFirst(subject)}:** ${trimToCompleteSentence([...new Set(lines)].slice(0,2).join(' '),400)}.`)
 return "I could not find that specific information in your documents."
+}
+function subjectWords(subject){
+return subject.toLowerCase().replace(/[^\w\s]/g,' ').split(/\s+/).filter(w=>w.length>1)
 }
 function cleanAnswer(raw){
 if(!raw) return ''
@@ -1009,6 +1083,7 @@ if(!r.ok){const t=await r.text();throw new Error(`ASKDATA2 ${r.status}: ${t}`)}
 const d=await r.json()
 return d.choices?.[0]?.message?.content||''
 }
+setLLMCaller(callASKDATA2)
 async function callBestAvailableEngine(sys,user,maxTokens=512){
 if(ASKDATA_ENDPOINT&&ASKDATA_KEY&&!askedataCircuitOpen()){
 try{const r=await callASKDATA(sys,user,maxTokens);if(r?.trim().length>=15) return r}catch(e){console.warn(`[ASKDATA] ${e.message}`)}
@@ -1019,6 +1094,17 @@ try{const r=await callASKDATA2(sys,user,maxTokens);if(r?.trim().length>=15) retu
 return ''
 }
 async function generateAnswerWithFallback(q,hits,intent,docType,chunks,invertedIndex,topK){
+if(intent==='url_lookup'){
+const directUrl=buildDirectUrlAnswer(q,hits)
+if(directUrl) return directUrl
+const sys=buildSystemPrompt(intent,docType)
+const user=buildUserMessage(q,hits,intent,docType)
+let llmRaw=''
+try{llmRaw=await Promise.race([callBestAvailableEngine(sys,user,200),new Promise((_,r)=>setTimeout(()=>r(new Error('timeout')),15000))])}
+catch(e){console.warn(`[genAnswer url LLM] ${e.message}`)}
+if(!isWeakAnswer(llmRaw)) return cleanAnswer(llmRaw)
+return buildFallbackAnswer(q,hits,intent,docType)
+}
 const isMeasureQuery=hits.some(h=>h.metadata?.measure&&!h.metadata._expansionRow)
 if(isMeasureQuery){
 const directAns=buildDirectMeasureAnswer(q,hits,intent)
@@ -1756,8 +1842,8 @@ try{
 const {query,topK=5,conversationId}=req.body
 if(!query?.trim()) return res.status(400).json({error:'query required'})
 const {clientId,name}=req.client
-const intentResult=resolveIntent(query.trim())
-if(intentResult){
+const intentResult=await resolveIntent(query.trim())
+if(intentResult&&intentResult.intent!=='in_domain'){
 const cid=await saveConversationMessage(clientId,conversationId||null,query.trim(),intentResult.response,[])
 return res.json({answer:intentResult.response,sources:[],relatedKeywords:[],relatedMetrics:[],conversationId:cid,client:{clientId,name}})
 }
@@ -1782,7 +1868,7 @@ pq=await preprocessQuery(pq)
 const eDocType=docType||'mixed'
 const eIntent=detectQueryIntent(pq)
 if(eIntent==='all_urls'){
-const uc=chunks.filter(c=>/https?:\/\/\S+/.test(c.text||''))
+const uc=chunks.filter(c=>/https?:\/\/\S+/.test(c.text||'')||c.metadata?.url)
 const entries=extractAllUrlsFromChunks(uc)
 return{answer:entries.length?entries.map(e=>`**${e.name}:** ${e.url}`).join('\n'):'No URLs found.',sources:buildDedupedSources(uc.slice(0,5)),relatedKeywords:[],relatedMetrics:[],client:{clientId,name}}
 }
@@ -1794,11 +1880,14 @@ return{answer,sources:[],relatedKeywords:[],relatedMetrics:[],client:{clientId,n
 let hits=await retrieveChunks(pq,chunks,Math.min(topK,MAX_HITS_GLOBAL),invertedIndex,eDocType)
 if(!hits.length) hits=relaxedKeywordSearch(pq,chunks,32,invertedIndex)
 if(!hits.length||!hasMinimumRelevance(hits,pq,eIntent)){
+if(eIntent==='url_lookup'){
+return{answer:'No matching URL found for that report in your documents.',sources:[],relatedKeywords:[],relatedMetrics:[],client:{clientId,name}}
+}
 return{answer:'I can only answer questions about your enterprise data and documents. Please ask something related to your business metrics, policies, or reports.',sources:[],relatedKeywords:[],relatedMetrics:[],client:{clientId,name}}
 }
 const answer=await generateAnswerWithFallback(pq,hits,eIntent,eDocType,chunks,invertedIndex,Math.min(topK,MAX_HITS_GLOBAL))
 const sources=buildDedupedSources(hits)
-const subject=extractSubject(pq)
+const subject=eIntent==='url_lookup'?extractUrlSubject(pq):extractSubject(pq)
 const related=buildRelatedKeywords(subject,hits,chunks,invertedIndex,RELATED_KEYWORDS_COUNT)
 const hasMeasureData=chunks.some(c=>c.metadata?.measure&&!c.metadata._expansionRow)
 const isDefinitionOrGeneral=['definition','general','calculation'].includes(eIntent)
